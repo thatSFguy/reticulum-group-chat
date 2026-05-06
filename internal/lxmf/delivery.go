@@ -43,9 +43,10 @@ func NewDelivery(transport *rns.Transport, identity *rns.Identity) (*Delivery, e
 		destHash:  identity.DestinationHashFor(FullName()),
 	}
 	if err := transport.RegisterLocal(&rns.LocalDestination{
-		DestHash: d.destHash,
-		Identity: d.identity, // enables SPEC §6.5 PROOF emission on inbound DATA
-		OnPacket: d.handleInbound,
+		DestHash:        d.destHash,
+		Identity:        d.identity, // enables SPEC §6.5 PROOF emission on inbound DATA
+		OnPacket:        d.handleInbound,
+		OnLinkPlaintext: d.handleInboundLinkPlaintext,
 	}); err != nil {
 		return nil, err
 	}
@@ -160,6 +161,40 @@ func (d *Delivery) handleInbound(p *rns.Packet) {
 		return
 	}
 
+	if d.OnMessage != nil {
+		d.OnMessage(msg)
+	}
+}
+
+// handleInboundLinkPlaintext is invoked by the Transport when a link
+// DATA packet addressed to our destination has been decrypted on an
+// active Link. The plaintext is the FULL LXMF body in direct form
+// (SPEC §5.2): dest_hash || source_hash || sig || msgpack — unlike
+// opportunistic, the dest_hash is in the body itself because the outer
+// Reticulum packet was addressed to a link_id rather than our
+// destination.
+//
+// The link layer has already done its own authenticated decryption +
+// per-packet PROOF; this function just extracts the LXMF semantics and
+// fires the application-level OnMessage callback.
+func (d *Delivery) handleInboundLinkPlaintext(plaintext []byte) {
+	msg, err := ParseDirectBody(plaintext)
+	if err != nil {
+		d.errorf("link LXMF parse: %w", err)
+		return
+	}
+	sender := d.transport.Recall(msg.SourceHash)
+	if sender == nil {
+		d.errorf("link sender %x unknown — must announce first", msg.SourceHash[:4])
+		if err := d.transport.RequestPath(msg.SourceHash); err != nil {
+			d.errorf("path? request: %w", err)
+		}
+		return
+	}
+	if err := msg.Verify(sender.Ed25519Public()); err != nil {
+		d.errorf("link LXMF verify: %w", err)
+		return
+	}
 	if d.OnMessage != nil {
 		d.OnMessage(msg)
 	}

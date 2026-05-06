@@ -89,6 +89,52 @@ func SignAndPackOpportunistic(senderID *rns.Identity, senderDestHash, destHash [
 	return signAndPackOpportunisticAt(senderID, senderDestHash, destHash, title, content, fields, time.Now())
 }
 
+// SignAndPackDirect builds the link-form (direct) LXMF body bytes for
+// transmission inside a Reticulum Link DATA packet (SPEC §5.2):
+//
+//	destination_hash(16) || source_hash(16) || signature(64) || msgpack_payload
+//
+// Unlike SignAndPackOpportunistic, the body includes the destination
+// hash (the outer packet is addressed to a link_id, not the recipient's
+// destination). No size cap is enforced here — link DATA can carry
+// arbitrary-size payloads, fragmented by the link layer.
+func SignAndPackDirect(senderID *rns.Identity, senderDestHash, destHash []byte, title, content []byte, fields map[any]any) ([]byte, error) {
+	return signAndPackDirectAt(senderID, senderDestHash, destHash, title, content, fields, time.Now())
+}
+
+func signAndPackDirectAt(senderID *rns.Identity, senderDestHash, destHash []byte, title, content []byte, fields map[any]any, ts time.Time) ([]byte, error) {
+	if senderID == nil {
+		return nil, errors.New("nil sender identity")
+	}
+	if len(senderDestHash) != rns.IdentityHashLen || len(destHash) != rns.IdentityHashLen {
+		return nil, errors.New("dest_hash and source_hash must each be 16 bytes")
+	}
+	if title == nil {
+		title = []byte{}
+	}
+	if content == nil {
+		content = []byte{}
+	}
+	if fields == nil {
+		fields = map[any]any{}
+	}
+
+	tsSeconds := float64(ts.UnixMicro()) / 1_000_000.0
+	payload, err := msgpack.Marshal([]any{tsSeconds, title, content, fields})
+	if err != nil {
+		return nil, fmt.Errorf("marshal payload: %w", err)
+	}
+	signedData := buildSignedData(destHash, senderDestHash, payload)
+	sig := senderID.Sign(signedData)
+
+	out := make([]byte, 0, 2*rns.IdentityHashLen+len(sig)+len(payload))
+	out = append(out, destHash...)
+	out = append(out, senderDestHash...)
+	out = append(out, sig...)
+	out = append(out, payload...)
+	return out, nil
+}
+
 // signAndPackOpportunisticAt is the testable form: timestamp is injected
 // rather than read from the wall clock, so deterministic test vectors
 // (which pin the timestamp) can be reproduced exactly.
@@ -127,6 +173,30 @@ func signAndPackOpportunisticAt(senderID *rns.Identity, senderDestHash, destHash
 	out = append(out, sig...)
 	out = append(out, payload...)
 	return out, nil
+}
+
+// ParseDirectBody decodes the link-form LXMF body (SPEC §5.2):
+//
+//	destination_hash(16) || source_hash(16) || signature(64) || msgpack_payload
+//
+// Unlike opportunistic, the dest_hash is in the body (the outer Reticulum
+// packet is addressed to a link_id, not the recipient's destination_hash).
+// The returned Message can be Verify()'d the same way as opportunistic.
+func ParseDirectBody(body []byte) (*Message, error) {
+	const minDirectBodyLen = 2*rns.IdentityHashLen + signatureLen
+	if len(body) < minDirectBodyLen {
+		return nil, fmt.Errorf("direct body too short: %d", len(body))
+	}
+	m := &Message{
+		DestHash:   body[:rns.IdentityHashLen],
+		SourceHash: body[rns.IdentityHashLen : 2*rns.IdentityHashLen],
+		Signature:  body[2*rns.IdentityHashLen : 2*rns.IdentityHashLen+signatureLen],
+		rawPayload: body[2*rns.IdentityHashLen+signatureLen:],
+	}
+	if err := m.unpackPayload(); err != nil {
+		return nil, err
+	}
+	return m, nil
 }
 
 // ParseOpportunisticBody decodes the LXMF body bytes (without dest_hash).

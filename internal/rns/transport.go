@@ -34,6 +34,8 @@ type Transport struct {
 
 	pathRequestsSent map[string]time.Time // key: hex dest_hash, dedup window
 
+	linkManager *LinkManager
+
 	logger Logger
 }
 
@@ -95,10 +97,16 @@ func (k *KnownIdentity) Ed25519Public() []byte { return k.PublicKey[32:] }
 // acknowledging every received CTX_NONE DATA packet so the sender's
 // PacketReceipt can resolve and retransmits stop. This is non-optional for
 // interop with upstream Reticulum clients.
+//
+// OnLinkPlaintext, when set, receives the decrypted payload of inbound
+// link DATA packets sent on a Link established to this destination. The
+// link handshake (LINKREQUEST -> LRPROOF) is handled automatically by
+// the Transport using the supplied Identity.
 type LocalDestination struct {
-	DestHash []byte
-	Identity *Identity
-	OnPacket func(p *Packet)
+	DestHash        []byte
+	Identity        *Identity
+	OnPacket        func(p *Packet)
+	OnLinkPlaintext func(plaintext []byte)
 }
 
 // AnnounceHandler is called for every verified inbound announce whose
@@ -119,9 +127,15 @@ func NewTransport(logger Logger) *Transport {
 		known:            map[string]*KnownIdentity{},
 		locals:           map[string]*LocalDestination{},
 		pathRequestsSent: map[string]time.Time{},
+		linkManager:      NewLinkManager(),
 		logger:           logger,
 	}
 }
+
+// LinkManager returns the per-Transport LinkManager. Application layer
+// (lxmf.Delivery) reads this to send via Link or to register per-link
+// inbound callbacks. Returned manager is shared and thread-safe.
+func (t *Transport) LinkManager() *LinkManager { return t.linkManager }
 
 // RequestPath broadcasts an SPEC §7.1 path? request for the given target
 // destination hash. Used when we receive a message from a sender whose
@@ -280,11 +294,23 @@ func (t *Transport) dispatch(raw []byte) {
 	case PacketAnnounce:
 		t.handleAnnounce(p)
 	case PacketData:
+		if p.DestinationType == DestinationLink {
+			t.handleLinkData(p)
+			return
+		}
 		t.handleData(p)
-	default:
-		// LinkRequest, Proof — out of scope as inbound (we don't track
-		// outstanding PacketReceipts, so we have nothing to validate
-		// inbound proofs against).
+	case PacketLinkRequest:
+		t.handleLinkRequest(p)
+	case PacketProof:
+		if p.DestinationType == DestinationLink && p.Context == ContextLRProof {
+			t.handleLRProof(p)
+			return
+		}
+		// Other proofs (opportunistic-DATA proofs we get back, or link
+		// DATA proofs from the other end) — we don't track outstanding
+		// PacketReceipts on our outbound packets, so we drop them silently
+		// here. Future PR will validate them when we want delivery
+		// confirmation on our own sends.
 	}
 }
 
@@ -360,6 +386,116 @@ func (t *Transport) handleData(p *Packet) {
 	}
 
 	dest.OnPacket(p)
+}
+
+// handleLinkRequest is invoked for inbound LINKREQUEST packets addressed
+// to one of our local destinations. We mint an ephemeral X25519 keypair,
+// derive session keys via DeriveLinkSessionKeys, build + broadcast the
+// LRPROOF, and register the link as Active in the manager.
+func (t *Transport) handleLinkRequest(p *Packet) {
+	t.mu.RLock()
+	dest := t.locals[hex.EncodeToString(p.DestHash)]
+	t.mu.RUnlock()
+	if dest == nil {
+		return // LINKREQUEST not for us
+	}
+	if dest.Identity == nil {
+		t.logger.Printf("LINKREQUEST for local %x but no identity registered (cannot sign LRPROOF)", p.DestHash[:4])
+		return
+	}
+
+	link, lrProof, err := t.linkManager.AcceptIncomingLinkRequest(p, dest.Identity, nil /* signalling */)
+	if err != nil {
+		t.logger.Printf("AcceptIncomingLinkRequest: %v", err)
+		return
+	}
+	// Wire the local destination's OnLinkPlaintext callback if it has one.
+	link.mu.Lock()
+	link.OnInboundData = dest.OnLinkPlaintext
+	link.mu.Unlock()
+
+	t.logger.Printf("link established (responder): id=%x peer LRREQ from %x", link.ID[:4], p.DestHash[:4])
+	if err := t.Broadcast(lrProof); err != nil {
+		t.logger.Printf("broadcast LRPROOF: %v", err)
+	}
+}
+
+// handleLRProof feeds an inbound LRPROOF (responder -> initiator) to the
+// LinkManager, which transitions a Pending link to Active. We use the
+// responder's long-term Ed25519 pub from KnownIdentity (cached when
+// they previously announced).
+func (t *Transport) handleLRProof(p *Packet) {
+	parsed, err := ParseLRProof(p)
+	if err != nil {
+		t.logger.Printf("LRPROOF parse: %v", err)
+		return
+	}
+	// We don't know the responder dest_hash from the LRPROOF outer header
+	// (that's the link_id, not the responder's dest). So look up the
+	// pending link to find which peer this proof is for.
+	link := t.linkManager.Get(parsed.LinkID)
+	if link == nil {
+		t.logger.Printf("LRPROOF for unknown link_id %x", parsed.LinkID[:4])
+		return
+	}
+	link.mu.Lock()
+	peerDest := append([]byte(nil), link.peerDestHash...)
+	link.mu.Unlock()
+	if peerDest == nil {
+		t.logger.Printf("LRPROOF for link without peerDestHash (we were the responder?)")
+		return
+	}
+	known := t.Recall(peerDest)
+	if known == nil {
+		t.logger.Printf("LRPROOF received but responder %x not in known table — must have announced first", peerDest[:4])
+		return
+	}
+	if _, err := t.linkManager.HandleLRProof(p, known.Ed25519Public()); err != nil {
+		t.logger.Printf("HandleLRProof: %v", err)
+		return
+	}
+	t.logger.Printf("link active (initiator): id=%x", parsed.LinkID[:4])
+}
+
+// handleLinkData processes inbound DATA packets addressed to a link_id.
+// Decrypts via the LinkManager, emits the SPEC §6.5.6 explicit-form
+// PROOF acknowledging the packet, then forwards plaintext to the link's
+// OnInboundData callback (if set).
+func (t *Transport) handleLinkData(p *Packet) {
+	if p.Context == ContextKeepalive {
+		// Just bump activity. SPEC: KEEPALIVE has body [0x00].
+		if l := t.linkManager.Get(p.DestHash); l != nil {
+			l.mu.Lock()
+			l.LastActivity = time.Now()
+			l.mu.Unlock()
+		}
+		return
+	}
+	if p.Context != ContextNone {
+		// Link DATA on other contexts (resource transfer etc.) — out of scope.
+		return
+	}
+
+	_, link, err := t.linkManager.HandleLinkData(p)
+	if err != nil {
+		t.logger.Printf("link data: %v", err)
+		return
+	}
+
+	// Emit the explicit-form link DATA proof BEFORE returning so the
+	// sender's PacketReceipt can resolve quickly. (SPEC §6.5.6 — without
+	// this the sender retransmits and eventually tears the link down.)
+	link.mu.Lock()
+	signing := link.Signing
+	linkID := link.ID
+	link.mu.Unlock()
+	if signing != nil {
+		if proof, err := BuildLinkProof(linkID, signing, p); err != nil {
+			t.logger.Printf("build link proof: %v", err)
+		} else if err := t.Broadcast(proof); err != nil {
+			t.logger.Printf("broadcast link proof: %v", err)
+		}
+	}
 }
 
 // AnnouncePeriodically re-broadcasts the announce returned by build() on
