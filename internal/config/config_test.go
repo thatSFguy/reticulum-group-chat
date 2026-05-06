@@ -35,14 +35,14 @@ func TestParseDuration(t *testing.T) {
 func TestNormalizeRejectsBadHashes(t *testing.T) {
 	cfg := &Config{
 		Service: ServiceConfig{
-			DisplayName:   "x",
-			IdentityPath:  "/tmp/id",
-			StatePath:     "/tmp/st",
-			HistoryPath:   "/tmp/hi",
-			PruneAfter:    Duration(time.Hour),
-			PruneInterval: Duration(time.Minute),
+			DisplayName:      "x",
+			IdentityPath:     "/tmp/id",
+			StatePath:        "/tmp/st",
+			HistoryPath:      "/tmp/hi",
+			PruneAfter:       Duration(time.Hour),
+			PruneInterval:    Duration(time.Minute),
+			AnnounceInterval: Duration(time.Minute),
 		},
-		Reticulum: ReticulumConfig{ConfigPath: "/tmp/r"},
 		Replay:    ReplayConfig{Count: 0, MaxAge: Duration(0)},
 		Admins:    []string{"not-hex"},
 	}
@@ -54,14 +54,14 @@ func TestNormalizeRejectsBadHashes(t *testing.T) {
 func TestNormalizeAcceptsValidHashes(t *testing.T) {
 	cfg := &Config{
 		Service: ServiceConfig{
-			DisplayName:   "x",
-			IdentityPath:  "/tmp/id",
-			StatePath:     "/tmp/st",
-			HistoryPath:   "/tmp/hi",
-			PruneAfter:    Duration(time.Hour),
-			PruneInterval: Duration(time.Minute),
+			DisplayName:      "x",
+			IdentityPath:     "/tmp/id",
+			StatePath:        "/tmp/st",
+			HistoryPath:      "/tmp/hi",
+			PruneAfter:       Duration(time.Hour),
+			PruneInterval:    Duration(time.Minute),
+			AnnounceInterval: Duration(time.Minute),
 		},
-		Reticulum: ReticulumConfig{ConfigPath: "/tmp/r"},
 		Replay:    ReplayConfig{Count: 100, MaxAge: Duration(time.Hour)},
 		Admins:    []string{"00112233445566778899aabbccddeeff"},
 		Mods:      []string{"FFEEDDCCBBAA99887766554433221100"},
@@ -89,8 +89,7 @@ func TestNormalizeRejectsBadDurations(t *testing.T) {
 	for i, sc := range cases {
 		cfg := &Config{
 			Service:   sc,
-			Reticulum: ReticulumConfig{ConfigPath: "/tmp/r"},
-			Replay:    ReplayConfig{Count: 0, MaxAge: 0},
+				Replay:    ReplayConfig{Count: 0, MaxAge: 0},
 		}
 		cfg.Service.IdentityPath = "/tmp/id"
 		cfg.Service.StatePath = "/tmp/st"

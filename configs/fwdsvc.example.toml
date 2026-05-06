@@ -12,15 +12,28 @@ history_path  = "~/.fwdsvc/history.json"
 
 # Drop a user from the roster if we haven't heard an announce or message from
 # them in this long.
-prune_after    = "4w"
+prune_after = "4w"
 
 # How often to run the prune sweep.
 prune_interval = "1h"
 
-[reticulum]
-# Standard RNS config dir. The Reticulum stack reads its interface config from
-# here. Tilde is expanded.
-config_path = "~/.reticulum"
+# How often to re-broadcast our own announce so other Reticulum nodes
+# can learn / refresh our path. Upstream Python rnsd uses 5-15 minutes.
+announce_interval = "10m"
+
+# Reticulum I/O interfaces. Currently only "tcp_client" is supported, which
+# dials a TCPServerInterface peer (e.g. a public testnet entry node) and
+# exchanges HDLC-framed packets in both directions. You can list multiple.
+[[interfaces]]
+type = "tcp_client"
+addr = "amsterdam.connect.reticulum.network:4965"
+# Optional dial timeout; 0 = stdlib default (~30s).
+timeout = "10s"
+
+# A second interface (LAN peer, your own rnsd, etc.) — uncomment as needed.
+#[[interfaces]]
+#type = "tcp_client"
+#addr = "10.0.0.42:4242"
 
 [replay]
 # When a new (or returning) user joins, replay this many recent messages to
@@ -30,8 +43,8 @@ count   = 100
 max_age = "7d"
 
 # Identity hashes are 16 raw bytes / 32 hex chars. Get yours by running
-# `rnid` from the Reticulum tools, or read it off the stdout when the service
-# starts up.
+# `fwdsvc -config /tmp/...` once and reading the "service identity hash"
+# line on stdout — the service generates an identity on first run.
 admins = [
   # "00112233445566778899aabbccddeeff",
 ]

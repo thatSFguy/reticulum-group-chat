@@ -16,24 +16,30 @@ import (
 const identityHashLen = 16
 
 type Config struct {
-	Service   ServiceConfig   `toml:"service"`
-	Reticulum ReticulumConfig `toml:"reticulum"`
-	Replay    ReplayConfig    `toml:"replay"`
-	Admins    []string        `toml:"admins"`
-	Mods      []string        `toml:"mods"`
+	Service    ServiceConfig     `toml:"service"`
+	Interfaces []InterfaceConfig `toml:"interfaces"`
+	Replay     ReplayConfig      `toml:"replay"`
+	Admins     []string          `toml:"admins"`
+	Mods       []string          `toml:"mods"`
 }
 
 type ServiceConfig struct {
-	DisplayName   string        `toml:"display_name"`
-	IdentityPath  string        `toml:"identity_path"`
-	StatePath     string        `toml:"state_path"`
-	HistoryPath   string        `toml:"history_path"`
-	PruneAfter    Duration      `toml:"prune_after"`
-	PruneInterval Duration      `toml:"prune_interval"`
+	DisplayName      string   `toml:"display_name"`
+	IdentityPath     string   `toml:"identity_path"`
+	StatePath        string   `toml:"state_path"`
+	HistoryPath      string   `toml:"history_path"`
+	PruneAfter       Duration `toml:"prune_after"`
+	PruneInterval    Duration `toml:"prune_interval"`
+	AnnounceInterval Duration `toml:"announce_interval"`
 }
 
-type ReticulumConfig struct {
-	ConfigPath string `toml:"config_path"`
+// InterfaceConfig declares a single Reticulum I/O interface. Currently
+// only "tcp_client" is supported (dials a TCPServerInterface peer and
+// exchanges HDLC-framed packets).
+type InterfaceConfig struct {
+	Type    string   `toml:"type"`
+	Addr    string   `toml:"addr"`
+	Timeout Duration `toml:"timeout"`
 }
 
 type ReplayConfig struct {
@@ -89,15 +95,13 @@ func Load(path string) (*Config, error) {
 func defaults() *Config {
 	return &Config{
 		Service: ServiceConfig{
-			DisplayName:   "Forwarder",
-			IdentityPath:  "~/.fwdsvc/identity",
-			StatePath:     "~/.fwdsvc/state.json",
-			HistoryPath:   "~/.fwdsvc/history.json",
-			PruneAfter:    Duration(4 * 7 * 24 * time.Hour),
-			PruneInterval: Duration(1 * time.Hour),
-		},
-		Reticulum: ReticulumConfig{
-			ConfigPath: "~/.reticulum",
+			DisplayName:      "Forwarder",
+			IdentityPath:     "~/.fwdsvc/identity",
+			StatePath:        "~/.fwdsvc/state.json",
+			HistoryPath:      "~/.fwdsvc/history.json",
+			PruneAfter:       Duration(4 * 7 * 24 * time.Hour),
+			PruneInterval:    Duration(1 * time.Hour),
+			AnnounceInterval: Duration(10 * time.Minute),
 		},
 		Replay: ReplayConfig{
 			Count:  100,
@@ -111,7 +115,6 @@ func (c *Config) normalize() error {
 		&c.Service.IdentityPath,
 		&c.Service.StatePath,
 		&c.Service.HistoryPath,
-		&c.Reticulum.ConfigPath,
 	} {
 		ex, err := ExpandPath(*p)
 		if err != nil {
@@ -128,6 +131,17 @@ func (c *Config) normalize() error {
 	}
 	if c.Service.PruneAfter.Std() <= 0 {
 		return fmt.Errorf("service.prune_after must be positive")
+	}
+	if c.Service.AnnounceInterval.Std() <= 0 {
+		return fmt.Errorf("service.announce_interval must be positive")
+	}
+	for i, iface := range c.Interfaces {
+		if iface.Type != "tcp_client" {
+			return fmt.Errorf("interfaces[%d]: only tcp_client is supported, got %q", i, iface.Type)
+		}
+		if strings.TrimSpace(iface.Addr) == "" {
+			return fmt.Errorf("interfaces[%d]: addr is required", i)
+		}
 	}
 	if c.Replay.Count < 0 {
 		return fmt.Errorf("replay.count must be >= 0")
