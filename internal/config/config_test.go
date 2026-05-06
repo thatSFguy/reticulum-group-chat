@@ -90,7 +90,7 @@ func TestNormalizeRejectsBadDurations(t *testing.T) {
 		cfg := &Config{
 			Service:   sc,
 			Reticulum: ReticulumConfig{ConfigPath: "/tmp/r"},
-			Replay:    ReplayConfig{Count: 0, MaxAge: 0, OnRejoin: false},
+			Replay:    ReplayConfig{Count: 0, MaxAge: 0},
 		}
 		cfg.Service.IdentityPath = "/tmp/id"
 		cfg.Service.StatePath = "/tmp/st"

@@ -1,4 +1,5 @@
 /fwdsvc
+/fwdsvc.exe
 /fwdsvc-*
 /build/
 *.test
