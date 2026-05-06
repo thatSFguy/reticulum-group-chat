@@ -54,6 +54,15 @@ go build -o fwdsvc ./cmd/fwdsvc
 go test ./...
 ```
 
+Optional: live interop test against upstream Python `rns` + `LXMF`. Requires
+`pip install rns lxmf` (rns >= 1.2.0, LXMF >= 0.9.6) and `python` on PATH.
+Exchanges live announce + opportunistic-LXMF bytes with a Python subprocess
+in both directions:
+
+```sh
+go test -tags=interop ./tests/interop/...
+```
+
 Cross-compile for Raspberry Pi:
 
 ```sh
