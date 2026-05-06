@@ -192,6 +192,46 @@ func TestTransportBroadcastFansOut(t *testing.T) {
 	}
 }
 
+func TestTransportCapturesTransportIDFromHeader2Announce(t *testing.T) {
+	id, _ := NewIdentity()
+	pkt, _ := BuildAnnounce(id, FullName("lxmf", "delivery"), nil, nil)
+	// Mutate to HEADER_2 with a known transport_id.
+	pkt.HeaderType = HeaderType2
+	pkt.TransportType = NetworkTransport
+	pkt.TransportID = newDummyHash(0x99)
+	pkt.Hops = 3
+	wire, _ := pkt.Pack()
+
+	iface := newFakeInterface()
+	tr := NewTransport(nil)
+	tr.AddInterface(iface)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go tr.Run(ctx)
+
+	iface.inbox <- wire
+
+	deadline := time.After(500 * time.Millisecond)
+	for {
+		known := tr.Recall(id.DestinationHashFor(FullName("lxmf", "delivery")))
+		if known != nil && known.TransportID != nil {
+			if !bytes.Equal(known.TransportID, newDummyHash(0x99)) {
+				t.Errorf("transport_id mismatch: got %x", known.TransportID)
+			}
+			if known.Hops != 3 {
+				t.Errorf("hops = %d, want 3", known.Hops)
+			}
+			return
+		}
+		select {
+		case <-deadline:
+			t.Fatal("transport_id never captured into KnownIdentity")
+		case <-time.After(5 * time.Millisecond):
+		}
+	}
+}
+
 func TestTransportDedupesIdenticalRandomHash(t *testing.T) {
 	id, _ := NewIdentity()
 	pkt, _ := BuildAnnounce(id, FullName("lxmf", "delivery"), nil, nil)

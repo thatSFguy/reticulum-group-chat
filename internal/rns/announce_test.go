@@ -128,6 +128,54 @@ func TestVerifyRejectsForgedDestHash(t *testing.T) {
 	}
 }
 
+func TestParseAnnounceCapturesTransportIDForHeader2(t *testing.T) {
+	id, _ := NewIdentity()
+	pkt, err := BuildAnnounce(id, FullName("lxmf", "delivery"), nil, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Convert the announce packet to HEADER_2 by hand, simulating a relay
+	// that inserted its own identity as transport_id.
+	pkt.HeaderType = HeaderType2
+	pkt.TransportType = NetworkTransport
+	pkt.TransportID = newDummyHash(0xCC)
+	pkt.Hops = 2
+
+	wire, err := pkt.Pack()
+	if err != nil {
+		t.Fatal(err)
+	}
+	parsed, err := ParsePacket(wire)
+	if err != nil {
+		t.Fatal(err)
+	}
+	a, err := ParseAnnounce(parsed)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytesEqual(a.TransportID, newDummyHash(0xCC)) {
+		t.Errorf("TransportID not captured: got %x", a.TransportID)
+	}
+	if a.Hops != 2 {
+		t.Errorf("Hops = %d, want 2", a.Hops)
+	}
+	if err := a.Verify(); err != nil {
+		t.Errorf("Verify on HEADER_2 announce: %v", err)
+	}
+}
+
+func TestParseAnnounceTransportIDIsNilForHeader1(t *testing.T) {
+	id, _ := NewIdentity()
+	pkt, _ := BuildAnnounce(id, FullName("lxmf", "delivery"), nil, nil)
+	wire, _ := pkt.Pack()
+	parsed, _ := ParsePacket(wire)
+	a, _ := ParseAnnounce(parsed)
+	if a.TransportID != nil {
+		t.Errorf("TransportID should be nil for HEADER_1 announce, got %x", a.TransportID)
+	}
+}
+
 func TestRandomHashTimestamp(t *testing.T) {
 	id, _ := NewIdentity()
 	now := time.Date(2026, 5, 6, 12, 0, 0, 0, time.UTC)

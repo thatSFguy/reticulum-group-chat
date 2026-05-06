@@ -63,6 +63,13 @@ type KnownIdentity struct {
 	LastSeen   time.Time
 	LastRandom []byte // last seen random_hash, for cheap replay-defence dedup
 	Hops       byte
+
+	// TransportID is the next-hop transport node's identity hash for
+	// multi-hop sends, captured from the announce's outer packet header
+	// when it arrived as HEADER_2. Nil if the destination announced
+	// directly (HEADER_1). Used by Delivery.Send to decide whether to
+	// emit HEADER_2 with TransportType=NetworkTransport (SPEC §2.3).
+	TransportID []byte
 }
 
 // X25519Public returns the first 32 bytes of PublicKey — the X25519 half.
@@ -266,6 +273,11 @@ func (t *Transport) handleAnnounce(p *Packet) {
 	prev.LastSeen = now
 	prev.LastRandom = a.RandomHash
 	prev.Hops = a.Hops
+	if a.TransportID != nil {
+		prev.TransportID = append([]byte(nil), a.TransportID...)
+	} else {
+		prev.TransportID = nil
+	}
 	handlers := append([]AnnounceHandler(nil), t.announceHandlers...)
 	t.mu.Unlock()
 

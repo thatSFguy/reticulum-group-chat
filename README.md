@@ -93,10 +93,6 @@ link-based delivery, which isn't implemented either.
   and let `fwdsvc` connect to `rnsd` over TCP.
 - **No transit relay.** We don't forward third-party packets. Other
   Reticulum nodes can't route through us.
-- **No HEADER_2 originator conversion** (SPEC §2.3). Outbound packets
-  always use HEADER_1; multi-hop delivery relies on the receiving
-  `rnsd` auto-filling the transport_id, which only works for 0/1-hop
-  destinations. A peer 2+ hops away may not receive our messages.
 - **No automatic reconnect.** If the TCP interface drops, the service
   logs and continues; you have to restart it. (Use systemd `Restart=on-failure`.)
 

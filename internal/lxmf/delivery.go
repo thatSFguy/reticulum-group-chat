@@ -87,7 +87,33 @@ func (d *Delivery) Send(recipientDestHash []byte, title, content []byte, fields 
 		return fmt.Errorf("encrypt: %w", err)
 	}
 
-	pkt := &rns.Packet{
+	pkt := buildOutboundPacket(recipientDestHash, ciphertext, known.TransportID)
+	return d.transport.Broadcast(pkt)
+}
+
+// buildOutboundPacket frames the encrypted LXMF body as a Reticulum DATA
+// packet. If a transport_id is known (the recipient announced via a
+// HEADER_2 relay), we emit HEADER_2 with TransportType=NetworkTransport
+// per SPEC §2.3 so relays can route the packet to the multi-hop recipient.
+// Otherwise we emit HEADER_1 broadcast — sufficient for direct neighbors
+// and for cases where the receiving rnsd auto-fills transport_id for a
+// 1-hop local client.
+func buildOutboundPacket(recipientDestHash, ciphertext, transportID []byte) *rns.Packet {
+	if len(transportID) == rns.IdentityHashLen {
+		return &rns.Packet{
+			HeaderType:      rns.HeaderType2,
+			ContextFlag:     false,
+			TransportType:   rns.NetworkTransport,
+			DestinationType: rns.DestinationSingle,
+			PacketType:      rns.PacketData,
+			Hops:            0,
+			TransportID:     transportID,
+			DestHash:        recipientDestHash,
+			Context:         rns.ContextNone,
+			Data:            ciphertext,
+		}
+	}
+	return &rns.Packet{
 		HeaderType:      rns.HeaderType1,
 		ContextFlag:     false,
 		TransportType:   rns.BroadcastTransport,
@@ -98,7 +124,6 @@ func (d *Delivery) Send(recipientDestHash []byte, title, content []byte, fields 
 		Context:         rns.ContextNone,
 		Data:            ciphertext,
 	}
-	return d.transport.Broadcast(pkt)
 }
 
 // handleInbound is invoked by the Transport for each DATA packet

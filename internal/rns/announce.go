@@ -40,6 +40,14 @@ type Announce struct {
 	AppData     []byte // may be empty
 	ContextFlag bool
 	Hops        byte
+
+	// TransportID is the next-hop transport node's identity hash, taken
+	// from the outer packet header when the announce arrived as HEADER_2
+	// (i.e. the announcer is multiple hops away and the announce was
+	// relayed). Nil for HEADER_1 announces from direct neighbors. When
+	// non-nil, callers should use HEADER_2 with this transport_id when
+	// sending DATA back to the announcer's destination, per SPEC §2.3.
+	TransportID []byte
 }
 
 // EmittedAt returns the timestamp half of random_hash decoded as a unix-time
@@ -144,6 +152,7 @@ func ParseAnnounce(p *Packet) (*Announce, error) {
 		DestHash:    p.DestHash,
 		ContextFlag: p.ContextFlag,
 		Hops:        p.Hops,
+		TransportID: p.TransportID,
 	}
 
 	if p.ContextFlag {
