@@ -1,0 +1,181 @@
+package roster
+
+import (
+	"encoding/hex"
+	"path/filepath"
+	"testing"
+	"time"
+)
+
+func mustHash(t *testing.T, s string) []byte {
+	t.Helper()
+	b, err := hex.DecodeString(s)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return b
+}
+
+func newTestRoster(t *testing.T) (*Roster, string) {
+	t.Helper()
+	dir := t.TempDir()
+	store := NewStore(filepath.Join(dir, "state.json"))
+	r, err := New(store)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return r, dir
+}
+
+const hashA = "00112233445566778899aabbccddeeff"
+const hashB = "112233445566778899aabbccddeeff00"
+const hashC = "2233445566778899aabbccddeeff0011"
+
+func TestAddOrUpdateNewVsReturning(t *testing.T) {
+	r, _ := newTestRoster(t)
+	now := time.Date(2026, 5, 5, 12, 0, 0, 0, time.UTC)
+
+	isNew, err := r.AddOrUpdate(mustHash(t, hashA), now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !isNew {
+		t.Error("expected first AddOrUpdate to report new")
+	}
+	isNew, _ = r.AddOrUpdate(mustHash(t, hashA), now.Add(time.Minute))
+	if isNew {
+		t.Error("expected second AddOrUpdate to report not-new")
+	}
+}
+
+func TestPruneRespectsCutoff(t *testing.T) {
+	r, _ := newTestRoster(t)
+	t0 := time.Date(2026, 5, 5, 12, 0, 0, 0, time.UTC)
+
+	_, _ = r.AddOrUpdate(mustHash(t, hashA), t0.Add(-5*7*24*time.Hour)) // 5 weeks ago
+	_, _ = r.AddOrUpdate(mustHash(t, hashB), t0.Add(-1*time.Hour))      // recent
+
+	pruned, err := r.Prune(t0, 4*7*24*time.Hour)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(pruned) != 1 || pruned[0] != hashA {
+		t.Errorf("expected %s pruned, got %v", hashA, pruned)
+	}
+	if !r.Has(mustHash(t, hashB)) {
+		t.Error("recent user should not have been pruned")
+	}
+	if r.Has(mustHash(t, hashA)) {
+		t.Error("stale user should have been pruned")
+	}
+}
+
+func TestPruneRespectsAnnounceFreshness(t *testing.T) {
+	r, _ := newTestRoster(t)
+	t0 := time.Date(2026, 5, 5, 12, 0, 0, 0, time.UTC)
+
+	_, _ = r.AddOrUpdate(mustHash(t, hashA), t0.Add(-5*7*24*time.Hour))
+	// announced recently — should keep them alive even though no recent message
+	_ = r.UpdateLastAnnounce(mustHash(t, hashA), t0.Add(-1*time.Hour))
+
+	pruned, err := r.Prune(t0, 4*7*24*time.Hour)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(pruned) != 0 {
+		t.Errorf("expected nothing pruned, got %v", pruned)
+	}
+}
+
+func TestUpdateLastAnnounceDoesNotAutoJoin(t *testing.T) {
+	r, _ := newTestRoster(t)
+	t0 := time.Date(2026, 5, 5, 12, 0, 0, 0, time.UTC)
+
+	if err := r.UpdateLastAnnounce(mustHash(t, hashA), t0); err != nil {
+		t.Fatal(err)
+	}
+	if r.Has(mustHash(t, hashA)) {
+		t.Error("announce alone should not add a user to the roster")
+	}
+}
+
+func TestBanRemovesAndDropsFutureMessages(t *testing.T) {
+	r, _ := newTestRoster(t)
+	now := time.Now()
+	_, _ = r.AddOrUpdate(mustHash(t, hashA), now)
+
+	if err := r.Ban(hashA); err != nil {
+		t.Fatal(err)
+	}
+	if r.Has(mustHash(t, hashA)) {
+		t.Error("ban should remove user from roster")
+	}
+	if !r.IsBanned(mustHash(t, hashA)) {
+		t.Error("hash should be in banlist after ban")
+	}
+}
+
+func TestUnban(t *testing.T) {
+	r, _ := newTestRoster(t)
+	_ = r.Ban(hashA)
+	ok, err := r.Unban(hashA)
+	if err != nil || !ok {
+		t.Fatalf("unban: ok=%v err=%v", ok, err)
+	}
+	if r.IsBanned(mustHash(t, hashA)) {
+		t.Error("unban should clear the banlist entry")
+	}
+	ok, _ = r.Unban(hashA)
+	if ok {
+		t.Error("second unban should be a no-op")
+	}
+}
+
+func TestResolveByNickAndPrefix(t *testing.T) {
+	r, _ := newTestRoster(t)
+	now := time.Now()
+	_, _ = r.AddOrUpdate(mustHash(t, hashA), now)
+	_, _ = r.AddOrUpdate(mustHash(t, hashB), now)
+	_, _ = r.AddOrUpdate(mustHash(t, hashC), now)
+	_ = r.SetNickname(hashA, "alice")
+	_ = r.SetNickname(hashB, "bob")
+
+	if u, err := r.Resolve("ALICE"); err != nil || u.Hash != hashA {
+		t.Errorf("Resolve nick: got %+v err %v", u, err)
+	}
+	if u, err := r.Resolve("0011"); err != nil || u.Hash != hashA {
+		t.Errorf("Resolve prefix: got %+v err %v", u, err)
+	}
+	if _, err := r.Resolve("nobody"); err == nil {
+		t.Error("Resolve(nobody) should error")
+	}
+}
+
+func TestPersistRoundTrip(t *testing.T) {
+	dir := t.TempDir()
+	storePath := filepath.Join(dir, "state.json")
+
+	{
+		store := NewStore(storePath)
+		r, err := New(store)
+		if err != nil {
+			t.Fatal(err)
+		}
+		_, _ = r.AddOrUpdate(mustHash(t, hashA), time.Date(2026, 5, 5, 12, 0, 0, 0, time.UTC))
+		_ = r.SetNickname(hashA, "alice")
+		_ = r.Ban(hashB)
+	}
+
+	store := NewStore(storePath)
+	r, err := New(store)
+	if err != nil {
+		t.Fatal(err)
+	}
+	u, ok := r.Get(hashA)
+	if !ok || u.Nickname != "alice" {
+		t.Errorf("expected alice persisted, got %+v ok=%v", u, ok)
+	}
+	if !r.IsBanned(mustHash(t, hashB)) {
+		t.Error("ban should persist across reload")
+	}
+}

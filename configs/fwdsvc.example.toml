@@ -1,0 +1,41 @@
+# reticulum-forwarding-service config.
+
+[service]
+# Shown in our LXMF announces. Visible to all Reticulum nodes.
+display_name = "Forwarder"
+
+# Where to store the service's identity, roster, and replay buffer.
+# Tilde is expanded.
+identity_path = "~/.fwdsvc/identity"
+state_path    = "~/.fwdsvc/state.json"
+history_path  = "~/.fwdsvc/history.json"
+
+# Drop a user from the roster if we haven't heard an announce or message from
+# them in this long.
+prune_after    = "4w"
+
+# How often to run the prune sweep.
+prune_interval = "1h"
+
+[reticulum]
+# Standard RNS config dir. The Reticulum stack reads its interface config from
+# here. Tilde is expanded.
+config_path = "~/.reticulum"
+
+[replay]
+# When a new (or returning) user joins, replay this many recent messages to
+# them, skipping anything older than max_age. Set count = 0 to disable
+# replay entirely.
+count   = 100
+max_age = "7d"
+
+# Identity hashes are 16 raw bytes / 32 hex chars. Get yours by running
+# `rnid` from the Reticulum tools, or read it off the stdout when the service
+# starts up.
+admins = [
+  # "00112233445566778899aabbccddeeff",
+]
+
+mods = [
+  # "ffeeddccbbaa99887766554433221100",
+]

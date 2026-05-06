@@ -1,0 +1,7 @@
+/fwdsvc
+/fwdsvc-*
+/build/
+*.test
+*.out
+.idea/
+.vscode/
