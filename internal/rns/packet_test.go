@@ -2,6 +2,7 @@ package rns
 
 import (
 	"bytes"
+	"errors"
 	"testing"
 )
 
@@ -115,7 +116,15 @@ func TestFlagBitsRoundTripExhaustive(t *testing.T) {
 				for dt := byte(0); dt <= 3; dt++ {
 					for pt := byte(0); pt <= 3; pt++ {
 						f := packFlags(hdr, cf == 1, tr, dt, pt)
-						gotHdr, gotCF, gotTr, gotDt, gotPt := unpackFlags(f)
+						// packFlags must never set bit 7 (ifac_flag).
+						if f&0x80 != 0 {
+							t.Errorf("packFlags set bit 7 for (%d,%d,%d,%d,%d) -> 0x%02x",
+								hdr, cf, tr, dt, pt, f)
+						}
+						gotIFAC, gotHdr, gotCF, gotTr, gotDt, gotPt := unpackFlags(f)
+						if gotIFAC {
+							t.Errorf("unpackFlags read ifac_flag=true from packFlags output 0x%02x", f)
+						}
 						if gotHdr != hdr || (gotCF && cf == 0) || (!gotCF && cf == 1) ||
 							gotTr != tr || gotDt != dt || gotPt != pt {
 							t.Errorf("flags round-trip failed for (%d,%d,%d,%d,%d) -> 0x%02x -> (%d,%v,%d,%d,%d)",
@@ -126,6 +135,55 @@ func TestFlagBitsRoundTripExhaustive(t *testing.T) {
 				}
 			}
 		}
+	}
+}
+
+// TestUnpackFlagsReadsIFACBit confirms unpackFlags pulls bit 7 as
+// ifac_flag and bit 6 as a 1-bit header_type, consistent with the SPEC
+// §2.1 corrected layout (and upstream RNS/Packet.py:246 parse masks).
+func TestUnpackFlagsReadsIFACBit(t *testing.T) {
+	cases := []struct {
+		flags    byte
+		ifac     bool
+		hdr      byte
+		expected string
+	}{
+		{0x00, false, 0, "all zero"},
+		{0x40, false, 1, "header_type=1, ifac=0"},
+		{0x80, true, 0, "ifac=1, header_type=0"},
+		{0xC0, true, 1, "ifac=1, header_type=1"},
+	}
+	for _, tc := range cases {
+		ifac, hdr, _, _, _, _ := unpackFlags(tc.flags)
+		if ifac != tc.ifac || hdr != tc.hdr {
+			t.Errorf("%s (flags=0x%02x): got ifac=%v hdr=%d, want ifac=%v hdr=%d",
+				tc.expected, tc.flags, ifac, hdr, tc.ifac, tc.hdr)
+		}
+	}
+}
+
+// TestParseRejectsIFACSealed confirms inbound IFAC-sealed packets are
+// rejected with errIFACUnsupported instead of being mis-parsed as
+// header_type=2 or 3 (which earlier spec wording, briefly published in
+// 8c4d550, would have produced). The local clone of upstream
+// reticulum-specifications corrected this in 0c2021e.
+func TestParseRejectsIFACSealed(t *testing.T) {
+	p := &Packet{
+		HeaderType:      HeaderType1,
+		DestinationType: DestinationSingle,
+		PacketType:      PacketData,
+		DestHash:        newDummyHash(0xAB),
+		Context:         ContextNone,
+		Data:            []byte("payload"),
+	}
+	wire, err := p.Pack()
+	if err != nil {
+		t.Fatal(err)
+	}
+	wire[0] |= 0x80 // set ifac_flag
+
+	if _, err := ParsePacket(wire); !errors.Is(err, errIFACUnsupported) {
+		t.Errorf("ParsePacket(ifac-sealed) error = %v, want errIFACUnsupported", err)
 	}
 }
 

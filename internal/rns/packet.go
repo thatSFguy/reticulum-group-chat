@@ -5,13 +5,20 @@ import (
 	"fmt"
 )
 
-// Header-byte bit layout (SPEC §2.1):
+// Header-byte bit layout (SPEC §2.1, official manual §4.6.3):
 //
-//	bit 7-6 : header_type      (0 = HEADER_1, 1 = HEADER_2)
+//	bit 7   : ifac_flag        (0=open, 1=IFAC-sealed; we reject these)
+//	bit 6   : header_type      (0 = HEADER_1, 1 = HEADER_2)
 //	bit 5   : context_flag     (1 = announce includes a ratchet pubkey)
 //	bit 4   : transport_type   (0 = BROADCAST, 1 = TRANSPORT)
 //	bit 3-2 : destination_type (0=SINGLE, 1=GROUP, 2=PLAIN, 3=LINK)
 //	bit 1-0 : packet_type      (0=DATA, 1=ANNOUNCE, 2=LINKREQUEST, 3=PROOF)
+//
+// Bit 7 was wrongly grouped with header_type in earlier spec revisions
+// (corrected at thatSFguy/reticulum-specifications@0c2021e). An
+// implementation that reads bits 7-6 as a 2-bit header_type will silently
+// drop every inbound packet from an IFAC-sealed interface, since the
+// header_type comes back as 2 or 3 and never matches HEADER_1/HEADER_2.
 const (
 	HeaderType1 = 0
 	HeaderType2 = 1
@@ -44,6 +51,14 @@ const (
 	header1MinLen = 1 + 1 + addressHashLen + 1            // 19
 	header2MinLen = 1 + 1 + addressHashLen*2 + 1          // 35
 )
+
+// errIFACUnsupported is returned by ParsePacket when the inbound packet's
+// ifac_flag is set. We don't speak IFAC: the IFAC field's per-interface
+// size is configured out-of-band, and we have no way to verify the seal,
+// so we drop rather than guess. Surfaces in transport logs as a clear
+// "this packet came from an IFAC interface and we can't decode it"
+// signal, distinct from a generic parse error.
+var errIFACUnsupported = errors.New("IFAC-sealed packet rejected (ifac_flag=1, SPEC §2.1)")
 
 // Packet is a parsed Reticulum packet. The header bit fields are exploded
 // into named integers so callers don't have to mask manually.
@@ -102,7 +117,10 @@ func ParsePacket(raw []byte) (*Packet, error) {
 		return nil, fmt.Errorf("packet too short: %d bytes", len(raw))
 	}
 	flags := raw[0]
-	headerType, contextFlag, transportType, destType, packetType := unpackFlags(flags)
+	ifacFlag, headerType, contextFlag, transportType, destType, packetType := unpackFlags(flags)
+	if ifacFlag {
+		return nil, errIFACUnsupported
+	}
 
 	p := &Packet{
 		HeaderType:      headerType,
@@ -170,7 +188,9 @@ func (p *Packet) HashablePart() ([]byte, error) {
 
 func packFlags(headerType byte, contextFlag bool, transportType, destType, packetType byte) byte {
 	var f byte
-	f |= (headerType & 0x03) << 6
+	// header_type is bit 6 only; bit 7 is ifac_flag and we never set it
+	// (we don't originate IFAC-sealed traffic).
+	f |= (headerType & 0x01) << 6
 	if contextFlag {
 		f |= 1 << 5
 	}
@@ -180,8 +200,9 @@ func packFlags(headerType byte, contextFlag bool, transportType, destType, packe
 	return f
 }
 
-func unpackFlags(f byte) (headerType byte, contextFlag bool, transportType, destType, packetType byte) {
-	headerType = (f >> 6) & 0x03
+func unpackFlags(f byte) (ifacFlag bool, headerType byte, contextFlag bool, transportType, destType, packetType byte) {
+	ifacFlag = (f>>7)&0x01 == 1
+	headerType = (f >> 6) & 0x01
 	contextFlag = (f>>5)&0x01 == 1
 	transportType = (f >> 4) & 0x01
 	destType = (f >> 2) & 0x03
