@@ -44,7 +44,7 @@ Reticulum-supported transport.
    The first lines on stdout will be:
 
    ```
-   fwdsvc 1.0.1 starting (linux/amd64)
+   fwdsvc 1.2.0 starting (linux/amd64)
    fwdsvc 2026/05/06 16:00:00 interface tcp_client connected: …
    fwdsvc 2026/05/06 16:00:00 service identity hash: 359fc3967f984a529874d0960c6ee782
    fwdsvc 2026/05/06 16:00:00 delivery destination : 4c87fb86ccfdff39a3d1e22060ba1789
@@ -96,6 +96,23 @@ Reticulum-supported transport.
   whitespace range (TAB/LF/CR) are replaced with `?` before forwarding,
   so a sender can't inject ANSI escape sequences that would mess up
   receivers' terminal displays.
+- **Outbound retry queue.** Every outbound message goes through a
+  persistent queue that mirrors LXMF's `LXMRouter.process_outbound`
+  retry policy: up to 5 attempts at 10-second intervals (≈50 s total
+  budget), with a 7-second `path?`-backed defer when the recipient
+  hasn't announced yet. A single packet collision on a half-duplex
+  segment no longer drops the message, and the queue persists to
+  `outbound.json` so a service restart resumes pending sends rather
+  than losing them. See
+  [`flows/lxmf-outbound-retry.md`](https://github.com/thatSFguy/reticulum-specifications/blob/master/flows/lxmf-outbound-retry.md)
+  in the spec repo for the upstream-equivalent state machine this
+  mirrors.
+- **Announce cache survives restart.** Verified announces (peer
+  public key + transport_id + last_seen) persist to `announces.json`,
+  so after a restart every previously-known peer is immediately
+  addressable instead of waiting up to one `announce_interval`
+  (10 minutes default) for them to re-announce. Entries older than
+  30 days are dropped at load time.
 
 ## Commands
 
@@ -150,7 +167,7 @@ mods = [
 
 [service]
 # Shown in our LXMF announces. Visible to all Reticulum nodes.
-display_name = "Forwarder"
+display_name = "Group Chat - send /join"
 
 # Where the service stores its identity, roster, and replay buffer.
 # Tilde is expanded.
@@ -241,12 +258,14 @@ command (avoidable but explicit by design — config edits are auditable).
 
 Default state directory is `~/.fwdsvc/`:
 
-| File           | Purpose                                                   |
-|----------------|-----------------------------------------------------------|
-| `config.toml`  | The config file (you create this).                        |
-| `identity`     | The service's 64-byte Reticulum identity (do not share).  |
-| `state.json`   | Roster + banlist. Atomic writes; safe across crashes.     |
-| `history.json` | Recent-message ring buffer for replay-on-join.            |
+| File             | Purpose                                                          |
+|------------------|------------------------------------------------------------------|
+| `config.toml`    | The config file (you create this).                               |
+| `identity`       | The service's 64-byte Reticulum identity (do not share).         |
+| `state.json`     | Roster + banlist. Atomic writes; safe across crashes.            |
+| `history.json`   | Recent-message ring buffer for replay-on-join.                   |
+| `outbound.json`  | Pending outbound messages — queue with attempt counters and next-attempt timestamps so retries survive restarts. |
+| `announces.json` | Cached `KnownIdentity` per peer (public key + `transport_id` + `last_seen`) so a restart doesn't have to wait for re-announces. Entries older than 30 days are dropped at load. |
 
 ## Wire-format features implemented
 
@@ -316,10 +335,6 @@ LXMF to run a leaf-node group-chat hub. Notable gaps:
 - **No automatic reconnect.** If the TCP interface drops, the service
   logs and continues; you have to restart it (use systemd
   `Restart=on-failure`).
-- **Path table doesn't persist across restart.** First message after
-  restart from a previously-known sender triggers a path? request
-  and is dropped while we wait for the response. Subsequent messages
-  from the same sender succeed.
 - **No ratchets / forward secrecy.** Long-term X25519 key is used for
   every Token cipher. Future-key compromise means past messages are
   decryptable.

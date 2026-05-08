@@ -21,7 +21,7 @@ mods = [
 
 [service]
 # Shown in our LXMF announces. Visible to all Reticulum nodes.
-display_name = "Forwarder"
+display_name = "Group Chat - send /join"
 
 # Where to store the service's identity, roster, and replay buffer.
 # Tilde is expanded.

@@ -111,7 +111,7 @@ func Load(path string) (*Config, error) {
 func defaults() *Config {
 	return &Config{
 		Service: ServiceConfig{
-			DisplayName:      "Forwarder",
+			DisplayName:      "Group Chat - send /join",
 			IdentityPath:     "~/.fwdsvc/identity",
 			StatePath:        "~/.fwdsvc/state.json",
 			HistoryPath:      "~/.fwdsvc/history.json",
