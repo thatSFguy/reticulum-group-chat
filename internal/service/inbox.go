@@ -43,17 +43,9 @@ func (s *Service) onLXMFReceived(msg *lxmf.Message) {
 			senderHex[:8], parsed.Name, len(parsed.Args))
 		reply := s.dispatcher.Dispatch(senderHex, parsed)
 		if reply != "" {
-			if err := s.delivery.Send(senderBytes, nil, []byte(reply), nil); err != nil {
-				// Critical for troubleshooting: this is the path that
-				// silently broke /users when the reply outgrew the
-				// opportunistic packet cap. Always log enough detail to
-				// distinguish "recipient unknown" from "payload too big".
-				s.logger.Printf("cmd reply send failed: from=%s name=/%s reply_len=%d err=%v",
-					senderHex[:8], parsed.Name, len(reply), err)
-			} else {
-				s.logger.Printf("cmd reply sent: to=%s name=/%s reply_len=%d",
-					senderHex[:8], parsed.Name, len(reply))
-			}
+			id := s.outbound.Enqueue(senderBytes, []byte(reply))
+			s.logger.Printf("cmd reply queued: to=%s name=/%s reply_len=%d id=%s",
+				senderHex[:8], parsed.Name, len(reply), id)
 		}
 		return
 	}
@@ -121,18 +113,14 @@ func (s *Service) onLXMFReceived(msg *lxmf.Message) {
 // message from a non-member; the message itself isn't forwarded.
 func (s *Service) replyInvite(senderBytes []byte) {
 	const msg = "Welcome. To join this chat send /join. Send /? for help. Until you join, your messages aren't forwarded."
-	if err := s.delivery.Send(senderBytes, nil, []byte(msg), nil); err != nil {
-		s.logger.Printf("invite send: %v", err)
-	}
+	s.outbound.Enqueue(senderBytes, []byte(msg))
 }
 
 // replyPaused tells a paused member that their non-command message
 // wasn't forwarded.
 func (s *Service) replyPaused(senderBytes []byte) {
 	const msg = "You're paused. Your message wasn't forwarded. Send /resume to come back."
-	if err := s.delivery.Send(senderBytes, nil, []byte(msg), nil); err != nil {
-		s.logger.Printf("paused notify send: %v", err)
-	}
+	s.outbound.Enqueue(senderBytes, []byte(msg))
 }
 
 // replyOverInboundLimit notifies a sender that their message exceeded
@@ -144,7 +132,5 @@ func (s *Service) replyOverInboundLimit(senderBytes []byte, charCount int) {
 	limit := s.cfg.Service.MaxInboundChars
 	msg := fmt.Sprintf("Message rejected: limit is %d characters per message, yours was %d. Please shorten and resend.",
 		limit, charCount)
-	if err := s.delivery.Send(senderBytes, nil, []byte(msg), nil); err != nil {
-		s.logger.Printf("inbound-limit notify send: %v", err)
-	}
+	s.outbound.Enqueue(senderBytes, []byte(msg))
 }

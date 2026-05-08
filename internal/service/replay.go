@@ -24,10 +24,7 @@ func (s *Service) replayHistoryTo(joinerHash []byte, now time.Time) {
 			e.SenderNick,
 			sanitizeForward(e.Content),
 		)
-		if err := s.delivery.Send(joinerHash, nil, []byte(body), nil); err != nil {
-			s.logger.Printf("replay send to %x: %v", joinerHash[:4], err)
-			return
-		}
+		s.outbound.Enqueue(joinerHash, []byte(body))
 	}
 }
 

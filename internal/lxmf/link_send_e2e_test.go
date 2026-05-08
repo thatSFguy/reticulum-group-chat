@@ -672,6 +672,70 @@ func TestSweeperEmitsKeepalive(t *testing.T) {
 	}
 }
 
+// TestSendFromInsideOnMessageDoesNotDeadlock is the regression test for
+// a bug found in live testing of v1.1.0: when bob's OnMessage handler
+// itself called Delivery.Send to ship a reply that overflowed
+// opportunistic, the send blocked waiting for an LRPROOF that was
+// queued on the SAME dispatcher goroutine that was stuck in Send.
+// Result: handshake timeout fires after 30s, LRPROOF arrives 1ms later
+// to find no waiter, and the user sees no reply.
+//
+// Repro shape: alice opens an inbound link to bob, sends a small LXMF
+// command-style message. Bob's OnMessage replies with a payload large
+// enough to require link delivery. Without the fix
+// (Delivery.handleInbound* dispatching OnMessage on a goroutine), bob's
+// dispatcher deadlocks on the outbound link handshake. With the fix,
+// alice receives the long reply within the test timeout.
+func TestSendFromInsideOnMessageDoesNotDeadlock(t *testing.T) {
+	f := newTwoNodeFixture(t)
+
+	// Bob will reply to anything alice sends with a >280-byte payload,
+	// which forces the reply through the link path.
+	bigReply := bytes.Repeat([]byte("REPLY-PAYLOAD-MUST-OVERFLOW-OPPORTUNISTIC-CAP "), 20)
+	f.delB.OnMessage = func(m *Message) {
+		// Send from inside the handler. This is the production pattern
+		// (service.onLXMFReceived → dispatcher → Delivery.Send) and
+		// must NOT deadlock the Transport dispatcher.
+		_ = f.delB.Send(m.SourceHash, nil, bigReply, nil)
+	}
+
+	// Alice listens for the reply.
+	var (
+		muA           sync.Mutex
+		gotOnA        []*Message
+	)
+	f.delA.OnMessage = func(m *Message) {
+		muA.Lock()
+		gotOnA = append(gotOnA, &Message{Content: append([]byte(nil), m.Content...)})
+		muA.Unlock()
+	}
+
+	// Trigger: alice sends a small "command" to bob, expects bob's big
+	// reply back.
+	if err := f.delA.Send(f.delB.Hash(), nil, []byte("/users"), nil); err != nil {
+		t.Fatalf("alice send: %v", err)
+	}
+
+	// Without the fix the reply NEVER arrives — bob's dispatcher is
+	// deadlocked on its own outbound link handshake. Generous timeout
+	// so a slow CI doesn't false-positive: well below the 30s
+	// handshake-timeout default but well above any reasonable in-process
+	// link round-trip.
+	if !waitFor(5*time.Second, func() bool {
+		muA.Lock()
+		defer muA.Unlock()
+		return len(gotOnA) >= 1
+	}) {
+		t.Fatal("alice never received bob's reply — dispatcher likely deadlocked in Send-from-OnMessage")
+	}
+	muA.Lock()
+	got := gotOnA[0]
+	muA.Unlock()
+	if !bytes.Equal(got.Content, bigReply) {
+		t.Errorf("reply content mismatch")
+	}
+}
+
 // drainInterface sinks everything sent on the given crossInterface but
 // never replies. Used by handshake-timeout tests.
 func drainInterface(c *crossInterface) {

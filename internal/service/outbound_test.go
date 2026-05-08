@@ -1,0 +1,262 @@
+package service
+
+import (
+	"bytes"
+	"context"
+	"errors"
+	"io"
+	"log"
+	"path/filepath"
+	"sync"
+	"sync/atomic"
+	"testing"
+	"time"
+
+	"github.com/thatSFguy/reticulum-forwarding-service/internal/lxmf"
+)
+
+// fakeSender records every Send/RequestPath call and lets a test inject
+// per-call return values. Sufficient for exercising the queue's retry,
+// path-request, and persistence logic without standing up a real
+// transport.
+type fakeSender struct {
+	mu sync.Mutex
+
+	sendErrs    []error // pop from front per Send call
+	sendCalls   [][]byte
+	pathErr     error
+	pathRequests int32
+}
+
+func (f *fakeSender) SendLXMF(recipient, body []byte) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.sendCalls = append(f.sendCalls, append([]byte(nil), body...))
+	if len(f.sendErrs) == 0 {
+		return nil
+	}
+	err := f.sendErrs[0]
+	f.sendErrs = f.sendErrs[1:]
+	return err
+}
+
+func (f *fakeSender) RequestPath(recipient []byte) error {
+	atomic.AddInt32(&f.pathRequests, 1)
+	return f.pathErr
+}
+
+func (f *fakeSender) sendCount() int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return len(f.sendCalls)
+}
+
+func newTestQueue(t *testing.T, sender outboundSender, store *outboundStore) *OutboundQueue {
+	t.Helper()
+	q := newOutboundQueue(sender, store, log.New(io.Discard, "", 0))
+	q.now = time.Now
+	return q
+}
+
+func TestEnqueueAndDrainSuccess(t *testing.T) {
+	sender := &fakeSender{}
+	q := newTestQueue(t, sender, nil)
+
+	q.Enqueue(make([]byte, 16), []byte("hello"))
+	if got := q.pendingCount(); got != 1 {
+		t.Fatalf("pendingCount after enqueue = %d, want 1", got)
+	}
+
+	q.processOnce(context.Background())
+
+	if got := sender.sendCount(); got != 1 {
+		t.Fatalf("sendCount = %d, want 1", got)
+	}
+	if got := q.pendingCount(); got != 0 {
+		t.Fatalf("pendingCount after success = %d, want 0", got)
+	}
+}
+
+func TestDrainRetriesAfterTransientError(t *testing.T) {
+	sender := &fakeSender{
+		sendErrs: []error{errors.New("link timeout"), nil},
+	}
+	q := newTestQueue(t, sender, nil)
+	// Tighten the retry wait so the test stays fast.
+	q.retryWait = 5 * time.Millisecond
+
+	q.Enqueue(make([]byte, 16), []byte("hi"))
+	q.processOnce(context.Background())
+
+	// First attempt failed; message should still be queued with a
+	// scheduled NextAttempt in the future.
+	if got := q.pendingCount(); got != 1 {
+		t.Fatalf("pendingCount after first failure = %d, want 1", got)
+	}
+	if got := sender.sendCount(); got != 1 {
+		t.Fatalf("sendCount after first failure = %d, want 1", got)
+	}
+
+	// Wait past the retryWait, drain again — should succeed and clear.
+	time.Sleep(10 * time.Millisecond)
+	q.processOnce(context.Background())
+
+	if got := q.pendingCount(); got != 0 {
+		t.Fatalf("pendingCount after retry success = %d, want 0", got)
+	}
+	if got := sender.sendCount(); got != 2 {
+		t.Fatalf("sendCount after retry = %d, want 2", got)
+	}
+}
+
+func TestDrainGivesUpAfterMaxAttempts(t *testing.T) {
+	// Always-fail sender. With maxAttempts=3, expect exactly 3 Send
+	// calls and the message removed (failed).
+	sender := &fakeSender{}
+	for i := 0; i < 10; i++ {
+		sender.sendErrs = append(sender.sendErrs, errors.New("never delivers"))
+	}
+	q := newTestQueue(t, sender, nil)
+	q.maxAttempts = 3
+	q.retryWait = 0 // due immediately on every tick
+
+	q.Enqueue(make([]byte, 16), []byte("doomed"))
+
+	// Drain repeatedly — each processOnce should consume one attempt
+	// (the message is due immediately because retryWait=0).
+	for i := 0; i < 5; i++ {
+		q.processOnce(context.Background())
+	}
+
+	if got := sender.sendCount(); got != 3 {
+		t.Errorf("sendCount = %d, want 3 (maxAttempts)", got)
+	}
+	if got := q.pendingCount(); got != 0 {
+		t.Errorf("pendingCount after fail = %d, want 0", got)
+	}
+}
+
+func TestRecipientUnknownTriggersPathRequest(t *testing.T) {
+	// First two attempts fail with ErrRecipientUnknown; third succeeds.
+	// Path request should fire on attempt 2 (after pathlessTries=1) and
+	// the backoff should be the longer pathRequestWait.
+	sender := &fakeSender{
+		sendErrs: []error{
+			lxmf.ErrRecipientUnknown,
+			lxmf.ErrRecipientUnknown,
+			nil,
+		},
+	}
+	q := newTestQueue(t, sender, nil)
+	q.retryWait = time.Millisecond
+	q.pathRequestWait = time.Millisecond
+
+	q.Enqueue(make([]byte, 16), []byte("path-request test"))
+
+	for i := 0; i < 3; i++ {
+		q.processOnce(context.Background())
+		time.Sleep(2 * time.Millisecond)
+	}
+
+	if got := atomic.LoadInt32(&sender.pathRequests); got < 1 {
+		t.Errorf("pathRequests = %d, want >= 1", got)
+	}
+	if got := q.pendingCount(); got != 0 {
+		t.Errorf("pendingCount after success = %d, want 0", got)
+	}
+}
+
+func TestNotYetDueMessageIsSkipped(t *testing.T) {
+	sender := &fakeSender{}
+	q := newTestQueue(t, sender, nil)
+
+	q.Enqueue(make([]byte, 16), []byte("future"))
+	// Hand-set NextAttempt to the far future.
+	q.mu.Lock()
+	q.pending[0].NextAttempt = time.Now().Add(time.Hour)
+	q.mu.Unlock()
+
+	q.processOnce(context.Background())
+
+	if got := sender.sendCount(); got != 0 {
+		t.Errorf("sendCount = %d, want 0 (message not due)", got)
+	}
+	if got := q.pendingCount(); got != 1 {
+		t.Errorf("pendingCount = %d, want 1", got)
+	}
+}
+
+func TestPersistenceRoundTrip(t *testing.T) {
+	dir := t.TempDir()
+	storePath := filepath.Join(dir, "outbound.json")
+	store := newOutboundStore(storePath)
+
+	sender1 := &fakeSender{}
+	q1 := newTestQueue(t, sender1, store)
+
+	body := []byte("survive a restart")
+	recipient := bytes.Repeat([]byte{0xab}, 16)
+	q1.Enqueue(recipient, body)
+
+	// Brand-new queue, same store: it should pick up the persisted
+	// message on Load and drain it on processOnce.
+	sender2 := &fakeSender{}
+	q2 := newTestQueue(t, sender2, store)
+	if err := q2.Load(); err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if got := q2.pendingCount(); got != 1 {
+		t.Fatalf("pendingCount after Load = %d, want 1", got)
+	}
+
+	q2.processOnce(context.Background())
+	if got := sender2.sendCount(); got != 1 {
+		t.Fatalf("sendCount = %d, want 1", got)
+	}
+	if !bytes.Equal(sender2.sendCalls[0], body) {
+		t.Errorf("sendCalls[0] = %q, want %q", sender2.sendCalls[0], body)
+	}
+}
+
+func TestDrainOrderIsFIFO(t *testing.T) {
+	sender := &fakeSender{}
+	q := newTestQueue(t, sender, nil)
+
+	for i := byte(0); i < 5; i++ {
+		q.Enqueue(make([]byte, 16), []byte{i})
+	}
+
+	q.processOnce(context.Background())
+
+	if got := sender.sendCount(); got != 5 {
+		t.Fatalf("sendCount = %d, want 5", got)
+	}
+	for i, body := range sender.sendCalls {
+		if len(body) != 1 || body[0] != byte(i) {
+			t.Errorf("sendCalls[%d] = %v, want [%d]", i, body, i)
+		}
+	}
+}
+
+func TestEnqueuePersistsImmediately(t *testing.T) {
+	// A crash between enqueue and the next drain tick must not lose
+	// the message — this verifies the file is written from inside
+	// Enqueue, not lazily on first drain.
+	dir := t.TempDir()
+	storePath := filepath.Join(dir, "outbound.json")
+	store := newOutboundStore(storePath)
+
+	q := newTestQueue(t, &fakeSender{}, store)
+	q.Enqueue(make([]byte, 16), []byte("durable"))
+
+	loaded, err := store.load()
+	if err != nil {
+		t.Fatalf("store.load: %v", err)
+	}
+	if len(loaded) != 1 {
+		t.Fatalf("loaded %d messages, want 1", len(loaded))
+	}
+	if string(loaded[0].Body) != "durable" {
+		t.Errorf("loaded body = %q, want %q", loaded[0].Body, "durable")
+	}
+}

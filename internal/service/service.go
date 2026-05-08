@@ -45,6 +45,7 @@ type Service struct {
 	roster     *roster.Roster
 	history    *history.Log
 	dispatcher *commands.Dispatcher
+	outbound   *OutboundQueue
 
 	logger *log.Logger
 	now    func() time.Time
@@ -86,6 +87,16 @@ func New(cfg *config.Config) (*Service, error) {
 		return nil, fmt.Errorf("register delivery: %w", err)
 	}
 
+	outboundStore := newOutboundStore(outboundStorePath(cfg.Service.StatePath))
+	outbound := newOutboundQueue(
+		&deliverySender{delivery: delivery, transport: transport},
+		outboundStore,
+		logger,
+	)
+	if err := outbound.Load(); err != nil {
+		return nil, fmt.Errorf("load outbound queue: %w", err)
+	}
+
 	svc := &Service{
 		cfg:       cfg,
 		identity:  id,
@@ -93,6 +104,7 @@ func New(cfg *config.Config) (*Service, error) {
 		delivery:  delivery,
 		roster:    r,
 		history:   hist,
+		outbound:  outbound,
 		logger:    logger,
 		now:       time.Now,
 	}
@@ -142,6 +154,13 @@ func (s *Service) Run(ctx context.Context) error {
 	// RunLinkSweeper closes idle outbound links and emits KEEPALIVE on
 	// active ones so the responder doesn't tear them down for inactivity.
 	go s.transport.RunLinkSweeper(tCtx)
+	// OutboundQueue.Run drains the persisted outbound message queue —
+	// retries up to maxDeliveryAttempts with deliveryRetryWait backoff,
+	// path-request defer for unknown recipients. Sequential by design
+	// (half-duplex collision resilience).
+	go s.outbound.Run(tCtx)
+
+	s.logger.Printf("outbound queue depth   : %d", s.outbound.pendingCount())
 
 	pruneTicker := time.NewTicker(s.cfg.Service.PruneInterval.Std())
 	defer pruneTicker.Stop()

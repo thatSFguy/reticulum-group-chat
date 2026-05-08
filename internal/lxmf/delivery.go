@@ -8,6 +8,13 @@ import (
 	"github.com/thatSFguy/reticulum-forwarding-service/internal/rns"
 )
 
+// ErrRecipientUnknown is returned by Send when the recipient hasn't
+// announced yet, so we have no public key to encrypt to. Callers wrapping
+// Send in a retry loop should treat this as a recoverable error: issue a
+// path request to the recipient and try again later, since an inbound
+// announce can populate the public key out-of-band.
+var ErrRecipientUnknown = errors.New("recipient has not announced; cannot encrypt")
+
 // Delivery is an LXMF "delivery destination" registered on a Transport.
 // Inbound opportunistic LXMF messages addressed to its destination hash are
 // Token-decrypted, parsed, signature-verified, and handed to OnMessage.
@@ -93,7 +100,7 @@ func (d *Delivery) Send(recipientDestHash []byte, title, content []byte, fields 
 	}
 	known := d.transport.Recall(recipientDestHash)
 	if known == nil {
-		return fmt.Errorf("recipient %x has not announced; cannot encrypt", recipientDestHash[:4])
+		return fmt.Errorf("%w: %x", ErrRecipientUnknown, recipientDestHash[:4])
 	}
 
 	// Try opportunistic first. signAndPackOpportunisticAt fails fast with
@@ -210,7 +217,16 @@ func (d *Delivery) handleInbound(p *rns.Packet) {
 	}
 
 	if d.OnMessage != nil {
-		d.OnMessage(msg)
+		// CRITICAL: dispatch on a goroutine so a slow OnMessage cannot
+		// block the Transport dispatcher. The forwarder calls
+		// Delivery.Send from within OnMessage, and Send may block on a
+		// Reticulum Link handshake (LRPROOF round-trip) — which arrives
+		// on the SAME dispatcher goroutine. Running OnMessage inline
+		// causes a deadlock: dispatch is stuck in Send waiting for an
+		// LRPROOF that's queued waiting for dispatch. Spawning here
+		// turns Send's blocking semantics back into the per-call wait
+		// it's documented to be, without holding the dispatcher.
+		go d.OnMessage(msg)
 	}
 }
 
@@ -244,7 +260,16 @@ func (d *Delivery) handleInboundLinkPlaintext(plaintext []byte) {
 		return
 	}
 	if d.OnMessage != nil {
-		d.OnMessage(msg)
+		// CRITICAL: dispatch on a goroutine so a slow OnMessage cannot
+		// block the Transport dispatcher. The forwarder calls
+		// Delivery.Send from within OnMessage, and Send may block on a
+		// Reticulum Link handshake (LRPROOF round-trip) — which arrives
+		// on the SAME dispatcher goroutine. Running OnMessage inline
+		// causes a deadlock: dispatch is stuck in Send waiting for an
+		// LRPROOF that's queued waiting for dispatch. Spawning here
+		// turns Send's blocking semantics back into the per-call wait
+		// it's documented to be, without holding the dispatcher.
+		go d.OnMessage(msg)
 	}
 }
 
