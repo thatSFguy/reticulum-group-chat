@@ -103,7 +103,13 @@ Reticulum-supported transport.
   hasn't announced yet. A single packet collision on a half-duplex
   segment no longer drops the message, and the queue persists to
   `outbound.json` so a service restart resumes pending sends rather
-  than losing them. See
+  than losing them. The queue is drained by a small worker pool
+  (4 concurrent sends), so a slow link send to one recipient doesn't
+  block command replies or forwards to others — head-of-line
+  avoidance for snappy UX. The picker prioritises by recipient
+  recency: peers we just heard announce go first (most likely to be
+  online), then less-recent peers, then peers we've never heard from.
+  See
   [`flows/lxmf-outbound-retry.md`](https://github.com/thatSFguy/reticulum-specifications/blob/master/flows/lxmf-outbound-retry.md)
   in the spec repo for the upstream-equivalent state machine this
   mirrors.

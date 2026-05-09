@@ -22,27 +22,49 @@ import (
 type fakeSender struct {
 	mu sync.Mutex
 
-	sendErrs    []error // pop from front per Send call
-	sendCalls   [][]byte
-	pathErr     error
-	pathRequests int32
+	sendErrs       []error // pop from front per Send call
+	sendCalls      [][]byte
+	sendRecipients [][]byte
+	sendDelay      time.Duration // sleep inside SendLXMF, for parallelism tests
+	pathErr        error
+	pathRequests   int32
+
+	// recency populates LastAnnounceFor responses keyed by the first
+	// byte of the recipient hash (a tiny hack — every test recipient
+	// in this file uses bytes.Repeat so byte 0 is unique per recipient).
+	recency map[byte]time.Time
 }
 
 func (f *fakeSender) SendLXMF(recipient, body []byte) error {
 	f.mu.Lock()
-	defer f.mu.Unlock()
 	f.sendCalls = append(f.sendCalls, append([]byte(nil), body...))
-	if len(f.sendErrs) == 0 {
-		return nil
+	f.sendRecipients = append(f.sendRecipients, append([]byte(nil), recipient...))
+	delay := f.sendDelay
+	var err error
+	if len(f.sendErrs) > 0 {
+		err = f.sendErrs[0]
+		f.sendErrs = f.sendErrs[1:]
 	}
-	err := f.sendErrs[0]
-	f.sendErrs = f.sendErrs[1:]
+	f.mu.Unlock()
+	if delay > 0 {
+		time.Sleep(delay)
+	}
 	return err
 }
 
 func (f *fakeSender) RequestPath(recipient []byte) error {
 	atomic.AddInt32(&f.pathRequests, 1)
 	return f.pathErr
+}
+
+func (f *fakeSender) LastAnnounceFor(recipient []byte) (time.Time, bool) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.recency == nil || len(recipient) == 0 {
+		return time.Time{}, false
+	}
+	t, ok := f.recency[recipient[0]]
+	return t, ok
 }
 
 func (f *fakeSender) sendCount() int {
@@ -235,6 +257,132 @@ func TestDrainOrderIsFIFO(t *testing.T) {
 		if len(body) != 1 || body[0] != byte(i) {
 			t.Errorf("sendCalls[%d] = %v, want [%d]", i, body, i)
 		}
+	}
+}
+
+func TestPickDuePrioritisesMostRecentlyAnnouncedRecipient(t *testing.T) {
+	now := time.Now()
+	sender := &fakeSender{
+		recency: map[byte]time.Time{
+			0x01: now.Add(-1 * time.Hour),  // older
+			0x02: now.Add(-10 * time.Minute), // newest
+			0x03: now.Add(-30 * time.Minute), // middle
+		},
+	}
+	q := newTestQueue(t, sender, nil)
+
+	q.Enqueue(bytes.Repeat([]byte{0x01}, 16), []byte("oldest"))
+	q.Enqueue(bytes.Repeat([]byte{0x02}, 16), []byte("newest"))
+	q.Enqueue(bytes.Repeat([]byte{0x03}, 16), []byte("middle"))
+
+	q.processOnce(context.Background())
+
+	if got := sender.sendCount(); got != 3 {
+		t.Fatalf("sendCount = %d, want 3", got)
+	}
+	// Recipients should drain newest-first regardless of enqueue order.
+	wantOrder := []byte{0x02, 0x03, 0x01}
+	for i, want := range wantOrder {
+		if sender.sendRecipients[i][0] != want {
+			t.Errorf("sendRecipients[%d][0] = 0x%02x, want 0x%02x",
+				i, sender.sendRecipients[i][0], want)
+		}
+	}
+}
+
+func TestPickDueDeprioritisesUnknownRecipients(t *testing.T) {
+	now := time.Now()
+	sender := &fakeSender{
+		recency: map[byte]time.Time{
+			0xAA: now.Add(-2 * time.Hour),
+			// 0xBB unknown
+		},
+	}
+	q := newTestQueue(t, sender, nil)
+
+	// Enqueue unknown FIRST, then known. Known should still drain first
+	// because any recency beats unknown.
+	q.Enqueue(bytes.Repeat([]byte{0xBB}, 16), []byte("unknown"))
+	q.Enqueue(bytes.Repeat([]byte{0xAA}, 16), []byte("known"))
+
+	q.processOnce(context.Background())
+
+	if sender.sendRecipients[0][0] != 0xAA {
+		t.Errorf("first send was 0x%02x, want 0xAA (known recipient)",
+			sender.sendRecipients[0][0])
+	}
+}
+
+func TestPickDueFIFOAmongUnknownRecipients(t *testing.T) {
+	// All recipients unknown — should fall back to enqueue order.
+	sender := &fakeSender{}
+	q := newTestQueue(t, sender, nil)
+
+	for _, b := range []byte{0x10, 0x20, 0x30} {
+		q.Enqueue(bytes.Repeat([]byte{b}, 16), []byte{b})
+	}
+	q.processOnce(context.Background())
+
+	for i, want := range []byte{0x10, 0x20, 0x30} {
+		if sender.sendRecipients[i][0] != want {
+			t.Errorf("FIFO broken: sendRecipients[%d] = 0x%02x, want 0x%02x",
+				i, sender.sendRecipients[i][0], want)
+		}
+	}
+}
+
+func TestWorkersRunInParallelToAvoidHeadOfLineBlocking(t *testing.T) {
+	// One slow recipient + several fast ones. With workers=4, the
+	// slow send must NOT block the fast sends — total wall time
+	// should be roughly the slow send's duration, not the sum of
+	// all sends.
+	const slowDuration = 200 * time.Millisecond
+	const fastSends = 5
+
+	sender := &fakeSender{sendDelay: slowDuration}
+	q := newTestQueue(t, sender, nil)
+	q.workers = 4
+	q.interval = 20 * time.Millisecond // workers idle quickly when nothing's due
+
+	// Enqueue one "slow" + N "fast" — all the same delay, but the
+	// point is N+1 messages should drain in roughly slowDuration if
+	// workers run in parallel, vs (N+1)*slowDuration if serial.
+	for i := 0; i < 1+fastSends; i++ {
+		q.Enqueue(bytes.Repeat([]byte{byte(i + 1)}, 16), []byte{byte(i)})
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+
+	done := make(chan struct{})
+	start := time.Now()
+	go func() {
+		q.Run(ctx)
+		close(done)
+	}()
+
+	// Wait until all messages drain (or timeout).
+	deadline := time.Now().Add(1500 * time.Millisecond)
+	for time.Now().Before(deadline) {
+		if q.pendingCount() == 0 {
+			break
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	elapsed := time.Since(start)
+	cancel()
+	<-done
+
+	if q.pendingCount() != 0 {
+		t.Fatalf("queue still has %d pending after deadline", q.pendingCount())
+	}
+	// With 4 workers and 6 sends each taking ~200ms, expect ~400ms
+	// total (two batches of 4 → only 2 workers in second batch).
+	// Allow generous slack for CI: anything under 800ms proves we
+	// got real parallelism (serial would be 6 × 200 = 1200ms).
+	if elapsed > 800*time.Millisecond {
+		t.Errorf("drain took %v with workers=4 + delay=%v; expected < 800ms (serial would be 1200ms)",
+			elapsed, slowDuration)
 	}
 }
 

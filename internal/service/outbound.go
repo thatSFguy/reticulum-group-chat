@@ -29,6 +29,16 @@ const (
 	pathRequestWait     = 7 * time.Second  // LXMRouter.PATH_REQUEST_WAIT
 	maxPathlessTries    = 1                // LXMRouter.MAX_PATHLESS_TRIES
 	processingInterval  = 4 * time.Second  // LXMRouter.PROCESSING_INTERVAL
+
+	// outboundWorkers caps the number of concurrent in-flight Send
+	// calls. Higher values let a fast command reply to user A skip
+	// past a slow link send to user B (head-of-line avoidance), at
+	// the cost of more parallel work on the underlying interface.
+	// Four matches the typical LXMF/Sideband fan-out for small
+	// rosters; bump it if your roster is large and your interface
+	// can absorb the parallelism (a TCP-attached rnsd handles the
+	// per-radio scheduling for us).
+	outboundWorkers = 4
 )
 
 // outboundMessage is one queued LXMF message awaiting delivery. The drain
@@ -51,22 +61,35 @@ type outboundMessage struct {
 type outboundSender interface {
 	SendLXMF(recipient, body []byte) error
 	RequestPath(recipient []byte) error
+	// LastAnnounceFor returns when the recipient most recently
+	// announced (verified inbound), or zero+false if we've never
+	// heard them. The drain loop uses this to send to the most
+	// recently-seen recipient first — they're most likely to be
+	// reachable, and prioritising them shrinks the latency for users
+	// who are actually online while a slow send to a possibly-offline
+	// peer can wait.
+	LastAnnounceFor(recipient []byte) (time.Time, bool)
 }
 
-// OutboundQueue serializes outbound LXMF deliveries through Delivery.Send
-// with retry semantics matching LXMF 0.9.7's LXMRouter.process_outbound.
+// OutboundQueue runs outbound LXMF deliveries through Delivery.Send with
+// retry semantics matching LXMF 0.9.7's LXMRouter.process_outbound.
 //
-// One drain goroutine runs sequentially — half-duplex LoRa interfaces
-// collide if multiple sends race, so parallel delivery would defeat the
-// retry resilience the queue exists to provide. Multiple due messages
-// drain per tick, but each Send blocks until proof or timeout.
+// Sends run on a small worker pool (outboundWorkers, default 4) so a
+// slow link send to one recipient doesn't block command replies or
+// forwards to others — head-of-line avoidance is the main reason for
+// concurrency here. Each worker independently picks the next due
+// message via pickDue, which orders by recipient recency so a
+// recently-announced peer (most likely reachable) goes first; ties
+// fall back to FIFO. The queue mutex is the only serialisation point;
+// nothing else coordinates between workers.
 type OutboundQueue struct {
 	sender outboundSender
 	store  *outboundStore
 	logger *log.Logger
 
-	mu      sync.Mutex
-	pending []*outboundMessage
+	mu       sync.Mutex
+	pending  []*outboundMessage
+	inFlight map[string]bool // message ID → currently being sent
 
 	// Tunables exposed for tests; production uses the package constants.
 	interval        time.Duration
@@ -74,6 +97,7 @@ type OutboundQueue struct {
 	pathRequestWait time.Duration
 	maxAttempts     int
 	pathlessTries   int
+	workers         int
 
 	now func() time.Time
 }
@@ -83,11 +107,13 @@ func newOutboundQueue(sender outboundSender, store *outboundStore, logger *log.L
 		sender:          sender,
 		store:           store,
 		logger:          logger,
+		inFlight:        map[string]bool{},
 		interval:        processingInterval,
 		retryWait:       deliveryRetryWait,
 		pathRequestWait: pathRequestWait,
 		maxAttempts:     maxDeliveryAttempts,
 		pathlessTries:   maxPathlessTries,
+		workers:         outboundWorkers,
 		now:             time.Now,
 	}
 }
@@ -125,18 +151,38 @@ func (q *OutboundQueue) Enqueue(recipient, body []byte) string {
 	return msg.ID
 }
 
-// Run drives the drain loop until ctx is cancelled. Sends are sequential.
+// Run drives the drain loop until ctx is cancelled. Spawns
+// q.workers goroutines that independently pick due messages and call
+// Send. Each worker idles for q.interval when there's nothing due,
+// so a freshly enqueued message is picked up within at most one
+// interval (4s default).
 func (q *OutboundQueue) Run(ctx context.Context) {
-	ticker := time.NewTicker(q.interval)
-	defer ticker.Stop()
-	q.processOnce(ctx)
+	var wg sync.WaitGroup
+	for i := 0; i < q.workers; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			q.workerLoop(ctx)
+		}()
+	}
+	wg.Wait()
+}
+
+func (q *OutboundQueue) workerLoop(ctx context.Context) {
 	for {
-		select {
-		case <-ctx.Done():
+		if ctx.Err() != nil {
 			return
-		case <-ticker.C:
-			q.processOnce(ctx)
 		}
+		msg := q.pickDue()
+		if msg == nil {
+			select {
+			case <-ctx.Done():
+				return
+			case <-time.After(q.interval):
+				continue
+			}
+		}
+		q.attempt(msg)
 	}
 }
 
@@ -147,6 +193,9 @@ func (q *OutboundQueue) pendingCount() int {
 	return len(q.pending)
 }
 
+// processOnce drains every currently-due message synchronously in the
+// caller's goroutine. Used by tests so assertions don't have to race
+// the worker pool. Production uses Run/workerLoop.
 func (q *OutboundQueue) processOnce(ctx context.Context) {
 	for {
 		if ctx.Err() != nil {
@@ -160,21 +209,60 @@ func (q *OutboundQueue) processOnce(ctx context.Context) {
 	}
 }
 
+// pickDue returns the next message ready to send and marks it
+// in-flight, or nil if nothing's due. Selection rules:
+//
+//   - skip messages currently in-flight on another worker
+//   - skip messages whose NextAttempt is in the future
+//   - among due+available messages, pick the one whose recipient most
+//     recently announced (recipients we just heard from are most
+//     likely to ack, so prioritising them shrinks effective latency
+//     for users who are actually online)
+//   - tie-break with FIFO so two equally-recent recipients drain in
+//     enqueue order
+//   - recipients with no announce on record are deprioritised — they'd
+//     ride retries anyway, so giving live recipients a head start
+//     doesn't penalise them
 func (q *OutboundQueue) pickDue() *outboundMessage {
 	now := q.now()
 	q.mu.Lock()
 	defer q.mu.Unlock()
+
+	var best *outboundMessage
+	var bestSeen time.Time
+	var bestKnown bool
+
 	for _, m := range q.pending {
-		if m.NextAttempt.IsZero() || !m.NextAttempt.After(now) {
-			return m
+		if q.inFlight[m.ID] {
+			continue
 		}
+		if !m.NextAttempt.IsZero() && m.NextAttempt.After(now) {
+			continue
+		}
+		seen, known := q.sender.LastAnnounceFor(m.Recipient)
+		switch {
+		case best == nil:
+			best, bestSeen, bestKnown = m, seen, known
+		case known && !bestKnown:
+			// Any known recency beats unknown.
+			best, bestSeen, bestKnown = m, seen, known
+		case known && bestKnown && seen.After(bestSeen):
+			// More recent wins among known.
+			best, bestSeen, bestKnown = m, seen, known
+		}
+		// Other cases keep the current best (FIFO tie-break: first
+		// match in the iteration order is the older enqueue).
 	}
-	return nil
+	if best != nil {
+		q.inFlight[best.ID] = true
+	}
+	return best
 }
 
 // attempt fires one Send for msg and updates state from the outcome.
 // Holds no lock across Send — Delivery.Send blocks for the link DATA
 // proof on the link path, up to lxmf.LinkSendTimeout (30s default).
+// Clears the in-flight marker before returning, regardless of outcome.
 func (q *OutboundQueue) attempt(msg *outboundMessage) {
 	q.mu.Lock()
 	msg.Attempts++
@@ -185,6 +273,7 @@ func (q *OutboundQueue) attempt(msg *outboundMessage) {
 
 	q.mu.Lock()
 	defer q.mu.Unlock()
+	defer delete(q.inFlight, msg.ID)
 	if err == nil {
 		q.removeLocked(msg)
 		q.persistLocked()
@@ -268,6 +357,14 @@ func (d *deliverySender) SendLXMF(recipient, body []byte) error {
 
 func (d *deliverySender) RequestPath(recipient []byte) error {
 	return d.transport.RequestPath(recipient)
+}
+
+func (d *deliverySender) LastAnnounceFor(recipient []byte) (time.Time, bool) {
+	known := d.transport.Recall(recipient)
+	if known == nil {
+		return time.Time{}, false
+	}
+	return known.LastSeen, true
 }
 
 // outboundStore is the on-disk backing for OutboundQueue. JSON file
