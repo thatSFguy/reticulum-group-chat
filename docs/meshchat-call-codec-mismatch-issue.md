@@ -4,50 +4,48 @@ Submit at: https://github.com/liamcottle/reticulum-meshchat/issues/new
 
 ---
 
-**Title:** Voice call to a peer with no `call.audio` destination shows misleading "codec mismatch" instead of "not supported"
+**Title:** Spurious incoming-call notification from a peer that has no `call.audio` destination
 
 ---
 
 ## Summary
 
-When MeshChat tries to call a peer whose RNS identity exists and announces normally on `lxmf.delivery` but does **not** register a `call.audio` destination, the call attempt times out at the link-establishment stage and the UI surfaces a "codec mismatch" / failed-call message. The actual failure isn't codec-related at all — it's "no destination listening" — so the displayed reason is misleading and points users at the wrong problem.
+A MeshChat user receives an "incoming call" UI notification attributed to a peer that has only an `lxmf.delivery` destination — no `call.audio` destination at all. The notification fires shortly after the peer's announce reaches the user's MeshChat, presents briefly with a codec-mismatch / failed-call message, and ends. This is reproducible against any text-only LXMF peer; we hit it consistently against [`reticulum-forwarding-service`](https://github.com/thatSFguy/reticulum-forwarding-service), a Go LXMF group-chat relay that registers only `lxmf.delivery` and never opens links to anything other than other peers' `lxmf.delivery` destinations.
 
-## What the user sees
+## What we expect
 
-A text-only LXMF peer (in our case [`reticulum-forwarding-service`](https://github.com/thatSFguy/reticulum-forwarding-service), a group-chat relay that registers only `lxmf.delivery`) appears in the address book / online list as expected. Tapping the call button — or any frontend code path that triggers a voice call to that destination — shows a brief "incoming/outgoing call" UI that immediately ends with a codec-mismatch-flavored message. The service's log shows nothing on the call attempt because the LINKREQUEST hits a destination hash with no local listener and is silently dropped.
+The text-only peer never derives, never announces, and never opens a link to `call.audio` on anyone. So the only way `AudioCallReceiver.client_connected` should fire is if a remote peer establishes a link to *the local user's* `call.audio` destination — which a peer that doesn't even know that aspect exists shouldn't be able to do.
 
-## Why it happens (per code)
+## What actually happens
 
-`src/backend/audio_call_manager.py`:
+The incoming-call UI appears, attributed to the text-only peer. We've audited the relay end:
 
-- The call protocol opens an `RNS.Link` to a destination on the peer's identity with aspects `"call"` and `"audio"`:
-  ```python
-  server_destination = RNS.Destination(
-      server_identity, RNS.Destination.OUT, RNS.Destination.SINGLE,
-      "call", "audio")
-  link = RNS.Link(server_destination)
-  ```
-- A peer that doesn't register `call.audio` has no responder for that hash. The LINKREQUEST goes unanswered; the `RNS.Link` constructor's establishment timer fires and the wrapper raises:
-  ```python
-  raise CallFailedException("Could not establish link to destination.")
-  ```
-- The frontend translates this generic "could not establish link" into the codec-mismatch UI, which is misleading — codec negotiation never started.
+- It never computes the `call.audio` name_hash, so it cannot produce that destination's hash.
+- Its only outbound link path (`acquireLinkTo`) targets the recipient's `lxmf.delivery` dest_hash — pulled either from `roster.ActiveHashes()` or from the `source_hash` field of an inbound LXMF body. Both are `lxmf.delivery` hashes, not `call.audio`.
+- It does not call `link.identify`, so even if a link reached MeshChat for unrelated reasons, we wouldn't be advertising our identity over it.
 
-## Proposed fix
+## Suspected mechanisms (need help confirming)
 
-Distinguish the *no-listener-at-all* failure mode from genuine codec/establishment failures, and surface a different message:
+One of the following must be true. We can't pin which without MeshChat-side diagnostics:
 
-- If the link establishment times out **without** any LRPROOF arriving at all (i.e. the destination hash has no responder on the network), treat that as "peer doesn't support voice calls" and display a UI to that effect — e.g. *"This peer doesn't support voice calls"* or *"No call destination on this peer"*.
-- If an LRPROOF arrives but subsequent codec/audio negotiation fails, keep the current "codec mismatch" message — that's accurate then.
+1. **Misrouted link callback.** RNS dispatches the link-established callback on the destination the LINKREQUEST is addressed to. If anything in MeshChat installs a global / identity-level link callback that fires for *any* destination on the identity, an inbound LXMF link (addressed to `lxmf.delivery` on the user's identity) would be misrouted to `AudioCallReceiver.client_connected`. Worth checking whether `set_link_established_callback` is installed anywhere outside `AudioCallReceiver.__init__`, and whether anything wraps RNS's per-destination dispatch.
 
-The two cases are distinguishable inside `RNS.Link` (initiator either gets an LRPROOF or doesn't). A small wrapper around the link callback could classify the failure before the frontend reaches the codec-mismatch path.
+2. **Frontend or unrelated subsystem opens the call.audio link.** Something other than `AudioCallManager.initiate()` — possibly a Vue frontend handler, a presence/keepalive job, or a contact-online auto-action — opens a link to a peer's `call.audio` destination on announce-received. We didn't find such a path in `audio_call_manager.py` or `announce_handler.py` but haven't read the frontend.
 
-Even simpler short-term: add a hint to the failed-call UI suggesting that "this peer may not support voice calls" so users don't chase phantom codec issues.
+3. **Misattribution.** An unrelated peer is actually opening links to the user's `call.audio` and the admin is attributing it to whichever peer most recently announced. Less likely given how reproducibly it correlates with fwdsvc startup, but possible.
+
+## Diagnostic that would settle it
+
+When the bogus notification fires, MeshChat's log line for the incoming call (and the link-established callback that fired) should include the dest_hash the link was addressed to and the initiator's identity hash if it identified. Specifically:
+
+- If the destination shows the user's `call.audio` dest_hash AND the initiator hash matches the text-only peer's identity → that peer really did open a call.audio link, and the bug is on the peer's side or in some shared library both ends use.
+- If the destination shows the user's `lxmf.delivery` dest_hash (not call.audio) → MeshChat is misrouting the callback (mechanism #1 above).
+- If the initiator hash doesn't match the displayed peer → misattribution (#3).
+
+We're happy to capture this on our side too if MeshChat exposes the link-established attribution.
 
 ## Why this matters
 
-Text-only LXMF peers (group-chat relays, command bots, automation endpoints) are a growing class of useful destinations. They announce normally and respond to LXMF, but have no voice surface and never will. Today's UX makes them look broken to MeshChat users when they're working as intended.
-
-Happy to put together a PR if you'd like to suggest the shape of the change.
+Text-only LXMF peers (group-chat relays, command bots, automation endpoints) are a real and growing class of useful destinations. They announce normally, respond to LXMF, and have no voice surface. Today's UX surfaces them as "broken voice peers that keep failing to connect" — which is wrong on both axes (they're not voice peers, and they're not calling anyone).
 
 cc @ynosgr — reporting this from the affected-user side (running into it via fwdsvc).
