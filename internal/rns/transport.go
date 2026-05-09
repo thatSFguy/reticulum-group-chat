@@ -1,6 +1,7 @@
 package rns
 
 import (
+	"bytes"
 	"context"
 	"crypto/ed25519"
 	"crypto/sha256"
@@ -34,7 +35,8 @@ type Transport struct {
 	locals           map[string]*LocalDestination
 	announceHandlers []AnnounceHandler
 
-	pathRequestsSent map[string]time.Time // key: hex dest_hash, dedup window
+	pathRequestsSent     map[string]time.Time // key: hex dest_hash, dedup window for outbound
+	pathResponseTagsSeen map[string]time.Time // key: hex tag, dedup for inbound path? we've already responded to
 
 	linkManager *LinkManager
 
@@ -50,6 +52,12 @@ type Transport struct {
 // same target. SPEC §7.2.2 has a much larger 32k-tag table at the relay
 // side; we just want to avoid spamming when an unknown sender retransmits.
 const PathRequestDedupWindow = 60 * time.Second
+
+// PathResponseTagDedupWindow bounds how long we remember an inbound
+// path? request's 16-byte random tag so we don't emit a path-response
+// twice if the same request reaches us through multiple relay hops or
+// re-broadcasts. Matches SPEC §7.2.5 PR_TAG_WINDOW.
+const PathResponseTagDedupWindow = 30 * time.Second
 
 // KnownIdentityCapacity caps the number of cached known identities to
 // prevent a memory-DoS where an attacker on a public mesh broadcasts
@@ -127,6 +135,16 @@ type LocalDestination struct {
 	Identity        *Identity
 	OnPacket        func(p *Packet)
 	OnLinkPlaintext func(plaintext []byte)
+
+	// BuildAnnounce, if non-nil, is called when the Transport receives
+	// a SPEC §7.2 path? request whose target_dest_hash matches this
+	// destination. The returned announce is broadcast as a path-response
+	// (SPEC §7.2 — same wire body as a regular announce, with
+	// context=ContextPathResponse so transit relays can short-circuit
+	// re-broadcast). Without this, leaf clients can't bootstrap a path
+	// to this destination via path? — they'd have to wait up to one
+	// announce_interval for our periodic announce to arrive.
+	BuildAnnounce func(context byte) (*Packet, error)
 }
 
 // AnnounceHandler is called for every verified inbound announce whose
@@ -146,7 +164,8 @@ func NewTransport(logger Logger) *Transport {
 	return &Transport{
 		known:            map[string]*KnownIdentity{},
 		locals:           map[string]*LocalDestination{},
-		pathRequestsSent: map[string]time.Time{},
+		pathRequestsSent:     map[string]time.Time{},
+		pathResponseTagsSeen: map[string]time.Time{},
 		linkManager:      NewLinkManager(),
 		logger:           logger,
 	}
@@ -380,6 +399,10 @@ func (t *Transport) dispatch(raw []byte) {
 			t.handleLinkData(p)
 			return
 		}
+		if p.DestinationType == DestinationPlain && isPathRequestDestHash(p.DestHash) {
+			t.handlePathRequest(p)
+			return
+		}
 		t.handleData(p)
 	case PacketLinkRequest:
 		t.handleLinkRequest(p)
@@ -520,6 +543,79 @@ func (t *Transport) handleLinkRequest(p *Packet) {
 	t.logger.Printf("link established (responder): id=%x peer LRREQ from %x", link.ID[:4], p.DestHash[:4])
 	if err := t.Broadcast(lrProof); err != nil {
 		t.logger.Printf("broadcast LRPROOF: %v", err)
+	}
+}
+
+// pathRequestWellKnownHash is the 16-byte well-known PLAIN destination
+// path? requests are addressed to. Cached at package-init so we don't
+// re-decode the hex on every inbound DATA packet.
+var pathRequestWellKnownHash = mustDecodeHex(PathRequestDestHashHex)
+
+func mustDecodeHex(s string) []byte {
+	b, err := hex.DecodeString(s)
+	if err != nil {
+		panic(fmt.Sprintf("invalid hex constant %q: %v", s, err))
+	}
+	return b
+}
+
+func isPathRequestDestHash(b []byte) bool {
+	return bytes.Equal(b, pathRequestWellKnownHash)
+}
+
+// handlePathRequest is invoked for inbound DATA packets addressed to
+// the well-known PLAIN path-request hash (SPEC §7.1). When the request
+// targets one of our local destinations, we emit a path-response —
+// a regular announce with context=ContextPathResponse — so the
+// requester gets our public key + path table entry without waiting for
+// our next periodic announce. Tag dedup (SPEC §7.2.5 PR_TAG_WINDOW)
+// prevents responding twice if the same request reaches us via
+// multiple relays.
+func (t *Transport) handlePathRequest(p *Packet) {
+	target, err := PathRequestTarget(p.Data)
+	if err != nil {
+		return
+	}
+	// Tag is the 16 bytes after target_dest_hash.
+	if len(p.Data) < IdentityHashLen*2 {
+		return // no tag, malformed leaf-form request
+	}
+	tag := p.Data[IdentityHashLen : IdentityHashLen*2]
+	tagKey := hex.EncodeToString(tag)
+
+	t.mu.Lock()
+	// Sweep expired tags so the map can't grow unbounded under a flood.
+	now := time.Now()
+	for k, ts := range t.pathResponseTagsSeen {
+		if now.Sub(ts) > PathResponseTagDedupWindow {
+			delete(t.pathResponseTagsSeen, k)
+		}
+	}
+	if last, ok := t.pathResponseTagsSeen[tagKey]; ok && now.Sub(last) < PathResponseTagDedupWindow {
+		t.mu.Unlock()
+		return // already responded recently
+	}
+	t.pathResponseTagsSeen[tagKey] = now
+
+	local, isOurs := t.locals[hex.EncodeToString(target)]
+	t.mu.Unlock()
+	if !isOurs {
+		// Not for us. A transit-mode node would forward; we're a leaf,
+		// so drop silently.
+		return
+	}
+	if local.BuildAnnounce == nil {
+		t.logger.Printf("path? for %x but no BuildAnnounce on local destination — cannot respond", target[:4])
+		return
+	}
+	pkt, err := local.BuildAnnounce(ContextPathResponse)
+	if err != nil {
+		t.logger.Printf("build path-response announce: %v", err)
+		return
+	}
+	t.logger.Printf("path? answered for %x (tag %x)", target[:4], tag[:4])
+	if err := t.Broadcast(pkt); err != nil {
+		t.logger.Printf("broadcast path-response: %v", err)
 	}
 }
 

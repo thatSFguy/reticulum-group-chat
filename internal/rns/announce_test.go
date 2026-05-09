@@ -179,7 +179,7 @@ func TestParseAnnounceTransportIDIsNilForHeader1(t *testing.T) {
 func TestRandomHashTimestamp(t *testing.T) {
 	id, _ := NewIdentity()
 	now := time.Date(2026, 5, 6, 12, 0, 0, 0, time.UTC)
-	pkt, err := buildAnnounce(id, FullName("lxmf", "delivery"), nil, nil,
+	pkt, err := buildAnnounce(id, FullName("lxmf", "delivery"), nil, nil, ContextNone,
 		func() time.Time { return now },
 		func(p []byte) (int, error) { return len(p), nil }, // deterministic zero entropy
 	)

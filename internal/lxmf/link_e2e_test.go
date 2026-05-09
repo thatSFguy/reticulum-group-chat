@@ -32,8 +32,8 @@ func TestLinkE2EReceiveLongMessage(t *testing.T) {
 	tB := rns.NewTransport(nil)
 	tB.AddInterface(bIface)
 
-	delA, _ := NewDelivery(tA, alice)
-	delB, _ := NewDelivery(tB, bob)
+	delA, _ := NewDelivery(tA, alice, nil)
+	delB, _ := NewDelivery(tB, bob, nil)
 
 	var (
 		mu       sync.Mutex

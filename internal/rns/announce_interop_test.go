@@ -67,7 +67,7 @@ func TestAnnounceVectorsBytewiseInterop(t *testing.T) {
 			now := func() time.Time { return time.Unix(v.Inputs.RandomHashTimestamp, 0) }
 			rnd := scriptedRandom(rhPrefix)
 
-			pkt, err := buildAnnounce(id, v.Inputs.DestinationFullName, appData, ratchetPub, now, rnd)
+			pkt, err := buildAnnounce(id, v.Inputs.DestinationFullName, appData, ratchetPub, ContextNone, now, rnd)
 			if err != nil {
 				t.Fatalf("buildAnnounce: %v", err)
 			}

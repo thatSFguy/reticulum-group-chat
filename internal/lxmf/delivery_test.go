@@ -57,11 +57,11 @@ func TestEndToEndRoundTripBetweenTwoDeliveries(t *testing.T) {
 	tB := rns.NewTransport(nil)
 	tB.AddInterface(bIface)
 
-	delA, err := NewDelivery(tA, alice)
+	delA, err := NewDelivery(tA, alice, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
-	delB, err := NewDelivery(tB, bob)
+	delB, err := NewDelivery(tB, bob, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -133,7 +133,7 @@ func TestEndToEndRoundTripBetweenTwoDeliveries(t *testing.T) {
 func TestSendRejectsUnknownRecipient(t *testing.T) {
 	id, _ := rns.NewIdentity()
 	tr := rns.NewTransport(nil)
-	d, _ := NewDelivery(tr, id)
+	d, _ := NewDelivery(tr, id, nil)
 
 	bogus := make([]byte, rns.IdentityHashLen)
 	if err := d.Send(bogus, nil, []byte("x"), nil); err == nil {

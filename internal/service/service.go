@@ -84,7 +84,18 @@ func New(cfg *config.Config) (*Service, error) {
 	}
 
 	transport := rns.NewTransport(stdLoggerAdapter{logger})
-	delivery, err := lxmf.NewDelivery(transport, id)
+	// buildAnnounceWithContext is the same announce body as our periodic
+	// announce, but we let the caller pick the context byte so the
+	// Transport can mint path-response announces (context 0x0B) on
+	// demand without duplicating the appData/identity wiring.
+	buildAnnounceWithContext := func(ctx byte) (*rns.Packet, error) {
+		appData, err := rns.EncodeLXMFAppData([]byte(cfg.Service.DisplayName), nil)
+		if err != nil {
+			return nil, err
+		}
+		return rns.BuildAnnounceWithContext(id, lxmf.FullName(), appData, nil, ctx)
+	}
+	delivery, err := lxmf.NewDelivery(transport, id, buildAnnounceWithContext)
 	if err != nil {
 		return nil, fmt.Errorf("register delivery: %w", err)
 	}

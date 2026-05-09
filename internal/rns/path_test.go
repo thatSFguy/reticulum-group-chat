@@ -95,3 +95,124 @@ func TestPathRequestTargetExtracts(t *testing.T) {
 		t.Errorf("target extraction mismatch")
 	}
 }
+
+// TestHandlePathRequestEmitsPathResponseAnnounce is the regression test
+// for the SPEC §7.2 path-request responder. When an inbound path?
+// request targets one of our local destinations, we must broadcast a
+// path-response (announce with context = ContextPathResponse) carrying
+// our public key so the requester can build a path table entry.
+//
+// Without this, leaf clients can't bootstrap a path to us via path? —
+// they have to wait up to one announce_interval (10 min default) for
+// our periodic announce.
+func TestHandlePathRequestEmitsPathResponseAnnounce(t *testing.T) {
+	transport := NewTransport(nil)
+	captured := newFakeInterface()
+	transport.AddInterface(captured)
+
+	id, _ := NewIdentity()
+	destHash := id.DestinationHashFor(FullName("lxmf", "delivery"))
+	if err := transport.RegisterLocal(&LocalDestination{
+		DestHash: destHash,
+		Identity: id,
+		OnPacket: func(*Packet) {},
+		BuildAnnounce: func(ctx byte) (*Packet, error) {
+			return BuildAnnounceWithContext(id, FullName("lxmf", "delivery"), nil, nil, ctx)
+		},
+	}); err != nil {
+		t.Fatalf("RegisterLocal: %v", err)
+	}
+
+	req, err := BuildPathRequest(destHash)
+	if err != nil {
+		t.Fatalf("BuildPathRequest: %v", err)
+	}
+	transport.handlePathRequest(req)
+
+	wires := captured.sentCopy()
+	if len(wires) != 1 {
+		t.Fatalf("expected 1 transmitted packet (path-response), got %d", len(wires))
+	}
+	resp, err := ParsePacket(wires[0])
+	if err != nil {
+		t.Fatalf("ParsePacket(response): %v", err)
+	}
+	if resp.PacketType != PacketAnnounce {
+		t.Errorf("response packet_type = %d, want PacketAnnounce", resp.PacketType)
+	}
+	if resp.Context != ContextPathResponse {
+		t.Errorf("response context = 0x%02x, want ContextPathResponse (0x0B)", resp.Context)
+	}
+	if !bytes.Equal(resp.DestHash, destHash) {
+		t.Errorf("response dest_hash = %x, want %x", resp.DestHash, destHash)
+	}
+	a, err := ParseAnnounce(resp)
+	if err != nil {
+		t.Fatalf("ParseAnnounce: %v", err)
+	}
+	if err := a.Verify(); err != nil {
+		t.Errorf("path-response announce signature does not verify: %v", err)
+	}
+}
+
+// TestHandlePathRequestIgnoresUnrelatedTarget pins that we don't emit
+// path-responses for destinations we don't own — preventing us from
+// turning into an inadvertent transit relay for arbitrary path queries.
+func TestHandlePathRequestIgnoresUnrelatedTarget(t *testing.T) {
+	transport := NewTransport(nil)
+	captured := newFakeInterface()
+	transport.AddInterface(captured)
+
+	id, _ := NewIdentity()
+	ourHash := id.DestinationHashFor(FullName("lxmf", "delivery"))
+	if err := transport.RegisterLocal(&LocalDestination{
+		DestHash: ourHash,
+		Identity: id,
+		OnPacket: func(*Packet) {},
+		BuildAnnounce: func(ctx byte) (*Packet, error) {
+			return BuildAnnounceWithContext(id, FullName("lxmf", "delivery"), nil, nil, ctx)
+		},
+	}); err != nil {
+		t.Fatalf("RegisterLocal: %v", err)
+	}
+
+	someOtherTarget := newDummyHash(0xAB)
+	req, _ := BuildPathRequest(someOtherTarget)
+	transport.handlePathRequest(req)
+
+	if got := captured.sentCopy(); len(got) != 0 {
+		t.Errorf("expected no transmission for unrelated target, got %d packets", len(got))
+	}
+}
+
+// TestHandlePathRequestDedupsByTag pins that re-receiving the same
+// request (same 16-byte tag) within PathResponseTagDedupWindow does
+// NOT cause us to emit a second response — protects against amplifying
+// when a single request reaches us via multiple relay hops.
+func TestHandlePathRequestDedupsByTag(t *testing.T) {
+	transport := NewTransport(nil)
+	captured := newFakeInterface()
+	transport.AddInterface(captured)
+
+	id, _ := NewIdentity()
+	destHash := id.DestinationHashFor(FullName("lxmf", "delivery"))
+	if err := transport.RegisterLocal(&LocalDestination{
+		DestHash: destHash,
+		Identity: id,
+		OnPacket: func(*Packet) {},
+		BuildAnnounce: func(ctx byte) (*Packet, error) {
+			return BuildAnnounceWithContext(id, FullName("lxmf", "delivery"), nil, nil, ctx)
+		},
+	}); err != nil {
+		t.Fatalf("RegisterLocal: %v", err)
+	}
+
+	req, _ := BuildPathRequest(destHash)
+
+	transport.handlePathRequest(req)
+	transport.handlePathRequest(req) // same tag → suppress
+
+	if got := captured.sentCopy(); len(got) != 1 {
+		t.Errorf("expected exactly 1 transmission with tag dedup, got %d", len(got))
+	}
+}

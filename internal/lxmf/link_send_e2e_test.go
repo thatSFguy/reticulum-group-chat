@@ -49,11 +49,11 @@ func newTwoNodeFixture(t *testing.T) *twoNodeFixture {
 	tB := rns.NewTransport(nil)
 	tB.AddInterface(bIface)
 
-	delA, err := NewDelivery(tA, alice)
+	delA, err := NewDelivery(tA, alice, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
-	delB, err := NewDelivery(tB, bob)
+	delB, err := NewDelivery(tB, bob, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -371,7 +371,7 @@ func TestSendInitiatorReceivesDataAndAcksWithEphemeralKey(t *testing.T) {
 func TestSendUnknownRecipient(t *testing.T) {
 	alice, _ := rns.NewIdentity()
 	tA := rns.NewTransport(nil)
-	delA, _ := NewDelivery(tA, alice)
+	delA, _ := NewDelivery(tA, alice, nil)
 
 	bob, _ := rns.NewIdentity()
 	delBHash := bob.DestinationHashFor(FullName())
@@ -427,7 +427,7 @@ func TestSendOverLinkHandshakeTimeout(t *testing.T) {
 	bobDest := bob.DestinationHashFor(FullName())
 	plantKnown(t, tA, bob, bobDest)
 
-	delA, _ := NewDelivery(tA, alice)
+	delA, _ := NewDelivery(tA, alice, nil)
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	go tA.Run(ctx)

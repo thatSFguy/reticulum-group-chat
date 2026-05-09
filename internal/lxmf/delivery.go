@@ -47,7 +47,14 @@ type Delivery struct {
 // NewDelivery registers the LXMF delivery destination for `identity` on
 // `transport` and returns the wrapper. OnMessage and OnError can be set
 // before or after this call (we check at dispatch time).
-func NewDelivery(transport *rns.Transport, identity *rns.Identity) (*Delivery, error) {
+//
+// `buildAnnounce`, if non-nil, lets the Transport answer SPEC §7.2
+// path? requests targeting this destination. Pass a closure that
+// produces a fresh announce with the given context byte (typically
+// rns.ContextPathResponse). When nil, path? requests for our delivery
+// destination go unanswered and clients have to wait for our periodic
+// announce instead.
+func NewDelivery(transport *rns.Transport, identity *rns.Identity, buildAnnounce func(context byte) (*rns.Packet, error)) (*Delivery, error) {
 	if transport == nil || identity == nil {
 		return nil, errors.New("nil transport or identity")
 	}
@@ -61,6 +68,7 @@ func NewDelivery(transport *rns.Transport, identity *rns.Identity) (*Delivery, e
 		Identity:        d.identity, // enables SPEC §6.5 PROOF emission on inbound DATA
 		OnPacket:        d.handleInbound,
 		OnLinkPlaintext: d.handleInboundLinkPlaintext,
+		BuildAnnounce:   buildAnnounce,
 	}); err != nil {
 		return nil, err
 	}

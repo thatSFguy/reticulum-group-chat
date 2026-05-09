@@ -83,8 +83,21 @@ func (a *Announce) EmittedAt() (time.Time, error) {
 // `ratchetPub`, if non-nil, MUST be 32 bytes and turns on context_flag.
 // Pass nil to omit (recommended for the first-cut implementation —
 // SPEC §7.3 ratchet rotation is deferred).
+//
+// The packet's Context is ContextNone (regular announce). To produce a
+// path-response announce (SPEC §7.2, context = ContextPathResponse),
+// call BuildAnnounceWithContext.
 func BuildAnnounce(id *Identity, fullName string, appData []byte, ratchetPub []byte) (*Packet, error) {
-	return buildAnnounce(id, fullName, appData, ratchetPub, time.Now, randReader)
+	return BuildAnnounceWithContext(id, fullName, appData, ratchetPub, ContextNone)
+}
+
+// BuildAnnounceWithContext is BuildAnnounce with an explicit context
+// byte. Used by the Transport's path-request responder to emit
+// path-response announces (context = 0x0B) — same body bytes as a
+// regular announce so any signature-verifying client can validate
+// either form.
+func BuildAnnounceWithContext(id *Identity, fullName string, appData []byte, ratchetPub []byte, context byte) (*Packet, error) {
+	return buildAnnounce(id, fullName, appData, ratchetPub, context, time.Now, randReader)
 }
 
 // buildAnnounce is the testable form: the clock and randomness source are
@@ -94,6 +107,7 @@ func buildAnnounce(
 	fullName string,
 	appData []byte,
 	ratchetPub []byte,
+	context byte,
 	now func() time.Time,
 	rnd func(p []byte) (int, error),
 ) (*Packet, error) {
@@ -141,7 +155,7 @@ func buildAnnounce(
 		PacketType:      PacketAnnounce,
 		Hops:            0,
 		DestHash:        destHash,
-		Context:         ContextNone,
+		Context:         context,
 		Data:            body,
 	}, nil
 }
