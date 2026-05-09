@@ -16,7 +16,7 @@ import (
 
 // Version is the human-readable release marker for this build. Bumped
 // per release; printed by --version and emitted in the startup log.
-const Version = "1.2.0"
+const Version = "1.2.3"
 
 func main() {
 	configPath := flag.String("config", "~/.fwdsvc/config.toml", "path to config TOML")
