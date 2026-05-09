@@ -392,6 +392,16 @@ func (lm *LinkManager) HandleLRProof(p *Packet, responderEd25519Pub []byte) (*Li
 // ephemeral X25519 keypair, derives session keys, registers an Active
 // link in the manager, and returns the LRPROOF the caller should
 // broadcast back.
+//
+// If sig is nil, the responder mirrors whatever signalling (if any)
+// the initiator sent. This is the SPEC §6.6 symmetry requirement: the
+// LRPROOF's signed_data MUST include the same signalling bytes the
+// initiator put in their LINKREQUEST, otherwise the initiator's
+// signature verification fails (their reconstructed signed_data has
+// signalling, ours doesn't). Callers that want to clamp the MTU pass
+// a non-nil sig with the clamped values; the typical caller (a leaf
+// forwarder that doesn't negotiate MTU) passes nil and gets correct
+// mirror behavior automatically.
 func (lm *LinkManager) AcceptIncomingLinkRequest(reqPkt *Packet, localID *Identity, sig *LinkSignalling) (*Link, *Packet, error) {
 	req, err := ParseLinkRequest(reqPkt)
 	if err != nil {
@@ -409,6 +419,13 @@ func (lm *LinkManager) AcceptIncomingLinkRequest(reqPkt *Packet, localID *Identi
 	signing, encryption, err := DeriveLinkSessionKeys(respEphPriv, req.InitiatorX25519Pub, id)
 	if err != nil {
 		return nil, nil, fmt.Errorf("derive session keys: %w", err)
+	}
+
+	// Mirror initiator's signalling presence when caller didn't override.
+	// SPEC §6.6 trap: asymmetric signalling breaks the LRPROOF signature
+	// because both sides must reconstruct the same signed_data.
+	if sig == nil {
+		sig = req.Signalling
 	}
 
 	proofPkt, err := BuildLRProof(localID, id, respEphPub, sig)

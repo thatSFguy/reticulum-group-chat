@@ -277,3 +277,95 @@ func newSHA256Hash() interface {
 } {
 	return sha256NewFromInternal()
 }
+
+// TestAcceptIncomingLinkRequestMirrorsInitiatorSignalling is a regression
+// test for a v1.2.x interop bug: when an initiator (e.g. Sideband) sent
+// a LINKREQUEST with the optional 3-byte MTU/mode signalling trailer and
+// our responder code passed sig=nil to AcceptIncomingLinkRequest, the
+// LRPROOF was signed over signed_data WITHOUT signalling. The
+// initiator's verification rebuilt signed_data WITH signalling (per
+// SPEC §6.6) and rejected our signature. From the initiator's logs:
+// "LRProof rejected: signature verification failed" → fall back to
+// opportunistic. Symptom on our side: silent — Sideband doesn't tell us
+// why it stopped using the link.
+//
+// The fix: AcceptIncomingLinkRequest now mirrors the initiator's
+// signalling when caller passes nil, so the wire and signed_data are
+// symmetric as the spec requires.
+func TestAcceptIncomingLinkRequestMirrorsInitiatorSignalling(t *testing.T) {
+	bob, _ := NewIdentity()
+	bobDest := bob.DestinationHashFor(FullName("vectors", "link"))
+
+	aliceMgr := NewLinkManager()
+	bobMgr := NewLinkManager()
+
+	// Alice initiates WITH signalling — typical Sideband behavior when
+	// link_mtu_discovery is enabled and the next-hop interface advertises
+	// HW_MTU.
+	initiatorSig := &LinkSignalling{MTU: 1196, Mode: LinkModeAES256CBC}
+	_, lrReq, err := aliceMgr.StartLinkAsInitiator(bobDest, initiatorSig)
+	if err != nil {
+		t.Fatalf("StartLinkAsInitiator: %v", err)
+	}
+
+	// Bob (us) accepts with sig=nil — what handleLinkRequest does in
+	// production. The function must auto-mirror Alice's signalling, or
+	// Alice's verify will fail.
+	_, lrProof, err := bobMgr.AcceptIncomingLinkRequest(lrReq, bob, nil)
+	if err != nil {
+		t.Fatalf("AcceptIncomingLinkRequest: %v", err)
+	}
+
+	// Parse the LRPROOF Bob produced. Its body must contain signalling
+	// (so Alice's reconstruction has it).
+	parsed, err := ParseLRProof(lrProof)
+	if err != nil {
+		t.Fatalf("ParseLRProof: %v", err)
+	}
+	if parsed.Signalling == nil {
+		t.Fatal("LRPROOF body is missing signalling trailer; would not match initiator's signed_data reconstruction")
+	}
+	if parsed.Signalling.MTU != initiatorSig.MTU || parsed.Signalling.Mode != initiatorSig.Mode {
+		t.Errorf("LRPROOF signalling = %+v, want mirrored %+v", parsed.Signalling, initiatorSig)
+	}
+
+	// Decisive check: the LRPROOF signature must verify under Bob's
+	// long-term Ed25519 pub when Alice rebuilds signed_data. This is
+	// exactly what HandleLRProof does on the initiator side.
+	if err := parsed.Verify(bob.PublicKey()[32:]); err != nil {
+		t.Errorf("LRPROOF.Verify: %v — initiator would reject this proof", err)
+	}
+}
+
+// TestAcceptIncomingLinkRequestNoSignallingWhenInitiatorOmits is the
+// inverse: if the initiator did NOT send signalling, the responder
+// must NOT add it (otherwise the same SPEC §6.6 trap fires the other
+// way). This case worked before the mirror fix too, but it's worth
+// pinning so a future "always emit signalling" change doesn't break
+// minimal-RNS clients that omit the trailer.
+func TestAcceptIncomingLinkRequestNoSignallingWhenInitiatorOmits(t *testing.T) {
+	bob, _ := NewIdentity()
+	bobDest := bob.DestinationHashFor(FullName("vectors", "link"))
+
+	aliceMgr := NewLinkManager()
+	bobMgr := NewLinkManager()
+
+	_, lrReq, err := aliceMgr.StartLinkAsInitiator(bobDest, nil) // no signalling
+	if err != nil {
+		t.Fatalf("StartLinkAsInitiator: %v", err)
+	}
+	_, lrProof, err := bobMgr.AcceptIncomingLinkRequest(lrReq, bob, nil)
+	if err != nil {
+		t.Fatalf("AcceptIncomingLinkRequest: %v", err)
+	}
+	parsed, err := ParseLRProof(lrProof)
+	if err != nil {
+		t.Fatalf("ParseLRProof: %v", err)
+	}
+	if parsed.Signalling != nil {
+		t.Errorf("LRPROOF body has signalling but initiator didn't send any")
+	}
+	if err := parsed.Verify(bob.PublicKey()[32:]); err != nil {
+		t.Errorf("LRPROOF.Verify: %v — initiator would reject this proof", err)
+	}
+}
