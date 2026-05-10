@@ -5,6 +5,7 @@ import (
 	"crypto/sha256"
 	"errors"
 	"fmt"
+	"math"
 )
 
 // Link DATA wire format (SPEC §6.4): a regular DATA packet whose outer
@@ -152,6 +153,18 @@ func ValidateLinkProof(p *Packet, peerEd25519Pub []byte) ([]byte, error) {
 // Context byte for KEEPALIVE on a link (SPEC §6 / RNS source).
 const ContextKeepalive = 0xFA
 
+// Context byte for LRRTT (link-request round-trip time measurement).
+// Sent by the initiator to the responder immediately after validating the
+// LRPROOF; carries the measured round-trip time as a msgpack-packed
+// float. The responder uses receipt of this packet as the trigger to
+// transition its link from HANDSHAKE to ACTIVE — which is what fires the
+// destination's link_established_callback (e.g. LXMRouter sets
+// resource_strategy=ACCEPT_APP only at that moment). Without LRRTT, the
+// responder silently drops Resource ADV / link DATA because its
+// resource_strategy is still default ACCEPT_NONE. Upstream:
+// RNS/Link.py:440-442 (initiator send) + 534-553 (responder activate).
+const ContextLRRTT = 0xFE
+
 // BuildLinkKeepalive builds a small DATA packet with context=KEEPALIVE
 // addressed to the link, used to refresh the activity timer at both
 // ends. Body is a single 0x00 byte (matches upstream RNS, which sends
@@ -171,4 +184,56 @@ func BuildLinkKeepalive(linkID []byte) (*Packet, error) {
 		Context:         ContextKeepalive,
 		Data:            []byte{0x00},
 	}, nil
+}
+
+// BuildLinkRTT builds the LRRTT packet the initiator sends to the
+// responder right after the link transitions to Active on the
+// initiator's side. Body is a msgpack-packed float64 carrying the
+// measured RTT in seconds. The responder takes max(its own measurement,
+// our reported value) — so a small estimate here is fine; the value
+// matters less than the act of sending it (which triggers the
+// responder's link_established_callback).
+func BuildLinkRTT(linkID, signing, encryption []byte, rttSeconds float64) (*Packet, error) {
+	if len(linkID) != IdentityHashLen {
+		return nil, fmt.Errorf("link_id must be %d bytes", IdentityHashLen)
+	}
+	body, err := msgpackMarshalFloat64(rttSeconds)
+	if err != nil {
+		return nil, fmt.Errorf("rtt msgpack: %w", err)
+	}
+	ciphertext, err := LinkTokenEncrypt(body, signing, encryption)
+	if err != nil {
+		return nil, fmt.Errorf("rtt encrypt: %w", err)
+	}
+	return &Packet{
+		HeaderType:      HeaderType1,
+		ContextFlag:     false,
+		TransportType:   BroadcastTransport,
+		DestinationType: DestinationLink,
+		PacketType:      PacketData,
+		Hops:            0,
+		DestHash:        linkID,
+		Context:         ContextLRRTT,
+		Data:            ciphertext,
+	}, nil
+}
+
+// msgpackMarshalFloat64 packs a single float64 in msgpack format —
+// emits one float64 marker byte (0xCB) followed by big-endian IEEE 754
+// double. Matches upstream `umsgpack.packb(rtt)` output for a Python
+// float, which is what the responder unpacks via umsgpack.unpackb at
+// RNS/Link.py:539.
+func msgpackMarshalFloat64(v float64) ([]byte, error) {
+	bits := math.Float64bits(v)
+	out := make([]byte, 9)
+	out[0] = 0xCB
+	out[1] = byte(bits >> 56)
+	out[2] = byte(bits >> 48)
+	out[3] = byte(bits >> 40)
+	out[4] = byte(bits >> 32)
+	out[5] = byte(bits >> 24)
+	out[6] = byte(bits >> 16)
+	out[7] = byte(bits >> 8)
+	out[8] = byte(bits)
+	return out, nil
 }

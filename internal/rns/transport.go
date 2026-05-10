@@ -45,13 +45,6 @@ type Transport struct {
 	// the sweeper don't have to set anything.
 	lifetime *linkLifetime
 
-	// EnableResourceTransfer gates the SPEC §10 Resource transfer path
-	// added in v1.3.0. Default false — v1.2.5 behavior, oversize link
-	// DATA emits as a single packet regardless of MTU. Set true to
-	// route plaintext > LinkMDU via Resource transfer instead. Kept
-	// off by default until the live-receiver Resource bug is fixed.
-	EnableResourceTransfer bool
-
 	logger Logger
 }
 
@@ -694,6 +687,43 @@ func (t *Transport) handleLRProof(p *Packet) {
 		return
 	}
 	t.logger.Printf("link active (initiator): id=%x", parsed.LinkID[:4])
+
+	// Upstream RNS: after the initiator validates the LRPROOF, it sends
+	// an LRRTT packet to the responder carrying the measured RTT (a
+	// msgpack-packed float). The responder uses receipt of this packet
+	// to transition its link from HANDSHAKE to ACTIVE and fire the
+	// link_established_callback. Without it, LXMRouter never calls
+	// `link.set_resource_strategy(ACCEPT_APP)`, so any subsequent
+	// RESOURCE_ADV we send is silently dropped at the receiver because
+	// resource_strategy stays at the default ACCEPT_NONE.
+	//
+	// We don't currently track LRREQ-send time per-link; estimate RTT
+	// generously enough that the responder's max(measured, reported)
+	// won't degrade keepalive cadence. 0.05s is roughly a single LAN
+	// round-trip and matches what upstream typically computes for
+	// localhost rnsd hops. The exact value is non-load-bearing — only
+	// the act of sending the packet matters.
+	if err := t.sendLRRTT(parsed.LinkID, link, 0.05); err != nil {
+		t.logger.Printf("send LRRTT: %v", err)
+	}
+}
+
+// sendLRRTT builds and broadcasts the post-handshake LRRTT packet.
+// Snapshots the link's session keys under its mutex so we don't race
+// a concurrent close.
+func (t *Transport) sendLRRTT(linkID []byte, link *Link, rttSec float64) error {
+	link.mu.Lock()
+	signing := append([]byte(nil), link.Signing...)
+	encryption := append([]byte(nil), link.Encryption...)
+	link.mu.Unlock()
+	if len(signing) == 0 || len(encryption) == 0 {
+		return fmt.Errorf("link has no session keys")
+	}
+	pkt, err := BuildLinkRTT(linkID, signing, encryption, rttSec)
+	if err != nil {
+		return err
+	}
+	return t.Broadcast(pkt)
 }
 
 // handleLinkData processes inbound DATA packets addressed to a link_id.
@@ -847,17 +877,12 @@ func (t *Transport) SendOverLink(responderDestHash []byte, plaintext []byte, tim
 	link.mu.Unlock()
 
 	// Size-driven dispatch: payloads that don't fit one Link DATA
-	// packet (LinkMDU = 431 bytes plaintext) can route via the
-	// SPEC §10 Resource transfer protocol when EnableResourceTransfer
-	// is set. The Resource path is feature-flagged off by default
-	// because the v1.3.0 implementation has a bug against live
-	// receivers (Sideband / Python LXMF) that we haven't pinned yet.
-	// With it disabled, oversize plaintext takes the v1.2.5 path
-	// below — emit one big link DATA packet and let the interface
-	// either fragment or drop. That's the behavior the 51-user
-	// `/users` reply was succeeding under, so until the Resource
-	// bug is fixed it's the safer default.
-	if t.EnableResourceTransfer && len(plaintext) > LinkMDU {
+	// packet (LinkMDU = 431 bytes plaintext) MUST go via the SPEC §10
+	// Resource transfer protocol. Stuffing them into a single oversize
+	// link DATA packet causes the receiver to drop them at MTU and
+	// the proof never returns — that's the operator's "5/5 retries"
+	// failure mode v1.3.x is built to fix.
+	if len(plaintext) > LinkMDU {
 		var transportID []byte
 		if known := t.Recall(responderDestHash); known != nil {
 			transportID = known.TransportID
@@ -872,12 +897,16 @@ func (t *Transport) SendOverLink(responderDestHash []byte, plaintext []byte, tim
 		return fmt.Errorf("link send: build DATA: %w", err)
 	}
 
-	// If the peer was reached via a transit relay (HEADER_2 announce),
-	// route the link DATA the same way. Without this, multi-hop responders
-	// would never receive our long forwards.
-	if known := t.Recall(responderDestHash); known != nil {
-		applyMultihopRouting(dataPkt, known.TransportID)
-	}
+	// Link DATA stays HEADER_1 even for multi-hop peers. Upstream RNS
+	// routes link DATA via link_table (keyed on link_id), not path_table,
+	// and relays forward link DATA UNCHANGED — they don't strip a
+	// transport_id like they do for path_table forwarding. If we set
+	// transport_id here, the relay forwards the HEADER_2 packet to the
+	// final hop with transport_id intact, and the receiver's
+	// packet_filter drops it as "for other transport instance" (RNS
+	// Transport.py:1283-1285). Upstream's own Packet(link, data,
+	// context=RESOURCE_ADV) constructor defaults to HEADER_1 + no
+	// transport_id — we mirror that.
 
 	// Compute the packet_hash the responder will sign. MUST use the SAME
 	// hashable_part the responder sees — HashablePart is invariant under

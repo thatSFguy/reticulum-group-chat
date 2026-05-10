@@ -407,7 +407,12 @@ func (rs *ResourceSender) broadcastAdv() error {
 	if err != nil {
 		return fmt.Errorf("build ADV packet: %w", err)
 	}
-	applyMultihopRouting(pkt, rs.multihopID)
+	// Resource ADV stays HEADER_1 even for multi-hop peers — same
+	// reasoning as link DATA in transport.go SendOverLink. Setting
+	// transport_id here would make the relay forward HEADER_2 to the
+	// final hop, where packet_filter drops it as "for other transport
+	// instance". Upstream's RNS.Packet(link, data, context=RESOURCE_ADV)
+	// defaults to HEADER_1 with no transport_id — mirror that.
 	if err := rs.transport.Broadcast(pkt); err != nil {
 		return fmt.Errorf("broadcast ADV: %w", err)
 	}
@@ -434,7 +439,7 @@ func (rs *ResourceSender) fulfillRequest(req *ResourceRequest) (int, error) {
 		if err != nil {
 			return delivered, fmt.Errorf("build PART packet idx=%d: %w", idx, err)
 		}
-		applyMultihopRouting(pkt, rs.multihopID)
+		// Resource PART stays HEADER_1 — same reasoning as ADV above.
 		if err := rs.transport.Broadcast(pkt); err != nil {
 			return delivered, fmt.Errorf("broadcast PART idx=%d: %w", idx, err)
 		}

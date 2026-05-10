@@ -218,6 +218,9 @@ enable_transport = yes
 share_instance = no
 panic_on_interface_error = no
 
+[logging]
+loglevel = 7
+
 [interfaces]
 
   [[Default Interface]]
@@ -240,7 +243,15 @@ panic_on_interface_error = no
 // output if the test failed.
 func spawnRnsd(t *testing.T, configDir string) func() {
 	t.Helper()
-	cmd := exec.Command("rnsd", "--config", configDir, "-v", "-v", "-v")
+	// -v repeated 7× pushes RNS to LOG_EXTREME — without that, link_table
+	// forwarding decisions and packet drops happen silently and we can't
+	// pin down where in the relay path a packet went missing.
+	// PYTHONUNBUFFERED=1 is critical: when stdout is piped to our captures,
+	// Python switches to block buffering by default and we see nothing
+	// until rnsd exits.
+	cmd := exec.Command("rnsd", "--config", configDir,
+		"-v", "-v", "-v", "-v", "-v", "-v", "-v")
+	cmd.Env = append(os.Environ(), "PYTHONUNBUFFERED=1", "PYTHONIOENCODING=utf-8")
 	stdout, err := cmd.StdoutPipe()
 	if err != nil {
 		t.Fatal(err)
@@ -270,7 +281,7 @@ func spawnRnsd(t *testing.T, configDir string) func() {
 	return func() {
 		_ = cmd.Process.Kill()
 		_, _ = cmd.Process.Wait()
-		if t.Failed() {
+		if t.Failed() || os.Getenv("INTEROP_DUMP_LOGS") == "1" {
 			mu.Lock()
 			t.Logf("rnsd output:\n%s", out.String())
 			mu.Unlock()
@@ -365,7 +376,7 @@ func spawnFwdsvc(t *testing.T, bin, configPath, dir string) (func(), string) {
 	cleanup := func() {
 		_ = cmd.Process.Kill()
 		_, _ = cmd.Process.Wait()
-		if t.Failed() {
+		if t.Failed() || os.Getenv("INTEROP_DUMP_LOGS") == "1" {
 			mu.Lock()
 			t.Logf("fwdsvc output:\n%s", out.String())
 			mu.Unlock()
@@ -421,7 +432,18 @@ func runCase(t *testing.T, py, script string, port int, fwdsvcHash, fwdsvcDir st
 		"--rnsd", fmt.Sprintf("127.0.0.1:%d", port),
 		"--fwdsvc", fwdsvcHash,
 	)
-	cmd.Env = append(os.Environ(), "PYTHONUNBUFFERED=1", "PYTHONIOENCODING=utf-8")
+	// INTEROP_LOGLEVEL=7 = RNS LOG_EXTREME — flips on every link / resource
+	// / decrypt diagnostic so a failed case dumps why the receiver dropped
+	// our packet. Off by default (4 = INFO) to keep passing-case logs sane.
+	logLevel := os.Getenv("INTEROP_LOGLEVEL")
+	if logLevel == "" {
+		logLevel = "4"
+	}
+	cmd.Env = append(os.Environ(),
+		"PYTHONUNBUFFERED=1",
+		"PYTHONIOENCODING=utf-8",
+		"INTEROP_LOGLEVEL="+logLevel,
+	)
 
 	out, err := cmd.CombinedOutput()
 	xfail := strings.Contains(filepath.Base(script), "_xfail")
