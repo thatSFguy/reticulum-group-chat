@@ -62,6 +62,13 @@ type ResourceReceiver struct {
 	// SHA256(part || randomR)[:4] and matching.
 	hashmap []byte
 
+	// hashmapKnownPrefix tracks how many leading map_hashes of `parts`
+	// we have a hashmap entry for. Starts at min(numParts, len(adv.m)/4).
+	// Grows as RESOURCE_HMU segments arrive. While < len(parts) we
+	// only request parts in [0, hashmapKnownPrefix) and keep an eye
+	// out for the next segment via the Exhausted REQ flag.
+	hashmapKnownPrefix int
+
 	// parts[i] = ciphertext slice for part i (nil until received).
 	// Indexed by hashmap position (0-based).
 	parts         [][]byte
@@ -70,6 +77,7 @@ type ResourceReceiver struct {
 
 	// Channels: dispatcher → receiver goroutine.
 	partCh   chan []byte
+	hmuCh    chan *ResourceHmu
 	cancelCh chan struct{}
 
 	state atomic.Int32
@@ -99,23 +107,34 @@ func (t *Transport) openResourceReceiver(link *Link, adv *ResourceAdvertisement)
 	if state != LinkActive {
 		return fmt.Errorf("resource receiver: link state %s, want active", state)
 	}
+	// Hashmap stored full-size (numParts * MAPHASH_LEN) so HMU
+	// segments can fill in the trailing parts without reallocation.
+	// The known-prefix counter tracks how much is currently valid.
+	fullHashmap := make([]byte, adv.NumParts*ResourceMapHashLen)
+	copy(fullHashmap, adv.Hashmap)
+	knownPrefix := len(adv.Hashmap) / ResourceMapHashLen
+	if knownPrefix > adv.NumParts {
+		knownPrefix = adv.NumParts
+	}
 	rr := &ResourceReceiver{
-		transport:      t,
-		link:           link,
-		logger:         t.logger,
-		resourceHash:   append([]byte(nil), adv.Hash...),
-		randomR:        append([]byte(nil), adv.RandomHash...),
-		expectedSize:   adv.TransferSize,
-		dataSize:       adv.DataSize,
-		flags:          adv.Flags,
-		hashmap:        append([]byte(nil), adv.Hashmap...),
-		parts:          make([][]byte, adv.NumParts),
-		receivedFlags:  make([]bool, adv.NumParts),
-		partCh:         make(chan []byte, 32),
-		cancelCh:       make(chan struct{}, 1),
-		done:           make(chan struct{}),
-		linkSigning:    signing,
-		linkEncryption: encryption,
+		transport:          t,
+		link:               link,
+		logger:             t.logger,
+		resourceHash:       append([]byte(nil), adv.Hash...),
+		randomR:            append([]byte(nil), adv.RandomHash...),
+		expectedSize:       adv.TransferSize,
+		dataSize:           adv.DataSize,
+		flags:              adv.Flags,
+		hashmap:            fullHashmap,
+		hashmapKnownPrefix: knownPrefix,
+		parts:              make([][]byte, adv.NumParts),
+		receivedFlags:      make([]bool, adv.NumParts),
+		partCh:             make(chan []byte, 32),
+		cancelCh:           make(chan struct{}, 1),
+		hmuCh:              make(chan *ResourceHmu, 4),
+		done:               make(chan struct{}),
+		linkSigning:        signing,
+		linkEncryption:     encryption,
 		OnAssembled: func(body []byte) {
 			if cb != nil {
 				cb(body)
@@ -156,6 +175,17 @@ func (rr *ResourceReceiver) HandlePart(partCiphertext []byte) {
 	case rr.partCh <- append([]byte(nil), partCiphertext...):
 	default:
 		rr.logger.Printf("resource receiver: PART channel full for %s — dropping",
+			ResourceHashShortHex(rr.resourceHash))
+	}
+}
+
+// HandleHmu is invoked by the Transport dispatcher when a
+// RESOURCE_HMU arrives carrying the next hashmap segment.
+func (rr *ResourceReceiver) HandleHmu(h *ResourceHmu) {
+	select {
+	case rr.hmuCh <- h:
+	default:
+		rr.logger.Printf("resource receiver: HMU channel full for %s — dropping",
 			ResourceHashShortHex(rr.resourceHash))
 	}
 }
@@ -217,6 +247,17 @@ func (rr *ResourceReceiver) Run(ctx context.Context) error {
 				if err := rr.requestNextWindow(); err != nil {
 					rr.logger.Printf("resource receiver: window REQ: %v", err)
 				}
+			}
+
+		case hmu := <-rr.hmuCh:
+			if err := rr.applyHmu(hmu); err != nil {
+				rr.logger.Printf("resource receiver: apply HMU: %v", err)
+				continue
+			}
+			// HMU extended our hashmap; immediately request the new
+			// range.
+			if err := rr.requestNextWindow(); err != nil {
+				rr.logger.Printf("resource receiver: post-HMU REQ: %v", err)
 			}
 		}
 	}
@@ -290,12 +331,55 @@ func (rr *ResourceReceiver) windowComplete() bool {
 	return rr.receivedCount > 0 // any progress → consider window done
 }
 
+// applyHmu validates an inbound RESOURCE_HMU against the receiver's
+// expected next segment and extends the hashmap. SPEC §10.7: the
+// segment_index is `part_index // HASHMAP_MAX_LEN` of the first new
+// part — i.e. equal to the number of complete hashmap segments we
+// already have (1-indexed). The provided hashmap_segment_bytes get
+// copied into hashmap[segment*HashmapMaxLen*MAPHASH_LEN ... ].
+//
+// Rejects HMU with the wrong segment_index (sequencing error) by
+// returning an error; the caller will RCL and abandon. Mirrors
+// upstream Resource.py:1043-1046.
+func (rr *ResourceReceiver) applyHmu(h *ResourceHmu) error {
+	if !bytesEqual(h.ResourceHash, rr.resourceHash) {
+		return fmt.Errorf("HMU resource_hash mismatch")
+	}
+	rr.mu.Lock()
+	defer rr.mu.Unlock()
+	expectedSegment := rr.hashmapKnownPrefix / HashmapMaxLen
+	if h.SegmentIndex != expectedSegment {
+		return fmt.Errorf("HMU segment_index=%d, expected %d (sequencing error)", h.SegmentIndex, expectedSegment)
+	}
+	wantBytes := HashmapMaxLen * ResourceMapHashLen
+	// The last segment may legitimately be shorter than HashmapMaxLen
+	// if numParts isn't a multiple of HashmapMaxLen.
+	remainingMaxes := len(rr.parts) - rr.hashmapKnownPrefix
+	if remainingMaxes < HashmapMaxLen {
+		wantBytes = remainingMaxes * ResourceMapHashLen
+	}
+	if len(h.HashmapBytes) > wantBytes {
+		return fmt.Errorf("HMU hashmap segment %d bytes > expected max %d", len(h.HashmapBytes), wantBytes)
+	}
+	off := rr.hashmapKnownPrefix * ResourceMapHashLen
+	copy(rr.hashmap[off:], h.HashmapBytes)
+	added := len(h.HashmapBytes) / ResourceMapHashLen
+	rr.hashmapKnownPrefix += added
+	return nil
+}
+
 // requestNextWindow builds and sends a RESOURCE_REQ for the next
 // batch of unreceived map_hashes, capped at ReceiverWindowMaxOutstanding.
+// Only requests parts within `hashmapKnownPrefix` — out-of-known-range
+// parts must wait for an HMU first.
+//
+// If we've consumed all known map_hashes but more parts remain, emit
+// an Exhausted REQ to prompt the sender for the next HMU segment.
 func (rr *ResourceReceiver) requestNextWindow() error {
 	rr.mu.Lock()
+	scanLimit := rr.hashmapKnownPrefix
 	requested := make([][]byte, 0, ReceiverWindowMaxOutstanding)
-	for i := 0; i < len(rr.parts) && len(requested) < ReceiverWindowMaxOutstanding; i++ {
+	for i := 0; i < scanLimit && len(requested) < ReceiverWindowMaxOutstanding; i++ {
 		if rr.receivedFlags[i] {
 			continue
 		}
@@ -303,12 +387,30 @@ func (rr *ResourceReceiver) requestNextWindow() error {
 		mh := append([]byte(nil), rr.hashmap[off:off+ResourceMapHashLen]...)
 		requested = append(requested, mh)
 	}
+	// Detect "exhausted within known prefix": every known map_hash
+	// has been received, but we don't have all parts yet → ask for
+	// next hashmap segment.
+	allKnownReceived := true
+	for i := 0; i < scanLimit; i++ {
+		if !rr.receivedFlags[i] {
+			allKnownReceived = false
+			break
+		}
+	}
+	exhausted := allKnownReceived && scanLimit < len(rr.parts) && scanLimit > 0
+	var lastMapHash []byte
+	if exhausted {
+		off := (scanLimit - 1) * ResourceMapHashLen
+		lastMapHash = append([]byte(nil), rr.hashmap[off:off+ResourceMapHashLen]...)
+	}
 	rr.mu.Unlock()
-	if len(requested) == 0 {
+	if len(requested) == 0 && !exhausted {
 		return nil
 	}
 
 	body, err := BuildResourceReq(&ResourceRequest{
+		Exhausted:    exhausted,
+		LastMapHash:  lastMapHash,
 		ResourceHash: rr.resourceHash,
 		RequestedMap: requested,
 	})

@@ -104,16 +104,21 @@ func (t *Transport) handleResourceReq(link *Link, plaintext []byte) {
 }
 
 // handleResourceHmu routes an inbound RESOURCE_HMU to the receiver
-// matching (link_id, resource_hash). Stage-4/5 territory — current
-// receivers don't process HMU yet, so this is a logged drop.
+// matching (link_id, resource_hash). The receiver extends its
+// hashmap and continues requesting parts in the new range.
 func (t *Transport) handleResourceHmu(link *Link, plaintext []byte) {
 	h, err := ParseResourceHmu(plaintext)
 	if err != nil {
 		t.logger.Printf("resource HMU parse: %v", err)
 		return
 	}
-	t.logger.Printf("resource HMU inbound link=%x resource=%s segment=%d (receiver/HMU not yet wired — stage 4-5)",
-		link.ID[:4], ResourceHashShortHex(h.ResourceHash), h.SegmentIndex)
+	rr := t.linkManager.lookupResourceReceiver(link.ID, h.ResourceHash)
+	if rr == nil {
+		t.logger.Printf("resource HMU for unknown receiver link=%x resource=%s",
+			link.ID[:4], ResourceHashShortHex(h.ResourceHash))
+		return
+	}
+	rr.HandleHmu(h)
 }
 
 // handleResourceCancelInbound routes an inbound RESOURCE_ICL or
