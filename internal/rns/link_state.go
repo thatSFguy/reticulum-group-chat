@@ -234,11 +234,132 @@ type LinkManager struct {
 	// when it wants to receive plaintext payloads from inbound link
 	// DATA. Default no-op.
 	defaultOnInboundData func(linkID, plaintext []byte)
+
+	// senders / receivers index in-flight Resource transfers per link
+	// keyed by hex(link_id) || hex(resource_hash) so the Transport
+	// dispatcher can route inbound RESOURCE_REQ / RESOURCE_PRF /
+	// RESOURCE_RCL packets to the right sender, and inbound
+	// RESOURCE_ADV / RESOURCE / RESOURCE_HMU packets to the right
+	// receiver. Both maps are guarded by the same mu so iteration
+	// remains race-free.
+	senders   map[string]*ResourceSender
+	receivers map[string]*ResourceReceiver
 }
 
 // NewLinkManager constructs an empty manager.
 func NewLinkManager() *LinkManager {
-	return &LinkManager{links: map[string]*Link{}}
+	return &LinkManager{
+		links:     map[string]*Link{},
+		senders:   map[string]*ResourceSender{},
+		receivers: map[string]*ResourceReceiver{},
+	}
+}
+
+// resourceKey is the dictionary key used by the sender/receiver maps:
+// hex(link_id) || ":" || hex(resource_hash). The colon separator
+// prevents an attacker from crafting a pair (link_id', resource_hash')
+// that aliases an existing key.
+func resourceKey(linkID, resourceHash []byte) string {
+	return hex.EncodeToString(linkID) + ":" + hex.EncodeToString(resourceHash)
+}
+
+// registerResourceSender adds a sender to the in-flight index. Returns
+// an error if a sender with the same (link_id, resource_hash) already
+// exists — duplicate registrations are a programming bug. Holds the
+// LinkManager mutex briefly.
+func (lm *LinkManager) registerResourceSender(linkID, resourceHash []byte, rs *ResourceSender) error {
+	if rs == nil {
+		return errors.New("link manager: nil ResourceSender")
+	}
+	key := resourceKey(linkID, resourceHash)
+	lm.mu.Lock()
+	defer lm.mu.Unlock()
+	if _, dup := lm.senders[key]; dup {
+		return fmt.Errorf("link manager: duplicate ResourceSender for link=%x resource=%x", linkID[:4], resourceHash[:4])
+	}
+	lm.senders[key] = rs
+	return nil
+}
+
+// registerResourceReceiver adds a receiver to the in-flight index.
+// Same dedup semantics as registerResourceSender.
+func (lm *LinkManager) registerResourceReceiver(linkID, resourceHash []byte, rr *ResourceReceiver) error {
+	if rr == nil {
+		return errors.New("link manager: nil ResourceReceiver")
+	}
+	key := resourceKey(linkID, resourceHash)
+	lm.mu.Lock()
+	defer lm.mu.Unlock()
+	if _, dup := lm.receivers[key]; dup {
+		return fmt.Errorf("link manager: duplicate ResourceReceiver for link=%x resource=%x", linkID[:4], resourceHash[:4])
+	}
+	lm.receivers[key] = rr
+	return nil
+}
+
+// unregisterResource removes BOTH the sender and the receiver entries
+// (if any) for (link_id, resource_hash). Idempotent. Called from the
+// sender/receiver Run() defer so a transfer that exits via any path
+// (success, cancel, link teardown) frees its slot.
+func (lm *LinkManager) unregisterResource(linkID, resourceHash []byte) {
+	key := resourceKey(linkID, resourceHash)
+	lm.mu.Lock()
+	defer lm.mu.Unlock()
+	delete(lm.senders, key)
+	delete(lm.receivers, key)
+}
+
+// lookupResourceSender returns the active ResourceSender for the
+// given (link_id, resource_hash) or nil if none. The Transport
+// dispatcher calls this to route inbound RESOURCE_REQ / RESOURCE_PRF /
+// RESOURCE_RCL packets to the right sender.
+func (lm *LinkManager) lookupResourceSender(linkID, resourceHash []byte) *ResourceSender {
+	key := resourceKey(linkID, resourceHash)
+	lm.mu.Lock()
+	defer lm.mu.Unlock()
+	return lm.senders[key]
+}
+
+// lookupResourceReceiver returns the active ResourceReceiver for the
+// given (link_id, resource_hash) or nil if none. The Transport
+// dispatcher uses this for inbound RESOURCE / RESOURCE_HMU packets.
+func (lm *LinkManager) lookupResourceReceiver(linkID, resourceHash []byte) *ResourceReceiver {
+	key := resourceKey(linkID, resourceHash)
+	lm.mu.Lock()
+	defer lm.mu.Unlock()
+	return lm.receivers[key]
+}
+
+// closeResourcesForLink terminates every in-flight transfer
+// associated with link_id. Used by CloseLink to ensure a torn-down
+// link can't leave dangling sender/receiver goroutines.
+func (lm *LinkManager) closeResourcesForLink(linkID []byte) {
+	prefix := hex.EncodeToString(linkID) + ":"
+	var senders []*ResourceSender
+	var receivers []*ResourceReceiver
+	lm.mu.Lock()
+	for k, rs := range lm.senders {
+		if len(k) >= len(prefix) && k[:len(prefix)] == prefix {
+			senders = append(senders, rs)
+			delete(lm.senders, k)
+		}
+	}
+	for k, rr := range lm.receivers {
+		if len(k) >= len(prefix) && k[:len(prefix)] == prefix {
+			receivers = append(receivers, rr)
+			delete(lm.receivers, k)
+		}
+	}
+	lm.mu.Unlock()
+	// Signal cancellation OUTSIDE the lock so the sender/receiver
+	// goroutines that are currently blocked on lm.mu (e.g. in a
+	// separate lookup) don't deadlock.
+	for _, rs := range senders {
+		rs.HandleCancel()
+	}
+	for _, rr := range receivers {
+		rr.HandleCancel()
+	}
 }
 
 // SetDefaultInboundDataHandler sets a fallback callback used by Active
@@ -486,10 +607,11 @@ func (lm *LinkManager) HandleLinkData(p *Packet) ([]byte, *Link, error) {
 }
 
 // CloseLink moves the link to Closed and removes it from the manager.
-// Idempotent.
+// Idempotent. Also cancels every in-flight Resource transfer bound to
+// this link — without that, sender/receiver goroutines would block
+// forever on a dead link's REQ/PRF channels.
 func (lm *LinkManager) CloseLink(linkID []byte) {
 	lm.mu.Lock()
-	defer lm.mu.Unlock()
 	key := hex.EncodeToString(linkID)
 	if l, ok := lm.links[key]; ok {
 		l.mu.Lock()
@@ -499,6 +621,10 @@ func (lm *LinkManager) CloseLink(linkID []byte) {
 		l.mu.Unlock()
 		delete(lm.links, key)
 	}
+	lm.mu.Unlock()
+	// closeResourcesForLink takes the lock itself; call after we
+	// release ours to keep lock ordering consistent.
+	lm.closeResourcesForLink(linkID)
 }
 
 // ActiveCount returns the number of links currently in Active state.
