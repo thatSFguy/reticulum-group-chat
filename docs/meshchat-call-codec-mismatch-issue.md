@@ -10,7 +10,7 @@ Submit at: https://github.com/liamcottle/reticulum-meshchat/issues/new
 
 ## Summary
 
-A MeshChat user receives an "incoming call" UI notification attributed to a peer that has only an `lxmf.delivery` destination — no `call.audio` destination at all. The notification fires shortly after the peer's announce reaches the user's MeshChat, presents briefly with a codec-mismatch / failed-call message, and ends. This is reproducible against any text-only LXMF peer; we hit it consistently against [`reticulum-forwarding-service`](https://github.com/thatSFguy/reticulum-forwarding-service), a Go LXMF group-chat relay that registers only `lxmf.delivery` and never opens links to anything other than other peers' `lxmf.delivery` destinations.
+A MeshChat user receives an "incoming call" UI notification attributed to a peer that has only an `lxmf.delivery` destination — no `call.audio` destination at all. The notification fires shortly after the peer's announce reaches the user's MeshChat, presents briefly with a codec-mismatch / failed-call message, and ends. This is reproducible against any text-only LXMF peer; we hit it consistently against [`reticulum-forwarding-service`](https://github.com/thatSFguy/reticulum-forwarding-service) **v1.2.4**, a Go LXMF group-chat relay that registers only `lxmf.delivery` and never opens links to anything other than other peers' `lxmf.delivery` destinations. The fwdsvc side has been exercised end-to-end against an upstream Python RNS/LXMF client (the known-good reference implementation) for every command path.
 
 ## What we expect
 
@@ -18,11 +18,13 @@ The text-only peer never derives, never announces, and never opens a link to `ca
 
 ## What actually happens
 
-The incoming-call UI appears, attributed to the text-only peer. We've audited the relay end:
+The incoming-call UI appears, attributed to the text-only peer. The fwdsvc side cannot be the cause of an actual `call.audio` link:
 
 - It never computes the `call.audio` name_hash, so it cannot produce that destination's hash.
 - Its only outbound link path (`acquireLinkTo`) targets the recipient's `lxmf.delivery` dest_hash — pulled either from `roster.ActiveHashes()` or from the `source_hash` field of an inbound LXMF body. Both are `lxmf.delivery` hashes, not `call.audio`.
-- It does not call `link.identify`, so even if a link reached MeshChat for unrelated reasons, we wouldn't be advertising our identity over it.
+- It does not call `link.identify`, so even if a link reached MeshChat for unrelated reasons, fwdsvc would not be advertising its identity over it.
+
+So whatever is firing `AudioCallReceiver.client_connected` on the MeshChat side is not an actual call link from this peer.
 
 ## Suspected mechanisms (need help confirming)
 
