@@ -1,0 +1,39 @@
+name: interop
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch: {}
+
+jobs:
+  harness:
+    name: harness (ubuntu-latest)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install RNS + LXMF
+        run: |
+          python -m pip install --upgrade pip
+          pip install rns lxmf
+          which rnsd
+          rnsd --version
+
+      - name: Build fwdsvc (sanity)
+        run: go build ./...
+
+      - name: Run interop harness
+        run: bash tests/interop/run.sh

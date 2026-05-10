@@ -8,6 +8,10 @@
 .idea/
 .vscode/
 
+# Python bytecode caches from the interop harness
+__pycache__/
+*.pyc
+
 # Agent / AI config files — kept locally for the developer working on the
 # repo, not pushed to the public repo.
 AGENTS.md
