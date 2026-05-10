@@ -36,6 +36,19 @@ type Caller struct {
 	Paused    bool
 }
 
+// PathInfo is the routing snapshot returned by Dispatcher.PathLookup.
+// All fields zero-valued means "no announce cached for this destination."
+// Used by the /path command so an operator (and the user themselves) can
+// see exactly what the service knows about reaching a target — separates
+// "we don't know about you yet" from "we know you but the path is bad."
+type PathInfo struct {
+	Known       bool      // true when an announce has been cached
+	LastSeen    time.Time // wall-clock of the most recent verified announce
+	Hops        int       // hop count at last announce
+	NextHopHex  string    // hex of TransportID for multi-hop peers; "" when direct
+	LinkActive  bool      // an Active outbound Link to this dest currently exists
+}
+
 // Dispatcher dispatches parsed commands. It's stateless apart from the
 // references it holds; safe to share across the inbox goroutine.
 type Dispatcher struct {
@@ -45,6 +58,12 @@ type Dispatcher struct {
 	// Announce, when set, is invoked by the /announce command to trigger
 	// an immediate fresh announce broadcast. Mod/admin only.
 	Announce func() error
+
+	// PathLookup, when set, is invoked by the /path command to query the
+	// transport for routing info on a target dest_hash (lowercase hex,
+	// 32 chars). Returns PathInfo{Known:false} if the destination has
+	// never announced. Mod/admin only — exposes routing topology.
+	PathLookup func(destHashHex string) PathInfo
 
 	// OnJoin is invoked AFTER a user successfully /joins so the service
 	// layer can fire replay-on-join for them. Called with the joiner's
@@ -100,6 +119,8 @@ func (d *Dispatcher) Dispatch(senderHash string, parsed Parsed) string {
 		return d.handleUnban(caller.Role, parsed.Args)
 	case "announce":
 		return d.handleAnnounce(caller.Role)
+	case "path":
+		return d.handlePath(caller.Role, parsed.Args)
 	default:
 		// Echo the unknown command name back to the sender, but strip
 		// non-printable bytes from it first. parsed.Name comes from
@@ -164,7 +185,7 @@ func helpText(c *Caller) string {
 
 	if c.Role.atLeastMod() {
 		b.WriteString("/nick USER NAME - mod\n")
-		b.WriteString("/kick /ban /unban USER - mod\n")
+		b.WriteString("/kick /ban /unban /path USER - mod\n")
 		b.WriteString("/announce - mod\n")
 		b.WriteString("USER = nick or hex (>=4)")
 	} else if c.Member {
@@ -472,6 +493,55 @@ func (d *Dispatcher) handleUnban(role Role, args []string) string {
 	default:
 		return fmt.Sprintf("%q matches multiple banned users: %s", hash, strings.Join(shortHashes(matches), ", "))
 	}
+}
+
+// handlePath answers /path <user> for mods/admins. Resolves the target via
+// the roster (nick or >=4-char hex prefix), then queries PathLookup for
+// what the transport actually knows: cached announce, hops, multi-hop
+// next-hop, and whether an Active Link is open. The intent is exactly
+// the operator-side diagnostic for "messages queue and time out 5/5
+// times" — separates "we don't know this peer" from "we know them but
+// the path is bad."
+func (d *Dispatcher) handlePath(role Role, args []string) string {
+	if !role.atLeastMod() {
+		return "Only mods or admins can /path."
+	}
+	if len(args) != 1 {
+		return "Usage: /path <user>"
+	}
+	if d.PathLookup == nil {
+		return "Path lookup not wired (server bug)."
+	}
+	target, err := d.Roster.Resolve(args[0])
+	if err != nil {
+		return err.Error()
+	}
+	info := d.PathLookup(target.Hash)
+
+	label := target.Nickname
+	if label == "" {
+		label = "(no nick)"
+	}
+	var b strings.Builder
+	fmt.Fprintf(&b, "Path to %s (%s):\n", label, target.Hash[:8])
+	if !info.Known {
+		b.WriteString("  no announce cached — they haven't reached us")
+		return b.String()
+	}
+	fmt.Fprintf(&b, "  hops: %d\n", info.Hops)
+	age := time.Since(info.LastSeen).Round(time.Second)
+	fmt.Fprintf(&b, "  announce age: %s\n", age)
+	if info.NextHopHex != "" {
+		fmt.Fprintf(&b, "  next hop: %s (multi-hop)\n", info.NextHopHex[:8])
+	} else {
+		b.WriteString("  next hop: direct\n")
+	}
+	if info.LinkActive {
+		b.WriteString("  link: active")
+	} else {
+		b.WriteString("  link: none")
+	}
+	return b.String()
 }
 
 func (d *Dispatcher) handleAnnounce(role Role) string {

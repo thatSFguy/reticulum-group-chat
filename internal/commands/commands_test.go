@@ -153,7 +153,7 @@ func TestHelpForModShowsAllCommands(t *testing.T) {
 	d := newDispatcher(t)
 	_, _ = d.Roster.AddOrUpdate(mustBytes(t, modHash), time.Now())
 	out := d.Dispatch(modHash, Parse("/?"))
-	for _, want := range []string{"/users", "/mods", "/admin", "/nick", "/kick", "/ban", "/unban", "/announce", "/leave", "/pause", "/resume"} {
+	for _, want := range []string{"/users", "/mods", "/admin", "/nick", "/kick", "/ban", "/unban", "/announce", "/path", "/leave", "/pause", "/resume"} {
 		if !strings.Contains(out, want) {
 			t.Errorf("mod help missing %q\n%s", want, out)
 		}
@@ -201,6 +201,86 @@ func TestJoinRespectsMaxMembers(t *testing.T) {
 	}
 	if d.Roster.Has(mustBytes(t, userHash)) {
 		t.Error("user should NOT have been added when chat is full")
+	}
+}
+
+func TestPathRequiresMod(t *testing.T) {
+	d := newDispatcher(t)
+	out := d.Dispatch(userHash, Parse("/path some-nick"))
+	if !strings.Contains(strings.ToLower(out), "only mods or admins") {
+		t.Errorf("non-mod /path should be denied, got %q", out)
+	}
+}
+
+func TestPathRejectsBadArgCount(t *testing.T) {
+	d := newDispatcher(t)
+	d.PathLookup = func(string) PathInfo { return PathInfo{} }
+	out := d.Dispatch(modHash, Parse("/path"))
+	if !strings.Contains(strings.ToLower(out), "usage") {
+		t.Errorf("/path with no args should show usage, got %q", out)
+	}
+}
+
+func TestPathReportsUnwiredLookup(t *testing.T) {
+	d := newDispatcher(t)
+	// PathLookup deliberately nil to simulate forgotten wiring.
+	out := d.Dispatch(adminHash, Parse("/path "+userHash))
+	if !strings.Contains(strings.ToLower(out), "not wired") {
+		t.Errorf("missing PathLookup should report server bug, got %q", out)
+	}
+}
+
+func TestPathReportsUnknownDestination(t *testing.T) {
+	d := newDispatcher(t)
+	_, _ = d.Roster.AddOrUpdate(mustBytes(t, userHash), time.Now())
+	d.PathLookup = func(string) PathInfo { return PathInfo{Known: false} }
+	out := d.Dispatch(modHash, Parse("/path "+userHash))
+	if !strings.Contains(out, "no announce cached") {
+		t.Errorf("unknown dest should say so, got %q", out)
+	}
+}
+
+func TestPathReportsKnownDirectWithLink(t *testing.T) {
+	d := newDispatcher(t)
+	_, _ = d.Roster.AddOrUpdate(mustBytes(t, userHash), time.Now())
+	_ = d.Roster.SetNickname(userHash, "alice")
+	d.PathLookup = func(hex string) PathInfo {
+		if hex != userHash {
+			t.Errorf("PathLookup called with %q, want %q", hex, userHash)
+		}
+		return PathInfo{
+			Known:      true,
+			LastSeen:   time.Now().Add(-3 * time.Minute),
+			Hops:       2,
+			LinkActive: true,
+		}
+	}
+	out := d.Dispatch(modHash, Parse("/path alice"))
+	for _, want := range []string{"alice", userHash[:8], "hops: 2", "direct", "link: active"} {
+		if !strings.Contains(out, want) {
+			t.Errorf("/path output missing %q\n%s", want, out)
+		}
+	}
+}
+
+func TestPathReportsMultihop(t *testing.T) {
+	d := newDispatcher(t)
+	_, _ = d.Roster.AddOrUpdate(mustBytes(t, userHash), time.Now())
+	transportID := strings.Repeat("ab", 16)
+	d.PathLookup = func(string) PathInfo {
+		return PathInfo{
+			Known:      true,
+			LastSeen:   time.Now(),
+			Hops:       4,
+			NextHopHex: transportID,
+		}
+	}
+	out := d.Dispatch(modHash, Parse("/path "+userHash))
+	if !strings.Contains(out, "multi-hop") {
+		t.Errorf("multi-hop /path should mark it as such, got %q", out)
+	}
+	if !strings.Contains(out, transportID[:8]) {
+		t.Errorf("multi-hop /path should show next-hop short hash %q, got %q", transportID[:8], out)
 	}
 }
 

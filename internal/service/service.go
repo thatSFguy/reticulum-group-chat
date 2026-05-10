@@ -122,10 +122,11 @@ func New(cfg *config.Config) (*Service, error) {
 		now:       time.Now,
 	}
 	svc.dispatcher = &commands.Dispatcher{
-		Cfg:      cfg,
-		Roster:   r,
-		Announce: svc.announceNow,
-		OnJoin:   svc.onJoin,
+		Cfg:        cfg,
+		Roster:     r,
+		Announce:   svc.announceNow,
+		PathLookup: svc.pathLookup,
+		OnJoin:     svc.onJoin,
 		// MaxReplyContentBytes intentionally left at 0 (unlimited) — see
 		// replyContentBudget docstring. Delivery.Send routes oversize
 		// replies through Link automatically, so /users etc. return the
@@ -245,6 +246,35 @@ func (s *Service) onJoin(senderHex string) {
 	if s.cfg.Replay.Count > 0 {
 		go s.replayHistoryTo(bytes, s.now())
 	}
+}
+
+// pathLookup is the /path hook — translates the dispatcher's hex
+// dest_hash into a snapshot of what the transport actually knows about
+// reaching that destination: cached announce, hop count, multi-hop
+// next-hop transport_id, and whether an Active Link is currently open.
+// Returns PathInfo{Known:false} for any hex that fails to decode or for
+// a destination we've never seen announced.
+func (s *Service) pathLookup(destHashHex string) commands.PathInfo {
+	destHash, err := hex.DecodeString(destHashHex)
+	if err != nil || len(destHash) != 16 {
+		return commands.PathInfo{}
+	}
+	known := s.transport.Recall(destHash)
+	if known == nil {
+		return commands.PathInfo{}
+	}
+	info := commands.PathInfo{
+		Known:    true,
+		LastSeen: known.LastSeen,
+		Hops:     int(known.Hops),
+	}
+	if len(known.TransportID) == 16 {
+		info.NextHopHex = hex.EncodeToString(known.TransportID)
+	}
+	if s.transport.LinkManager().ActiveTo(destHash) != nil {
+		info.LinkActive = true
+	}
+	return info
 }
 
 // announceNow is the /announce hook — builds a fresh announce and

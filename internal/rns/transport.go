@@ -53,6 +53,15 @@ type Transport struct {
 // side; we just want to avoid spamming when an unknown sender retransmits.
 const PathRequestDedupWindow = 60 * time.Second
 
+// AnnounceLogReturnThreshold is the silence window after which we log a
+// repeat announce from a previously-known identity. Periodic re-announces
+// arrive every AnnounceInterval (default 10 min) per peer per relay hop;
+// on a busy public mesh this fills the log faster than anything else and
+// drowns out the lines an operator actually wants to see (new peers,
+// link state, errors). Above the threshold we still log once so absence-
+// then-return is visible.
+const AnnounceLogReturnThreshold = 6 * time.Hour
+
 // PathResponseTagDedupWindow bounds how long we remember an inbound
 // path? request's 16-byte random tag so we don't emit a path-response
 // twice if the same request reaches us through multiple relay hops or
@@ -449,6 +458,15 @@ func (t *Transport) handleAnnounce(p *Packet) {
 		t.mu.Unlock()
 		return
 	}
+	// Snapshot prior-state fields BEFORE we update prev so the post-unlock
+	// log decision can tell "new identity" / "returning after a long gap"
+	// from "routine periodic re-announce". Skips the log line for the
+	// common case (a known peer announcing on schedule).
+	wasNewIdentity := prev == nil
+	var prevLastSeen time.Time
+	if prev != nil {
+		prevLastSeen = prev.LastSeen
+	}
 	if prev == nil {
 		// Bound the map: when at capacity, evict the entry with the oldest
 		// LastSeen. O(N) but only runs at full capacity, which is rare.
@@ -481,8 +499,14 @@ func (t *Transport) handleAnnounce(p *Packet) {
 	handlers := append([]AnnounceHandler(nil), t.announceHandlers...)
 	t.mu.Unlock()
 
-	displayName, _ := DecodeLXMFAppDataDisplayName(a.AppData)
-	t.logger.Printf("announce verified: dest=%x name=%x hops=%d ctxFlag=%v display=%q", a.DestHash[:4], a.NameHash, a.Hops, a.ContextFlag, string(displayName))
+	switch {
+	case wasNewIdentity:
+		displayName, _ := DecodeLXMFAppDataDisplayName(a.AppData)
+		t.logger.Printf("announce verified (new): dest=%x name=%x hops=%d ctxFlag=%v display=%q", a.DestHash[:4], a.NameHash, a.Hops, a.ContextFlag, string(displayName))
+	case now.Sub(prevLastSeen) >= AnnounceLogReturnThreshold:
+		displayName, _ := DecodeLXMFAppDataDisplayName(a.AppData)
+		t.logger.Printf("announce verified (returning after %s): dest=%x name=%x hops=%d display=%q", now.Sub(prevLastSeen).Round(time.Minute), a.DestHash[:4], a.NameHash, a.Hops, string(displayName))
+	}
 	for _, h := range handlers {
 		if h.AspectMatch(a.NameHash) {
 			h.OnAnnounce(a)
