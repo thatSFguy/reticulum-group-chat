@@ -78,6 +78,7 @@ func TestHarness(t *testing.T) {
 		name := strings.TrimSuffix(filepath.Base(c), ".py")
 		t.Run(name, func(t *testing.T) {
 			fwdsvcDir := t.TempDir()
+			maybePreloadState(t, c, fwdsvcDir)
 			cfgPath := writeFwdsvcConfig(t, fwdsvcDir, port)
 			fwdsvcCancel, deliveryHash := spawnFwdsvc(t, fwdsvcBin, cfgPath, fwdsvcDir)
 			defer fwdsvcCancel()
@@ -85,6 +86,30 @@ func TestHarness(t *testing.T) {
 			runCase(t, pyExe, c, port, deliveryHash, fwdsvcDir)
 		})
 	}
+}
+
+// maybePreloadState copies cases/<name>.preload.state.json into the
+// fwdsvc state dir before fwdsvc boots, when such a file exists. Lets a
+// case start with a populated roster / banlist instead of empty state —
+// useful for tests that need 50+ users without the case itself having
+// to /join 50 ephemeral identities.
+func maybePreloadState(t *testing.T, casePath, fwdsvcDir string) {
+	t.Helper()
+	base := strings.TrimSuffix(casePath, ".py")
+	preload := base + ".preload.state.json"
+	src, err := os.ReadFile(preload)
+	if err != nil {
+		if !os.IsNotExist(err) {
+			t.Fatalf("read preload %s: %v", preload, err)
+		}
+		return
+	}
+	dst := filepath.Join(fwdsvcDir, "state.json")
+	if err := os.WriteFile(dst, src, 0644); err != nil {
+		t.Fatalf("write preload to %s: %v", dst, err)
+	}
+	t.Logf("preloaded %d bytes from %s into fwdsvc state.json",
+		len(src), filepath.Base(preload))
 }
 
 // requireExe fails the test if exe isn't on PATH. Returns the resolved

@@ -1,13 +1,18 @@
 #!/usr/bin/env python3
-"""Joins the chat, then sends /users when the roster is large enough
-that the reply exceeds Reticulum's 500-byte MTU. fwdsvc has to either
-truncate the reply (with an "...and N more" footer) or transfer it via
-SPEC §10 Resource transfer. Today neither path works against an upstream
-Python LXMF receiver — this case is marked _xfail in its filename so the
-harness skips on failure rather than failing the whole run.
+"""Sends /users when fwdsvc has a 50-user roster preloaded (sidecar:
+link_data_oversize_xfail.preload.state.json). The reply is ~1.4 KB
+plaintext — well over Reticulum's 500-byte MTU and the 431-byte
+LinkMDU — so it can't fit in a single link DATA packet.
 
-Flip from xfail to normal once the regression is fixed:
-  rename to drop the _xfail suffix.
+Today this case fails: the v1.3.1 daemon emits one oversize link DATA
+packet, the receiver (or some hop's MTU-enforcing code) drops it, no
+proof comes back, the case times out. Marked _xfail so the harness
+skips on failure rather than failing CI.
+
+When the underlying fix lands (either MaxReplyContentBytes cap so the
+reply truncates with '...and N more', or working Resource transfer),
+rename this file to drop the _xfail suffix and the harness will start
+treating failure as a real test failure.
 """
 
 from __future__ import annotations
@@ -21,33 +26,43 @@ import LXMF  # noqa: E402
 
 
 def main() -> int:
-    args, peer = _common.setup(display_name="link-data-oversize")
+    args, peer = _common.setup(display_name="users-oversize")
     peer.wait_for_fwdsvc()
 
-    # Just /join and /users — the roster size is set up by the harness'
-    # fwdsvc state.json (or whatever future preload mechanism). For now,
-    # this case proves the *single-member* fanout works, then proves the
-    # large reply path either truncates cleanly or arrives.
+    # /join so the case peer becomes user 51 (preload has 50, we add one).
+    print("[case] sending /join")
     peer.send_cmd("/join", method=LXMF.LXMessage.DIRECT)
     peer.wait_for_reply(match=lambda t: "joined" in t.lower() or "already" in t.lower())
     time.sleep(0.5)
 
+    print("[case] sending /users (expects 51-user reply, ~1.4KB plaintext)")
     peer.send_cmd("/users", method=LXMF.LXMessage.DIRECT)
-    users_text = peer.wait_for_reply(
+    text = peer.wait_for_reply(
         match=lambda t: t.startswith("Users (") or t.startswith("No users"),
         timeout=30.0,
     )
-    print(f"[case] users reply ({len(users_text)} bytes): {users_text!r}")
+    print(f"[case] users reply ({len(text)} bytes): {text[:200]!r}...")
 
-    # When this case is migrated out of xfail we'll add a stronger
-    # assertion (e.g. that "...and N more" appears, or that the reply
-    # contains every preloaded user). For now, the success criterion is
-    # simply "we got SOMETHING that looks like a /users reply" — which
-    # today fails because the reply never arrives.
-    if "Users (" not in users_text and "No users" not in users_text:
-        print(f"[case] FAIL: malformed /users reply", file=sys.stderr)
+    # Two possible "fix landed" outcomes:
+    #   (a) Full reply: header says "Users (51)" and at least 51 lines arrived.
+    #   (b) Truncated cleanly: header says "Users (51)" and reply ends with
+    #       "...and N more (see operator log)" — short list but not an error.
+    # Either way, the case PASSES once we get a syntactically-correct reply
+    # whose header matches the actual roster size.
+    if "Users (51)" not in text:
+        print(f"[case] FAIL: expected 'Users (51)' header, got: {text!r}",
+              file=sys.stderr)
         return 1
-    print("[case] PASS")
+
+    truncation_ok = "...and" in text and "more" in text
+    full_ok = text.count("\n  ") >= 51
+
+    if not (truncation_ok or full_ok):
+        print(f"[case] FAIL: reply has wrong header but neither full list "
+              f"nor truncation footer: {text!r}", file=sys.stderr)
+        return 1
+
+    print("[case] PASS — reply arrived and structure is valid")
     return 0
 
 
