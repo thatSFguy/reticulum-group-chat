@@ -70,6 +70,16 @@ type Dispatcher struct {
 	// hex hash; safe to call from the dispatcher goroutine.
 	OnJoin func(senderHash string)
 
+	// LookupAnnouncedName, when set, returns the announced display name
+	// for a 16-byte destination hash (from the LXMF app_data blob on
+	// the peer's most recent verified announce), or an empty string if
+	// no announce has been heard. /join uses this to default a fresh
+	// member's nickname to their announced name — sanitized through
+	// SanitizeNickname so it conforms to nickRE. Mods can /nick to
+	// override later. No-op when the peer never announced a display
+	// name or when the field is nil (e.g. unit tests).
+	LookupAnnouncedName func(hashBytes []byte) string
+
 	// MaxReplyContentBytes caps the byte length of a single command reply
 	// so that, after msgpack wrapping in an opportunistic LXMF packet, it
 	// still fits in the upstream single-packet limit (295 bytes msgpack —
@@ -316,6 +326,18 @@ func (d *Dispatcher) handleJoin(c *Caller) string {
 	if _, err := d.Roster.AddOrUpdate(c.HashBytes, time.Now()); err != nil {
 		return "Couldn't join: " + err.Error()
 	}
+	// Default nickname to the announced display name, sanitized. Only
+	// applied when the joining user has no nickname yet (so re-joiners
+	// keep whatever they previously set via /nick).
+	if d.LookupAnnouncedName != nil {
+		if existing, ok := d.Roster.Get(c.Hash); ok && existing.Nickname == "" {
+			if announced := d.LookupAnnouncedName(c.HashBytes); announced != "" {
+				if sanitized := SanitizeNickname(announced); sanitized != "" {
+					_ = d.Roster.SetNickname(c.Hash, sanitized)
+				}
+			}
+		}
+	}
 	if d.OnJoin != nil {
 		d.OnJoin(c.Hash)
 	}
@@ -359,6 +381,57 @@ func (d *Dispatcher) handleResume(c *Caller) string {
 }
 
 var nickRE = regexp.MustCompile(`^[A-Za-z0-9_-]{1,24}$`)
+
+// SanitizeNickname maps an arbitrary announced display name into the
+// nickRE alphabet so it can be used as a default nickname when a user
+// joins. Any character outside [A-Za-z0-9_-] is replaced with `_`,
+// consecutive `_` runs collapse, and leading/trailing `_-` are trimmed.
+// Truncated to 24 chars. Returns empty when nothing usable survives
+// (e.g. an all-emoji display name) — caller MUST treat empty as "no
+// default available" and leave the nickname unset.
+//
+// Sanitization rules are intentionally lossy + deterministic so two
+// peers who announce "Bob & Alice" don't collide on "Bob" vs.
+// "BobAlice" — they both land on "Bob_Alice".
+func SanitizeNickname(raw string) string {
+	var b strings.Builder
+	prevUnderscore := false
+	for _, r := range raw {
+		ok := (r >= 'A' && r <= 'Z') ||
+			(r >= 'a' && r <= 'z') ||
+			(r >= '0' && r <= '9') ||
+			r == '-'
+		switch {
+		case ok:
+			b.WriteRune(r)
+			prevUnderscore = false
+		case r == '_' || r == ' ' || r == '\t':
+			if !prevUnderscore && b.Len() > 0 {
+				b.WriteByte('_')
+				prevUnderscore = true
+			}
+		default:
+			// Any other rune (punctuation, emoji, control chars,
+			// non-Latin alphabets the regex rejects) collapses into
+			// the same `_` substitution as whitespace. This keeps
+			// "Bob.Alice", "Bob Alice", "Bob_Alice" all mapping to
+			// "Bob_Alice".
+			if !prevUnderscore && b.Len() > 0 {
+				b.WriteByte('_')
+				prevUnderscore = true
+			}
+		}
+		if b.Len() >= 24 {
+			break
+		}
+	}
+	out := b.String()
+	out = strings.Trim(out, "_-")
+	if len(out) > 24 {
+		out = out[:24]
+	}
+	return out
+}
 
 func (d *Dispatcher) handleNick(c *Caller, args []string) string {
 	switch len(args) {

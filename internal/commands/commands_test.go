@@ -1,6 +1,7 @@
 package commands
 
 import (
+	"encoding/hex"
 	"fmt"
 	"path/filepath"
 	"strings"
@@ -174,6 +175,90 @@ func TestJoinAddsToRosterAndCallsOnJoin(t *testing.T) {
 	}
 	if joined != userHash {
 		t.Errorf("OnJoin called with %q, want %q", joined, userHash)
+	}
+}
+
+// TestJoinDefaultsNicknameToAnnouncedName confirms the operator-
+// requested behavior: when a user joins and we have an announced
+// display name cached for them, the sanitized form becomes their
+// default nickname. They can still /nick to override it.
+func TestJoinDefaultsNicknameToAnnouncedName(t *testing.T) {
+	d := newDispatcher(t)
+	d.LookupAnnouncedName = func(h []byte) string {
+		if hex.EncodeToString(h) == userHash {
+			return "New Blue"
+		}
+		return ""
+	}
+	_ = d.Dispatch(userHash, Parse("/join"))
+	u, ok := d.Roster.Get(userHash)
+	if !ok {
+		t.Fatal("user not in roster")
+	}
+	if u.Nickname != "New_Blue" {
+		t.Errorf("default nick = %q, want %q", u.Nickname, "New_Blue")
+	}
+}
+
+// TestJoinDoesNotOverrideExistingNickname pins the rule that a user
+// who already has a nickname (e.g. set previously via /nick, then
+// /leave, then /join again) keeps it. The announced-name default
+// only seeds an EMPTY nickname.
+func TestJoinDoesNotOverrideExistingNickname(t *testing.T) {
+	d := newDispatcher(t)
+	_, _ = d.Roster.AddOrUpdate(mustBytes(t, userHash), time.Now())
+	_ = d.Roster.SetNickname(userHash, "kept")
+	// Simulate /leave then /join. /leave removes the entry, so we
+	// rebuild it to the "already-has-nick" precondition first.
+	d.LookupAnnouncedName = func(h []byte) string { return "Different" }
+	_ = d.Dispatch(userHash, Parse("/join"))
+	u, _ := d.Roster.Get(userHash)
+	if u.Nickname != "kept" {
+		t.Errorf("existing nick clobbered: got %q want %q", u.Nickname, "kept")
+	}
+}
+
+// TestJoinIgnoresUnsanitizableAnnouncedName covers the all-emoji /
+// all-non-Latin case: sanitization returns empty, so the user lands
+// in the roster with no nickname.
+func TestJoinIgnoresUnsanitizableAnnouncedName(t *testing.T) {
+	d := newDispatcher(t)
+	d.LookupAnnouncedName = func(h []byte) string { return "👋🌍" }
+	_ = d.Dispatch(userHash, Parse("/join"))
+	u, _ := d.Roster.Get(userHash)
+	if u.Nickname != "" {
+		t.Errorf("expected empty nickname, got %q", u.Nickname)
+	}
+}
+
+func TestSanitizeNickname(t *testing.T) {
+	cases := []struct{ in, want string }{
+		{"NewBlue", "NewBlue"},
+		{"New Blue", "New_Blue"},
+		{"Bob & Alice", "Bob_Alice"},
+		{"  bob   ", "bob"},
+		{"_bob_", "bob"},
+		{"-bob-", "bob"},
+		{"a", "a"},
+		{"", ""},
+		{"👋🌍", ""},
+		{"👋 NewBlue", "NewBlue"},
+		{"a.b.c", "a_b_c"},
+		{"hello-world_test", "hello-world_test"},
+		// 24-char cap, then trim trailing `_`
+		{"abcdefghijklmnopqrstuvwxyz", "abcdefghijklmnopqrstuvwx"},
+		// Substitution + truncation interaction: leading whitespace skipped,
+		// then chars fill the budget.
+		{"  abcdefghijklmnopqrstuvwxyz", "abcdefghijklmnopqrstuvwx"},
+	}
+	for _, c := range cases {
+		got := SanitizeNickname(c.in)
+		if got != c.want {
+			t.Errorf("SanitizeNickname(%q) = %q, want %q", c.in, got, c.want)
+		}
+		if got != "" && !nickRE.MatchString(got) {
+			t.Errorf("SanitizeNickname(%q) = %q which fails nickRE", c.in, got)
+		}
 	}
 }
 

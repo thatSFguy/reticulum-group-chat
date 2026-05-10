@@ -122,11 +122,12 @@ func New(cfg *config.Config) (*Service, error) {
 		now:       time.Now,
 	}
 	svc.dispatcher = &commands.Dispatcher{
-		Cfg:        cfg,
-		Roster:     r,
-		Announce:   svc.announceNow,
-		PathLookup: svc.pathLookup,
-		OnJoin:     svc.onJoin,
+		Cfg:                 cfg,
+		Roster:              r,
+		Announce:            svc.announceNow,
+		PathLookup:          svc.pathLookup,
+		OnJoin:              svc.onJoin,
+		LookupAnnouncedName: svc.lookupAnnouncedName,
 		// MaxReplyContentBytes intentionally left at 0 (unlimited) — see
 		// replyContentBudget docstring. Delivery.Send routes oversize
 		// replies through Link automatically, so /users etc. return the
@@ -246,6 +247,27 @@ func (s *Service) onJoin(senderHex string) {
 	if s.cfg.Replay.Count > 0 {
 		go s.replayHistoryTo(bytes, s.now())
 	}
+}
+
+// lookupAnnouncedName returns the announced display name for a peer
+// from their most recent verified announce, or "" if no announce has
+// been heard or the announce carried no display name. Called by the
+// commands dispatcher to default a fresh /join'er's nickname to their
+// announced name. Decoding errors collapse to "" (the caller treats
+// empty as "no default available").
+func (s *Service) lookupAnnouncedName(hashBytes []byte) string {
+	if len(hashBytes) != rns.IdentityHashLen {
+		return ""
+	}
+	known := s.transport.Recall(hashBytes)
+	if known == nil || len(known.AppData) == 0 {
+		return ""
+	}
+	name, err := rns.DecodeLXMFAppDataDisplayName(known.AppData)
+	if err != nil || len(name) == 0 {
+		return ""
+	}
+	return string(name)
 }
 
 // pathLookup is the /path hook — translates the dispatcher's hex
