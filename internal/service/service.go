@@ -217,7 +217,7 @@ func (s *Service) Run(ctx context.Context) error {
 func (s *Service) dialInterface(iface config.InterfaceConfig) error {
 	switch iface.Type {
 	case "tcp_client":
-		client, err := rns.DialTCP(iface.Addr, iface.Timeout.Std())
+		client, err := rns.DialReconnectingTCP(iface.Addr, iface.Timeout.Std(), s.logger)
 		if err != nil {
 			return err
 		}

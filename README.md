@@ -144,6 +144,12 @@ messages addressed to a destination hash, deliverable opportunistically
   `identity_b64` and the config file is the single source of truth —
   reinstall on any machine, same destination hash, same chat for
   everyone.
+- **Self-healing TCP interface.** `tcp_client` interfaces auto-redial
+  with capped exponential backoff after any drop (peer restart, NAT
+  timeout, transient network failure). TCP keepalive on dialed sockets
+  surfaces silent peer drops within ~2 minutes instead of waiting for
+  the next outbound write to fail. The service does not need to be
+  restarted after an upstream blip.
 
 ---
 
@@ -195,7 +201,7 @@ Open `~/.fwdsvc/config.toml` and edit:
 First lines on stdout:
 
 ```
-fwdsvc 1.3.5 starting (linux/amd64)
+fwdsvc 1.3.6 starting (linux/amd64)
 fwdsvc 2026/05/11 16:00:00 interface tcp_client connected: rns.chicagonomad.net:4242
 fwdsvc 2026/05/11 16:00:00 service identity hash: 359fc3967f984a529874d0960c6ee782
 fwdsvc 2026/05/11 16:00:00 delivery destination : 4c87fb86ccfdff39a3d1e22060ba1789
@@ -508,6 +514,8 @@ to the microsecond. Examples worth recognising:
 | `outbound: failing message id=… after 5 attempts: …` | Gave up after the retry budget. |
 | `resource sender: ADV retry N/4 for <hash>` | Resource transfer's ADV phase is retrying because the receiver hasn't requested any parts yet. |
 | `nick from announce: adopted "X" for …`     | Auto-defaulted a nickname from an inbound announce (v1.3.5+). |
+| `tcp interface … disconnected: … — reconnecting` | Upstream TCP drop; supervisor will redial with backoff (v1.3.6+). |
+| `tcp interface … reconnected`               | Reconnect succeeded; interface is live again (v1.3.6+). |
 
 ### Troubleshooting
 
