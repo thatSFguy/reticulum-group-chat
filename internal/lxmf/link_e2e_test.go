@@ -93,7 +93,7 @@ func TestLinkE2EReceiveLongMessage(t *testing.T) {
 
 	// Build a long LXMF body in DIRECT form (>>> 295-byte opportunistic cap).
 	long := []byte(strings.Repeat("the quick brown fox jumps over the lazy dog. ", 30)) // ~1.4 KB
-	directBody, err := SignAndPackDirect(
+	directBody, _, err := SignAndPackDirect(
 		alice,
 		delA.Hash(),
 		delB.Hash(),

@@ -38,6 +38,15 @@ type Transport struct {
 	pathRequestsSent     map[string]time.Time // key: hex dest_hash, dedup window for outbound
 	pathResponseTagsSeen map[string]time.Time // key: hex tag, dedup for inbound path? we've already responded to
 
+	// initiatorIdentity, when set, signs SPEC §6.6 LINKIDENTIFY packets
+	// emitted on every link the local node initiates that reaches the
+	// Active state. Set via SetInitiatorIdentity; nil means we never
+	// emit LINKIDENTIFY (the pre-v1.7 behavior). Single-identity service
+	// shape (fwdsvc has one identity per process), so a transport-wide
+	// setter is sufficient; a multi-identity host would need a
+	// per-link-request override.
+	initiatorIdentity *Identity
+
 	linkManager *LinkManager
 
 	// lifetime is the configurable timing for RunLinkSweeper. Lazily
@@ -702,6 +711,55 @@ func (t *Transport) handleLRProof(p *Packet) {
 	if err := t.sendLRRTT(parsed.LinkID, link, 0.05); err != nil {
 		t.logger.Printf("send LRRTT: %v", err)
 	}
+
+	// SPEC §6.6 LINKIDENTIFY: prove which identity is driving this link,
+	// so the responder can route follow-up traffic (tap-back reactions,
+	// reply-to fan-out replies) back to this destination instead of
+	// inferring a target from LXMF body fields. Only emitted when an
+	// initiator identity has been registered — keeps interop fallback
+	// on the silent-link behavior for callers that haven't opted in.
+	t.mu.RLock()
+	initID := t.initiatorIdentity
+	t.mu.RUnlock()
+	if initID != nil {
+		if err := t.sendLinkIdentify(parsed.LinkID, link, initID); err != nil {
+			t.logger.Printf("send LINKIDENTIFY: %v", err)
+		}
+	}
+}
+
+// SetInitiatorIdentity wires the identity used to sign SPEC §6.6
+// LINKIDENTIFY packets on every link we initiate that reaches Active.
+// Must be set before SendOverLink is exercised; nil restores the
+// pre-v1.7 silent behavior where we never identify on a link (which
+// means responders that route asynchronous follow-up traffic by
+// LINKIDENTIFY-cached destination — e.g. mobile clients that want to
+// send tap-back reactions back through fwdsvc rather than direct to
+// the embedded LXMF sender — fall back to their own heuristics).
+func (t *Transport) SetInitiatorIdentity(id *Identity) {
+	t.mu.Lock()
+	t.initiatorIdentity = id
+	t.mu.Unlock()
+}
+
+// sendLinkIdentify builds and broadcasts the post-handshake
+// LINKIDENTIFY packet that tells the responder which identity (and
+// therefore which destination) is driving the link. Snapshots the
+// link's session keys under its mutex to avoid racing a concurrent
+// close.
+func (t *Transport) sendLinkIdentify(linkID []byte, link *Link, id *Identity) error {
+	link.mu.Lock()
+	signing := append([]byte(nil), link.Signing...)
+	encryption := append([]byte(nil), link.Encryption...)
+	link.mu.Unlock()
+	if len(signing) == 0 || len(encryption) == 0 {
+		return fmt.Errorf("link has no session keys")
+	}
+	pkt, err := BuildLinkIdentify(linkID, signing, encryption, id)
+	if err != nil {
+		return err
+	}
+	return t.Broadcast(pkt)
 }
 
 // sendLRRTT builds and broadcasts the post-handshake LRRTT packet.

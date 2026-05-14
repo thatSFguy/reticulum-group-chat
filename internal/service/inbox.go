@@ -20,6 +20,20 @@ func (s *Service) onLXMFReceived(msg *lxmf.Message) {
 	senderBytes := msg.SourceHash
 	senderHex := hex.EncodeToString(senderBytes)
 
+	// Diagnostic: dump the inbound shape (sender prefix, content length,
+	// raw fields-map key list with concrete Go types). Lets us see exactly
+	// what the wire is delivering when reactions / replies vanish before
+	// the rewrite stage. Will be tightened once cross-client reaction
+	// interop is stable.
+	if len(msg.Fields) > 0 || len(msg.Content) == 0 {
+		fieldKeys := make([]string, 0, len(msg.Fields))
+		for k := range msg.Fields {
+			fieldKeys = append(fieldKeys, fmt.Sprintf("%v(%T)", k, k))
+		}
+		s.logger.Printf("inbound LXMF: from=%s content_len=%d field_keys=%v",
+			senderHex[:8], len(msg.Content), fieldKeys)
+	}
+
 	if s.roster.IsBanned(senderBytes) {
 		s.logger.Printf("dropping banned sender %s", senderHex[:8])
 		return
@@ -91,15 +105,68 @@ func (s *Service) onLXMFReceived(msg *lxmf.Message) {
 	// values (image bytes, …) pass through raw.
 	content = sanitizeForward(content)
 
-	body := "[" + senderNick + "] " + content
-
 	// Apply the operator's attachment policy. Disallowed keys drop
 	// silently; oversized values drop with a "[image not forwarded: …]"
 	// suffix appended to the body so recipients know the sender tried.
 	fwdFields, drops := filterAttachments(msg.Fields, s.cfg.Service)
+
+	// Compose the forwarded body. Reactions (Columba/MeshChatX
+	// fields[16]) and reply-to-only messages can arrive with content=""
+	// — the metadata IS the field payload, and clients render the chip
+	// on the original message bubble. In that case the "[nick] " prefix
+	// would broadcast a trailing-space empty bubble, so we omit it and
+	// forward an empty body alongside the fields.
+	var body string
+	if content != "" {
+		body = "[" + senderNick + "] " + content
+	}
 	for _, note := range drops {
-		body += " " + note
 		s.logger.Printf("attachment dropped: from=%s %s", senderHex[:8], note)
+		if body == "" {
+			body = note
+		} else {
+			body += " " + note
+		}
+	}
+
+	// If a metadata-only message (e.g. a reaction) had all its fields
+	// stripped by the operator policy, there's nothing left to deliver
+	// — bail out so we don't fan out empty bubbles to every member.
+	if body == "" && len(fwdFields) == 0 {
+		s.logger.Printf("inbound LXMF: bailing — empty body and no fields survived filter (from=%s msg_fields_in=%d, allowlist=%v)",
+			senderHex[:8], len(msg.Fields), s.cfg.Service.ForwardedFields)
+		return
+	}
+
+	// Detect inbound reactions and reply-to fields targeting an earlier
+	// fan-out we cached. When the lookup succeeds we get a per-recipient
+	// rewrite closure that lets forwardToRoster substitute each
+	// recipient's view of the target message_id. On a cache miss the
+	// closure is nil and forwarding falls back to byte-for-byte
+	// passthrough (which won't bind — see Limitations in README).
+	opts := forwardOpts{rewrite: s.buildRewrite(fwdFields)}
+
+	// Only register a new bubble for primary text bubbles. Reactions
+	// and bare replies don't get reacted-to in practice, and keeping
+	// them out of the cache prevents reaction-of-reaction chains from
+	// thrashing the table.
+	if content != "" {
+		opts.bubble = s.newBubbleForForward()
+		// Pre-register the original sender's view of THIS message — fwdsvc
+		// already knows it (= msg.MessageID(), the same value the sender
+		// computed for what they sent us). Without this, when somebody
+		// else reacts to this bubble and the reaction fans out back to
+		// the original sender, the rewrite would miss the sender's view
+		// (sender was never a fan-out recipient) and we'd skip them
+		// entirely — meaning the originator of a message never sees the
+		// reactions to it. This is the load-bearing fix for the common
+		// 2-person case.
+		if opts.bubble != nil && s.idmap != nil {
+			senderMsgIDHex := hex.EncodeToString(msg.MessageID())
+			s.idmap.RegisterView(opts.bubble, senderHex, senderMsgIDHex)
+			s.logger.Printf("idmap: registered sender view from=%s msgid=%s",
+				senderHex[:8], senderMsgIDHex[:8])
+		}
 	}
 
 	// Delivery.Send routes opportunistic vs link automatically based on
@@ -107,9 +174,13 @@ func (s *Service) onLXMFReceived(msg *lxmf.Message) {
 	// "message too large" reply path. The MaxInboundChars policy cap
 	// above (s.cfg.Service.MaxInboundChars) is the only ceiling on
 	// content length that's still enforced here.
-	delivered := s.forwardToRoster(senderHex, body, fwdFields)
+	delivered := s.forwardToRoster(senderHex, body, fwdFields, opts)
 
-	if delivered > 0 {
+	// Reactions and bare reply-to messages have no visible text — keep
+	// them out of the replay buffer so a freshly-joining member doesn't
+	// see a bunch of orphan "" bubbles without the original messages
+	// they refer to.
+	if delivered > 0 && content != "" {
 		_ = s.history.Append(history.Entry{
 			At:         now,
 			SenderHash: senderHex,

@@ -86,12 +86,40 @@ type ServiceConfig struct {
 	// 20–30 KB output and the mobile app's defensive inbound cap.
 	MaxAttachmentBytes int `toml:"max_attachment_bytes"`
 
+	// IDCacheTTL is how long fwdsvc remembers each fan-out's per-
+	// recipient LXMF message_id views. The cache exists so cross-client
+	// reactions (fields[16].reaction_to) and MeshChatX reply-to
+	// (fields[0x30]) can be rewritten per recipient on fan-out — the
+	// bare rebroadcast model would otherwise compute a different
+	// message_id on every recipient and the binding fails. Set to 0 to
+	// disable rewriting (legacy behavior: reactions show "[someone
+	// reacted]" but don't land on a bubble, replies render quoted text
+	// only). Default 24h covers "react to something from earlier today"
+	// realistically.
+	IDCacheTTL Duration `toml:"id_cache_ttl"`
+
+	// IDCacheMax bounds the cache size (in distinct message_id keys,
+	// not bubbles — a fan-out to N recipients creates N keys). LRU
+	// eviction trims to this when exceeded. 0 = unbounded (only TTL
+	// evicts). Default 10000 ≈ "every member sending one message every
+	// few seconds for 24h on a 32-member roster fits."
+	IDCacheMax int `toml:"id_cache_max"`
+
 	// ForwardedFields is the allowlist of LXMF field keys that pass
 	// through forwarding. Anything not in this list is dropped even when
 	// ForwardAttachments=true — defense against a misbehaving client
 	// stuffing weird keys, and an operator opt-in for new field types
 	// (FIELD_FILE_ATTACHMENTS = 5, FIELD_AUDIO = 7, etc.) once those
-	// clients shake out. Default [6] (FIELD_IMAGE only).
+	// clients shake out. Default [6, 16, 48, 49]:
+	//
+	//   6  FIELD_IMAGE          ["ext", bytes]
+	//   16 reactions            {"reaction_to": <hex>, "emoji": "👍",
+	//                            "sender": <hex>} — Columba + MeshChatX
+	//                            tap-back convention.
+	//   48 reply-to hash        raw 32-byte message_id being replied to
+	//                            (MeshChatX 0x30 shape).
+	//   49 reply-to quoted text optional UTF-8 quote preview (MeshChatX
+	//                            0x31). Tiny by design — usually <100 B.
 	ForwardedFields []int `toml:"forwarded_fields"`
 }
 
@@ -167,7 +195,9 @@ func defaults() *Config {
 			MaxInboundChars:    500,
 			ForwardAttachments: true,
 			MaxAttachmentBytes: 32768,
-			ForwardedFields:    []int{6},
+			ForwardedFields:    []int{6, 16, 48, 49},
+			IDCacheTTL:         Duration(24 * time.Hour),
+			IDCacheMax:         10000,
 		},
 		Replay: ReplayConfig{
 			Count:  100,
@@ -210,6 +240,12 @@ func (c *Config) normalize() error {
 	}
 	if c.Service.MaxAttachmentBytes < 0 {
 		return fmt.Errorf("service.max_attachment_bytes must be >= 0")
+	}
+	if c.Service.IDCacheTTL.Std() < 0 {
+		return fmt.Errorf("service.id_cache_ttl must be >= 0 (0 disables)")
+	}
+	if c.Service.IDCacheMax < 0 {
+		return fmt.Errorf("service.id_cache_max must be >= 0")
 	}
 	for i, k := range c.Service.ForwardedFields {
 		if k < 0 {

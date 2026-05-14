@@ -167,8 +167,19 @@ func TestAttachmentConfigDefaults(t *testing.T) {
 	if c.Service.MaxAttachmentBytes != 32768 {
 		t.Errorf("MaxAttachmentBytes default = %d, want 32768", c.Service.MaxAttachmentBytes)
 	}
-	if len(c.Service.ForwardedFields) != 1 || c.Service.ForwardedFields[0] != 6 {
-		t.Errorf("ForwardedFields default = %v, want [6]", c.Service.ForwardedFields)
+	// Default allowlist: FIELD_IMAGE plus the message-meta fields
+	// (reactions = 16, MeshChatX reply-to hash = 48, reply-to quoted
+	// text = 49). See issue #8 for the cross-client convention.
+	wantFields := map[int]bool{6: true, 16: true, 48: true, 49: true}
+	if len(c.Service.ForwardedFields) != len(wantFields) {
+		t.Errorf("ForwardedFields default = %v, want keys %v",
+			c.Service.ForwardedFields, wantFields)
+	}
+	for _, k := range c.Service.ForwardedFields {
+		if !wantFields[k] {
+			t.Errorf("unexpected key %d in default ForwardedFields = %v",
+				k, c.Service.ForwardedFields)
+		}
 	}
 }
 

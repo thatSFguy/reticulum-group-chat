@@ -103,35 +103,49 @@ func (d *Delivery) Identity() *rns.Identity { return d.identity }
 // Ed25519 public key to verify the LRPROOF + link DATA proofs. An
 // unknown recipient yields an error before any wire activity.
 func (d *Delivery) Send(recipientDestHash []byte, title, content []byte, fields map[any]any) error {
+	_, err := d.SendWithID(recipientDestHash, title, content, fields)
+	return err
+}
+
+// SendWithID is Send but also returns the 32-byte LXMF message_id the
+// recipient will compute on parse (SPEC §5.4: H(dest||source||payload)).
+// Returned on success; on error the returned msgID is nil. Used by the
+// forwarding service to register the per-recipient view of a relayed
+// bubble so reactions / reply-to fields can be rewritten to bind on the
+// receiving client.
+func (d *Delivery) SendWithID(recipientDestHash []byte, title, content []byte, fields map[any]any) (msgID []byte, err error) {
 	if len(recipientDestHash) != rns.IdentityHashLen {
-		return fmt.Errorf("recipient dest_hash must be %d bytes", rns.IdentityHashLen)
+		return nil, fmt.Errorf("recipient dest_hash must be %d bytes", rns.IdentityHashLen)
 	}
 	known := d.transport.Recall(recipientDestHash)
 	if known == nil {
-		return fmt.Errorf("%w: %x", ErrRecipientUnknown, recipientDestHash[:4])
+		return nil, fmt.Errorf("%w: %x", ErrRecipientUnknown, recipientDestHash[:4])
 	}
 
 	// Try opportunistic first. signAndPackOpportunisticAt fails fast with
 	// ErrPayloadTooLarge before doing any crypto if the payload won't
 	// fit, so this branch costs at most one msgpack marshal for messages
 	// that route to link delivery.
-	body, err := SignAndPackOpportunistic(d.identity, d.destHash, recipientDestHash, title, content, fields)
+	body, packedID, err := SignAndPackOpportunistic(d.identity, d.destHash, recipientDestHash, title, content, fields)
 	if err != nil {
 		if errors.Is(err, ErrPayloadTooLarge) {
 			return d.sendOverLink(recipientDestHash, title, content, fields)
 		}
-		return fmt.Errorf("pack: %w", err)
+		return nil, fmt.Errorf("pack: %w", err)
 	}
 
 	// Recipient's identity hash drives the Token HKDF salt (SPEC §3.2).
 	recipientIdentityHash := identityHashFromPublic(known.PublicKey)
 	ciphertext, err := rns.TokenEncrypt(body, known.X25519Public(), recipientIdentityHash)
 	if err != nil {
-		return fmt.Errorf("encrypt: %w", err)
+		return nil, fmt.Errorf("encrypt: %w", err)
 	}
 
 	pkt := buildOutboundPacket(recipientDestHash, ciphertext, known.TransportID)
-	return d.transport.Broadcast(pkt)
+	if err := d.transport.Broadcast(pkt); err != nil {
+		return nil, err
+	}
+	return packedID, nil
 }
 
 // sendOverLink is the link-delivery fallback path used by Send when the
@@ -140,20 +154,22 @@ func (d *Delivery) Send(recipientDestHash []byte, title, content []byte, fields 
 // in the body because the outer Reticulum packet is addressed to a
 // link_id, not the recipient destination), then hands the bytes to
 // rns.Transport.SendOverLink which manages the link state machine and
-// blocks for the responder's proof.
-func (d *Delivery) sendOverLink(recipientDestHash, title, content []byte, fields map[any]any) error {
-	directBody, err := SignAndPackDirect(d.identity, d.destHash, recipientDestHash, title, content, fields)
+// blocks for the responder's proof. Returns the LXMF message_id alongside
+// the error so SendWithID can register the recipient view for cross-
+// client reaction / reply rewriting.
+func (d *Delivery) sendOverLink(recipientDestHash, title, content []byte, fields map[any]any) (msgID []byte, err error) {
+	directBody, packedID, err := SignAndPackDirect(d.identity, d.destHash, recipientDestHash, title, content, fields)
 	if err != nil {
-		return fmt.Errorf("pack direct: %w", err)
+		return nil, fmt.Errorf("pack direct: %w", err)
 	}
 	timeout := d.LinkSendTimeout
 	if timeout <= 0 {
 		timeout = rns.DefaultLinkSendTimeout
 	}
 	if err := d.transport.SendOverLink(recipientDestHash, directBody, timeout); err != nil {
-		return fmt.Errorf("link send: %w", err)
+		return nil, fmt.Errorf("link send: %w", err)
 	}
-	return nil
+	return packedID, nil
 }
 
 // buildOutboundPacket frames the encrypted LXMF body as a Reticulum DATA

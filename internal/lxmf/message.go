@@ -95,8 +95,11 @@ type Message struct {
 // destHash is the recipient's destination_hash; senderID signs.
 // senderDestHash is the SENDER's destination_hash (NOT the identity hash
 // — SPEC §5.4). title may be nil. content may be nil but typically isn't.
-// fields may be nil (encoded as an empty msgpack map).
-func SignAndPackOpportunistic(senderID *rns.Identity, senderDestHash, destHash []byte, title, content []byte, fields map[any]any) ([]byte, error) {
+// fields may be nil (encoded as an empty msgpack map). The returned
+// msgID is the 32-byte LXMF message_id the recipient will compute when
+// they parse this body — used by the forwarder to register per-recipient
+// IDs for cross-client reaction / reply rewriting.
+func SignAndPackOpportunistic(senderID *rns.Identity, senderDestHash, destHash []byte, title, content []byte, fields map[any]any) (wire, msgID []byte, err error) {
 	return signAndPackOpportunisticAt(senderID, senderDestHash, destHash, title, content, fields, time.Now())
 }
 
@@ -109,16 +112,16 @@ func SignAndPackOpportunistic(senderID *rns.Identity, senderDestHash, destHash [
 // hash (the outer packet is addressed to a link_id, not the recipient's
 // destination). No size cap is enforced here — link DATA can carry
 // arbitrary-size payloads, fragmented by the link layer.
-func SignAndPackDirect(senderID *rns.Identity, senderDestHash, destHash []byte, title, content []byte, fields map[any]any) ([]byte, error) {
+func SignAndPackDirect(senderID *rns.Identity, senderDestHash, destHash []byte, title, content []byte, fields map[any]any) (wire, msgID []byte, err error) {
 	return signAndPackDirectAt(senderID, senderDestHash, destHash, title, content, fields, time.Now())
 }
 
-func signAndPackDirectAt(senderID *rns.Identity, senderDestHash, destHash []byte, title, content []byte, fields map[any]any, ts time.Time) ([]byte, error) {
+func signAndPackDirectAt(senderID *rns.Identity, senderDestHash, destHash []byte, title, content []byte, fields map[any]any, ts time.Time) (wire, msgID []byte, err error) {
 	if senderID == nil {
-		return nil, errors.New("nil sender identity")
+		return nil, nil, errors.New("nil sender identity")
 	}
 	if len(senderDestHash) != rns.IdentityHashLen || len(destHash) != rns.IdentityHashLen {
-		return nil, errors.New("dest_hash and source_hash must each be 16 bytes")
+		return nil, nil, errors.New("dest_hash and source_hash must each be 16 bytes")
 	}
 	if title == nil {
 		title = []byte{}
@@ -133,9 +136,9 @@ func signAndPackDirectAt(senderID *rns.Identity, senderDestHash, destHash []byte
 	tsSeconds := float64(ts.UnixMicro()) / 1_000_000.0
 	payload, err := msgpack.Marshal([]any{tsSeconds, title, content, fields})
 	if err != nil {
-		return nil, fmt.Errorf("marshal payload: %w", err)
+		return nil, nil, fmt.Errorf("marshal payload: %w", err)
 	}
-	signedData := buildSignedData(destHash, senderDestHash, payload)
+	signedData, id := buildSignedDataWithID(destHash, senderDestHash, payload)
 	sig := senderID.Sign(signedData)
 
 	out := make([]byte, 0, 2*rns.IdentityHashLen+len(sig)+len(payload))
@@ -143,18 +146,20 @@ func signAndPackDirectAt(senderID *rns.Identity, senderDestHash, destHash []byte
 	out = append(out, senderDestHash...)
 	out = append(out, sig...)
 	out = append(out, payload...)
-	return out, nil
+	return out, id, nil
 }
 
 // signAndPackOpportunisticAt is the testable form: timestamp is injected
 // rather than read from the wall clock, so deterministic test vectors
-// (which pin the timestamp) can be reproduced exactly.
-func signAndPackOpportunisticAt(senderID *rns.Identity, senderDestHash, destHash []byte, title, content []byte, fields map[any]any, ts time.Time) ([]byte, error) {
+// (which pin the timestamp) can be reproduced exactly. The returned
+// msgID is the recipient-view LXMF message_id (independent of signature
+// — it's just H(dest||source||payload)).
+func signAndPackOpportunisticAt(senderID *rns.Identity, senderDestHash, destHash []byte, title, content []byte, fields map[any]any, ts time.Time) (wire, msgID []byte, err error) {
 	if senderID == nil {
-		return nil, errors.New("nil sender identity")
+		return nil, nil, errors.New("nil sender identity")
 	}
 	if len(senderDestHash) != rns.IdentityHashLen || len(destHash) != rns.IdentityHashLen {
-		return nil, errors.New("dest_hash and source_hash must each be 16 bytes")
+		return nil, nil, errors.New("dest_hash and source_hash must each be 16 bytes")
 	}
 	if title == nil {
 		title = []byte{}
@@ -169,21 +174,21 @@ func signAndPackOpportunisticAt(senderID *rns.Identity, senderDestHash, destHash
 	tsSeconds := float64(ts.UnixMicro()) / 1_000_000.0
 	payload, err := msgpack.Marshal([]any{tsSeconds, title, content, fields})
 	if err != nil {
-		return nil, fmt.Errorf("marshal payload: %w", err)
+		return nil, nil, fmt.Errorf("marshal payload: %w", err)
 	}
 	if len(payload) > MaxOpportunisticPayload {
-		return nil, fmt.Errorf("%w: msgpack payload is %d bytes, limit is %d (link-based delivery for larger messages is not implemented)",
+		return nil, nil, fmt.Errorf("%w: msgpack payload is %d bytes, limit is %d (link-based delivery for larger messages is not implemented)",
 			ErrPayloadTooLarge, len(payload), MaxOpportunisticPayload)
 	}
 
-	signedData := buildSignedData(destHash, senderDestHash, payload)
+	signedData, id := buildSignedDataWithID(destHash, senderDestHash, payload)
 	sig := senderID.Sign(signedData)
 
 	out := make([]byte, 0, len(senderDestHash)+len(sig)+len(payload))
 	out = append(out, senderDestHash...)
 	out = append(out, sig...)
 	out = append(out, payload...)
-	return out, nil
+	return out, id, nil
 }
 
 // ParseDirectBody decodes the link-form LXMF body (SPEC §5.2):
@@ -293,6 +298,15 @@ func CheckOpportunisticSize(title, content []byte, fields map[any]any) error {
 }
 
 func buildSignedData(destHash, sourceHash, msgpackPayload []byte) []byte {
+	signedData, _ := buildSignedDataWithID(destHash, sourceHash, msgpackPayload)
+	return signedData
+}
+
+// buildSignedDataWithID is buildSignedData but also returns the 32-byte
+// SHA-256 hash inserted between hashedPart and the signature input — that
+// hash IS the LXMF message_id (SPEC §5.4: H(dest||source||payload)). Two
+// callers want both pieces; everyone else just calls buildSignedData.
+func buildSignedDataWithID(destHash, sourceHash, msgpackPayload []byte) (signedData, msgID []byte) {
 	hashedPart := make([]byte, 0, len(destHash)+len(sourceHash)+len(msgpackPayload))
 	hashedPart = append(hashedPart, destHash...)
 	hashedPart = append(hashedPart, sourceHash...)
@@ -301,7 +315,24 @@ func buildSignedData(destHash, sourceHash, msgpackPayload []byte) []byte {
 	out := make([]byte, 0, len(hashedPart)+len(mh))
 	out = append(out, hashedPart...)
 	out = append(out, mh[:]...)
-	return out
+	return out, append([]byte(nil), mh[:]...)
+}
+
+// ComputeMessageID returns the LXMF message_id for a given (dest_hash,
+// source_hash, msgpack_payload) tuple — SPEC §5.4 defines it as
+// SHA-256(dest_hash || source_hash || msgpack_payload). Used by the
+// forwarding service to register per-recipient message_ids in the
+// id-rewrite cache without re-packing the body.
+func ComputeMessageID(destHash, sourceHash, msgpackPayload []byte) []byte {
+	mh := sha256.Sum256(append(append(append([]byte{}, destHash...), sourceHash...), msgpackPayload...))
+	return mh[:]
+}
+
+// MessageID returns the LXMF message_id (32 bytes, SPEC §5.4) for a
+// parsed inbound message. Only valid after a successful Parse; Verify is
+// not required, since message_id is independent of the signature.
+func (m *Message) MessageID() []byte {
+	return ComputeMessageID(m.DestHash, m.SourceHash, m.rawPayload)
 }
 
 // unpackPayload extracts Timestamp/Title/Content/Fields/Stamp from rawPayload.

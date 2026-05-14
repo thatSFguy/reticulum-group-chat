@@ -36,7 +36,7 @@ type fakeSender struct {
 	recency map[byte]time.Time
 }
 
-func (f *fakeSender) SendLXMF(recipient, body []byte, fields map[any]any) error {
+func (f *fakeSender) SendLXMF(recipient, body []byte, fields map[any]any) ([]byte, error) {
 	f.mu.Lock()
 	f.sendCalls = append(f.sendCalls, append([]byte(nil), body...))
 	f.sendRecipients = append(f.sendRecipients, append([]byte(nil), recipient...))
@@ -47,11 +47,22 @@ func (f *fakeSender) SendLXMF(recipient, body []byte, fields map[any]any) error 
 		err = f.sendErrs[0]
 		f.sendErrs = f.sendErrs[1:]
 	}
+	// Deterministic synthetic msg_id so registration tests can assert
+	// on it: first byte of recipient + monotonic counter. The byte slice
+	// is 32 bytes (length of SHA-256) so it matches real LXMF.
+	msgID := make([]byte, 32)
+	if len(recipient) > 0 {
+		msgID[0] = recipient[0]
+	}
+	msgID[1] = byte(len(f.sendCalls))
 	f.mu.Unlock()
 	if delay > 0 {
 		time.Sleep(delay)
 	}
-	return err
+	if err != nil {
+		return nil, err
+	}
+	return msgID, nil
 }
 
 func (f *fakeSender) RequestPath(recipient []byte) error {

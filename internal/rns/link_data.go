@@ -218,6 +218,61 @@ func BuildLinkRTT(linkID, signing, encryption []byte, rttSeconds float64) (*Pack
 	}, nil
 }
 
+// BuildLinkIdentify constructs the SPEC §6.6 LINKIDENTIFY packet an
+// initiator emits on an Active link to prove which identity (and
+// therefore which destination) it's driving the link from. Plaintext
+// before link-DATA encryption is:
+//
+//	identity_hash(16) || ed25519_signature(64)
+//
+// where the signature covers (link_id(16) || identity.public_key(64)).
+// The responder verifies the signature against the identity's known
+// Ed25519 public key (looked up from the announce table by
+// identity_hash) and caches the identity (and the matching destination)
+// on the session, so asynchronous follow-up traffic — most importantly
+// tap-back reactions on a relayed group bubble — gets routed back
+// through the initiator's destination rather than to some peer hash
+// the receiving app inferred from the LXMF body.
+//
+// `id` is the LOCAL endpoint's long-term identity; it signs. The link's
+// session signing/encryption keys protect the wire bytes.
+func BuildLinkIdentify(linkID []byte, signing, encryption []byte, id *Identity) (*Packet, error) {
+	if len(linkID) != IdentityHashLen {
+		return nil, fmt.Errorf("link_id must be %d bytes", IdentityHashLen)
+	}
+	if id == nil {
+		return nil, errors.New("nil identity")
+	}
+	pubkey := id.PublicKey()
+	signedData := make([]byte, 0, len(linkID)+len(pubkey))
+	signedData = append(signedData, linkID...)
+	signedData = append(signedData, pubkey...)
+	sig := id.Sign(signedData)
+	if len(sig) != ed25519.SignatureSize {
+		return nil, fmt.Errorf("identity sign returned %d bytes, want %d", len(sig), ed25519.SignatureSize)
+	}
+
+	plaintext := make([]byte, 0, IdentityHashLen+len(sig))
+	plaintext = append(plaintext, id.Hash()...)
+	plaintext = append(plaintext, sig...)
+
+	ciphertext, err := LinkTokenEncrypt(plaintext, signing, encryption)
+	if err != nil {
+		return nil, fmt.Errorf("link encrypt: %w", err)
+	}
+	return &Packet{
+		HeaderType:      HeaderType1,
+		ContextFlag:     false,
+		TransportType:   BroadcastTransport,
+		DestinationType: DestinationLink,
+		PacketType:      PacketData,
+		Hops:            0,
+		DestHash:        linkID,
+		Context:         ContextLinkIdentify,
+		Data:            ciphertext,
+	}, nil
+}
+
 // msgpackMarshalFloat64 packs a single float64 in msgpack format —
 // emits one float64 marker byte (0xCB) followed by big-endian IEEE 754
 // double. Matches upstream `umsgpack.packb(rtt)` output for a Python

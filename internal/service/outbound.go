@@ -14,6 +14,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/thatSFguy/reticulum-forwarding-service/internal/idmap"
 	"github.com/thatSFguy/reticulum-forwarding-service/internal/lxmf"
 	"github.com/thatSFguy/reticulum-forwarding-service/internal/rns"
 )
@@ -57,6 +58,7 @@ type outboundMessage struct {
 	Recipient   []byte         `json:"recipient"`    // 16-byte lxmf.delivery dest_hash
 	Body        []byte         `json:"body"`         // pre-formatted UTF-8 chat body or command reply
 	Fields      map[any]any    `json:"-"`            // LXMF fields (FIELD_IMAGE, etc.); not persisted
+	Bubble      *idmap.Bubble  `json:"-"`            // optional; when set, the queue registers the recipient view in the cache on send success
 	Attempts    int            `json:"attempts"`     // 0..maxDeliveryAttempts
 	NextAttempt time.Time      `json:"next_attempt"` // zero = ready now
 	EnqueuedAt  time.Time      `json:"enqueued_at"`
@@ -64,9 +66,12 @@ type outboundMessage struct {
 
 // outboundSender is the subset of *lxmf.Delivery + *rns.Transport the
 // queue calls into. Defined as an interface so tests can inject a fake
-// without standing up a real transport.
+// without standing up a real transport. SendLXMF returns the recipient-
+// view LXMF message_id (32 bytes) on success — the queue registers it in
+// the idmap cache so cross-client reactions and reply-tos can be
+// rewritten per recipient.
 type outboundSender interface {
-	SendLXMF(recipient, body []byte, fields map[any]any) error
+	SendLXMF(recipient, body []byte, fields map[any]any) (msgID []byte, err error)
 	RequestPath(recipient []byte) error
 	// LastAnnounceFor returns when the recipient most recently
 	// announced (verified inbound), or zero+false if we've never
@@ -92,6 +97,7 @@ type outboundSender interface {
 type OutboundQueue struct {
 	sender outboundSender
 	store  *outboundStore
+	idmap  *idmap.Cache // optional — when set, successful sends register the per-recipient message_id view here for reaction/reply rewriting
 	logger *log.Logger
 
 	mu       sync.Mutex
@@ -125,6 +131,15 @@ func newOutboundQueue(sender outboundSender, store *outboundStore, logger *log.L
 	}
 }
 
+// SetIDMap attaches a Cache so successful per-recipient sends register
+// their message_id view. Optional; nil disables cross-client reaction
+// and reply-to rewriting (the legacy behavior).
+func (q *OutboundQueue) SetIDMap(c *idmap.Cache) {
+	q.mu.Lock()
+	q.idmap = c
+	q.mu.Unlock()
+}
+
 // Load reads any persisted queue state into memory. Call once at
 // startup, before Run.
 func (q *OutboundQueue) Load() error {
@@ -153,11 +168,21 @@ func (q *OutboundQueue) Enqueue(recipient, body []byte) string {
 // persisted to outbound.json — a crash between enqueue and send loses
 // the attachment but keeps the text body. See outboundMessage docs.
 func (q *OutboundQueue) EnqueueWithFields(recipient, body []byte, fields map[any]any) string {
+	return q.EnqueueBubble(recipient, body, fields, nil)
+}
+
+// EnqueueBubble is EnqueueWithFields with an optional bubble that the
+// queue will populate with the recipient's message_id view once Send
+// succeeds. Used by forwardToRoster so cross-client reactions and
+// reply-tos can later be rewritten per recipient. Bubble is in-memory
+// only — not persisted.
+func (q *OutboundQueue) EnqueueBubble(recipient, body []byte, fields map[any]any, bubble *idmap.Bubble) string {
 	msg := &outboundMessage{
 		ID:         newMessageID(),
 		Recipient:  append([]byte(nil), recipient...),
 		Body:       append([]byte(nil), body...),
 		Fields:     fields,
+		Bubble:     bubble,
 		EnqueuedAt: q.now(),
 	}
 	q.mu.Lock()
@@ -285,7 +310,19 @@ func (q *OutboundQueue) attempt(msg *outboundMessage) {
 	attempts := msg.Attempts
 	q.mu.Unlock()
 
-	err := q.sender.SendLXMF(msg.Recipient, msg.Body, msg.Fields)
+	msgID, err := q.sender.SendLXMF(msg.Recipient, msg.Body, msg.Fields)
+
+	if err == nil && msg.Bubble != nil && q.idmap != nil && len(msgID) > 0 {
+		// Register the recipient's view of this bubble's message_id so
+		// inbound reactions/replies referencing it can be looked up and
+		// rewritten on fan-out. Outside the queue mutex — the cache has
+		// its own lock and the registration is a leaf operation.
+		recipientHex := hex.EncodeToString(msg.Recipient)
+		msgIDHex := hex.EncodeToString(msgID)
+		q.idmap.RegisterView(msg.Bubble, recipientHex, msgIDHex)
+		q.logger.Printf("idmap: registered view to=%s msgid=%s (cache size=%d)",
+			recipientHex[:8], msgIDHex[:8], q.idmap.Len())
+	}
 
 	q.mu.Lock()
 	defer q.mu.Unlock()
@@ -367,8 +404,8 @@ type deliverySender struct {
 	transport *rns.Transport
 }
 
-func (d *deliverySender) SendLXMF(recipient, body []byte, fields map[any]any) error {
-	return d.delivery.Send(recipient, nil, body, fields)
+func (d *deliverySender) SendLXMF(recipient, body []byte, fields map[any]any) ([]byte, error) {
+	return d.delivery.SendWithID(recipient, nil, body, fields)
 }
 
 func (d *deliverySender) RequestPath(recipient []byte) error {

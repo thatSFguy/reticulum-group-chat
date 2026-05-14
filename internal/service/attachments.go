@@ -111,6 +111,12 @@ func fieldLabel(key int) string {
 		return "image"
 	case 7:
 		return "audio"
+	case 16:
+		return "reaction"
+	case 48: // 0x30 — MeshChatX reply-to hash
+		return "reply-to"
+	case 49: // 0x31 — MeshChatX reply-to quoted text
+		return "reply text"
 	default:
 		return fmt.Sprintf("field %d", key)
 	}

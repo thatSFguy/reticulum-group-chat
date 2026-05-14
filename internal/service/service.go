@@ -20,6 +20,7 @@ import (
 	"github.com/thatSFguy/reticulum-forwarding-service/internal/commands"
 	"github.com/thatSFguy/reticulum-forwarding-service/internal/config"
 	"github.com/thatSFguy/reticulum-forwarding-service/internal/history"
+	"github.com/thatSFguy/reticulum-forwarding-service/internal/idmap"
 	"github.com/thatSFguy/reticulum-forwarding-service/internal/lxmf"
 	"github.com/thatSFguy/reticulum-forwarding-service/internal/rns"
 	"github.com/thatSFguy/reticulum-forwarding-service/internal/roster"
@@ -48,6 +49,13 @@ type Service struct {
 	history    *history.Log
 	dispatcher *commands.Dispatcher
 	outbound   *OutboundQueue
+
+	// idmap caches per-recipient LXMF message_id views for relayed
+	// bubbles so cross-client reactions (fields[16].reaction_to) and
+	// MeshChatX reply-to (fields[0x30]) can be rewritten per recipient
+	// at fan-out time. Nil if cfg.Service.IDCacheTTL == 0 (the legacy
+	// "reactions don't bind" behavior).
+	idmap *idmap.Cache
 
 	logger *log.Logger
 	now    func() time.Time
@@ -84,6 +92,12 @@ func New(cfg *config.Config) (*Service, error) {
 	}
 
 	transport := rns.NewTransport(stdLoggerAdapter{logger})
+	// Sign LINKIDENTIFY (SPEC §6.6) on every link we initiate, so
+	// responders can cache our destination and route follow-up tap-back
+	// reactions / replies back through us instead of inferring a target
+	// from the LXMF body. Required for cross-client group reactions to
+	// reach the relay rather than going direct-to-original-sender.
+	transport.SetInitiatorIdentity(id)
 	// buildAnnounceWithContext is the same announce body as our periodic
 	// announce, but we let the caller pick the context byte so the
 	// Transport can mint path-response announces (context 0x0B) on
@@ -110,6 +124,12 @@ func New(cfg *config.Config) (*Service, error) {
 		return nil, fmt.Errorf("load outbound queue: %w", err)
 	}
 
+	var idCache *idmap.Cache
+	if ttl := time.Duration(cfg.Service.IDCacheTTL); ttl > 0 {
+		idCache = idmap.New(ttl, cfg.Service.IDCacheMax)
+		outbound.SetIDMap(idCache)
+	}
+
 	svc := &Service{
 		cfg:       cfg,
 		identity:  id,
@@ -118,6 +138,7 @@ func New(cfg *config.Config) (*Service, error) {
 		roster:    r,
 		history:   hist,
 		outbound:  outbound,
+		idmap:     idCache,
 		logger:    logger,
 		now:       time.Now,
 	}

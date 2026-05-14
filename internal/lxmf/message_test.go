@@ -18,7 +18,7 @@ func TestSignParseVerifyRoundTrip(t *testing.T) {
 	senderDest := sender.DestinationHashFor(FullName())
 	recipientDest := recipient.DestinationHashFor(FullName())
 
-	body, err := SignAndPackOpportunistic(
+	body, msgID, err := SignAndPackOpportunistic(
 		sender, senderDest, recipientDest,
 		[]byte(""),
 		[]byte("hello world"),
@@ -26,6 +26,9 @@ func TestSignParseVerifyRoundTrip(t *testing.T) {
 	)
 	if err != nil {
 		t.Fatalf("SignAndPackOpportunistic: %v", err)
+	}
+	if len(msgID) != 32 {
+		t.Errorf("msgID length = %d, want 32", len(msgID))
 	}
 
 	m, err := ParseOpportunisticBody(body, recipientDest)
@@ -51,7 +54,7 @@ func TestVerifyRejectsTamperedContent(t *testing.T) {
 	senderDest := sender.DestinationHashFor(FullName())
 	recipientDest := recipient.DestinationHashFor(FullName())
 
-	body, _ := SignAndPackOpportunistic(sender, senderDest, recipientDest, nil, []byte("hello"), nil)
+	body, _, _ := SignAndPackOpportunistic(sender, senderDest, recipientDest, nil, []byte("hello"), nil)
 	m, _ := ParseOpportunisticBody(body, recipientDest)
 
 	// Tamper directly with the rawPayload bytes (preserved on the message).
@@ -70,7 +73,7 @@ func TestVerifyRejectsForgedDestHash(t *testing.T) {
 	senderDest := sender.DestinationHashFor(FullName())
 	recipientDest := recipient.DestinationHashFor(FullName())
 
-	body, _ := SignAndPackOpportunistic(sender, senderDest, recipientDest, nil, []byte("hello"), nil)
+	body, _, _ := SignAndPackOpportunistic(sender, senderDest, recipientDest, nil, []byte("hello"), nil)
 
 	bogusDest := bytes.Repeat([]byte{0xAA}, rns.IdentityHashLen)
 	m, _ := ParseOpportunisticBody(body, bogusDest)
@@ -89,7 +92,7 @@ func TestVerifyAcceptsStampStrippedVariant(t *testing.T) {
 	recipientDest := recipient.DestinationHashFor(FullName())
 
 	// Step 1: produce a normal 4-element body and capture its msgpack payload.
-	body, _ := SignAndPackOpportunistic(sender, senderDest, recipientDest, nil, []byte("hi"), nil)
+	body, _, _ := SignAndPackOpportunistic(sender, senderDest, recipientDest, nil, []byte("hi"), nil)
 	headerEnd := rns.IdentityHashLen + signatureLen
 	source := body[:rns.IdentityHashLen]
 	sig := body[rns.IdentityHashLen:headerEnd]
@@ -136,7 +139,7 @@ func TestRoundTripPreservesTimestamp(t *testing.T) {
 	recipientDest := recipient.DestinationHashFor(FullName())
 
 	before := time.Now().Truncate(time.Microsecond)
-	body, _ := SignAndPackOpportunistic(sender, senderDest, recipientDest, nil, []byte("hi"), nil)
+	body, _, _ := SignAndPackOpportunistic(sender, senderDest, recipientDest, nil, []byte("hi"), nil)
 	after := time.Now()
 
 	m, _ := ParseOpportunisticBody(body, recipientDest)
@@ -153,7 +156,7 @@ func TestSendRejectsOversizePayload(t *testing.T) {
 
 	// 1 KB content is well over the 295-byte msgpack payload cap.
 	huge := bytes.Repeat([]byte("x"), 1024)
-	_, err := SignAndPackOpportunistic(sender, senderDest, recipientDest, nil, huge, nil)
+	_, _, err := SignAndPackOpportunistic(sender, senderDest, recipientDest, nil, huge, nil)
 	if err == nil {
 		t.Fatal("expected error for oversize payload")
 	}

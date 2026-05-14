@@ -42,6 +42,17 @@ const (
 const (
 	ContextNone         = 0x00
 	ContextPathResponse = 0x0B
+	// ContextLinkIdentify (SPEC §6.6) is the link-DATA context byte for
+	// LINKIDENTIFY — an initiator-emitted, link-encrypted packet that
+	// proves which identity (and therefore which destination) the link
+	// is being driven from. Plaintext is identity_hash(16) ||
+	// signature(64), where the signature covers link_id || full
+	// public_key. Lets a responder route asynchronous follow-up traffic
+	// (e.g. tap-back reactions on a relayed bubble) back through the
+	// same destination the link originated from — critical for
+	// forwarding-relay group chats where the LXMF source_hash on
+	// link-delivered bubbles is the relay, not the human originator.
+	ContextLinkIdentify = 0xFB
 	ContextLRProof      = 0xFF
 )
 

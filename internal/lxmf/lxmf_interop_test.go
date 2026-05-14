@@ -82,7 +82,7 @@ func TestLXMFVectorsBytewiseInterop(t *testing.T) {
 				return
 			}
 			ts := time.Unix(int64(v.Inputs.LXMFTimestamp), 0)
-			gotBuilt, err := signAndPackOpportunisticAt(alice, aliceDest, bobDest,
+			gotBuilt, _, err := signAndPackOpportunisticAt(alice, aliceDest, bobDest,
 				[]byte(v.Inputs.TitleUTF8), []byte(v.Inputs.ContentUTF8), nil, ts)
 			if err != nil {
 				t.Fatalf("signAndPackOpportunisticAt: %v", err)

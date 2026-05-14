@@ -141,10 +141,45 @@ func TestFilterAttachmentsCoercesIntegerKeyTypes(t *testing.T) {
 }
 
 func TestFieldLabelKnownNumbers(t *testing.T) {
-	cases := map[int]string{5: "file", 6: "image", 7: "audio", 42: "field 42"}
+	cases := map[int]string{
+		5:  "file",
+		6:  "image",
+		7:  "audio",
+		16: "reaction",
+		48: "reply-to",   // 0x30 — MeshChatX reply-to hash
+		49: "reply text", // 0x31 — MeshChatX reply-to quoted text
+		42: "field 42",
+	}
 	for k, want := range cases {
 		if got := fieldLabel(k); got != want {
 			t.Errorf("fieldLabel(%d) = %q, want %q", k, got, want)
+		}
+	}
+}
+
+func TestFilterAttachmentsPassesReactionAndReplyFields(t *testing.T) {
+	// Issue #8: tap-back reactions ride on fields[16]; MeshChatX reply-
+	// to rides on fields[48] / fields[49]. The default allowlist must
+	// pass all three through unchanged.
+	cfg := defaultAttachmentCfg()
+	cfg.ForwardedFields = []int{6, 16, 48, 49}
+
+	in := map[any]any{
+		16: map[any]any{
+			"reaction_to": "deadbeef",
+			"emoji":       "👍",
+			"sender":      "cafef00d",
+		},
+		48: bytes.Repeat([]byte{0xAA}, 32),
+		49: []byte("> original message"),
+	}
+	out, drops := filterAttachments(in, cfg)
+	if len(drops) != 0 {
+		t.Errorf("unexpected drops for reaction/reply fields: %v", drops)
+	}
+	for _, k := range []int{16, 48, 49} {
+		if _, ok := out[k]; !ok {
+			t.Errorf("field %d missing from out: %v", k, out)
 		}
 	}
 }
