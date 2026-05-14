@@ -25,6 +25,7 @@ type fakeSender struct {
 	sendErrs       []error // pop from front per Send call
 	sendCalls      [][]byte
 	sendRecipients [][]byte
+	sendFields     []map[any]any
 	sendDelay      time.Duration // sleep inside SendLXMF, for parallelism tests
 	pathErr        error
 	pathRequests   int32
@@ -35,10 +36,11 @@ type fakeSender struct {
 	recency map[byte]time.Time
 }
 
-func (f *fakeSender) SendLXMF(recipient, body []byte) error {
+func (f *fakeSender) SendLXMF(recipient, body []byte, fields map[any]any) error {
 	f.mu.Lock()
 	f.sendCalls = append(f.sendCalls, append([]byte(nil), body...))
 	f.sendRecipients = append(f.sendRecipients, append([]byte(nil), recipient...))
+	f.sendFields = append(f.sendFields, fields)
 	delay := f.sendDelay
 	var err error
 	if len(f.sendErrs) > 0 {

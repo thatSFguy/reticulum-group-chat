@@ -6,7 +6,7 @@ package version
 
 // Version is bumped per release. cmd/fwdsvc/main.go's --version flag
 // and the /about command both read it from here.
-const Version = "1.3.6"
+const Version = "1.4.0"
 
 // RepoURL is the canonical source location. Surfaced in /about so users
 // running an unfamiliar deployment can find the project, file issues,

@@ -469,6 +469,72 @@ func TestResumeWithoutPause(t *testing.T) {
 	}
 }
 
+func TestTextOnlySetsFlag(t *testing.T) {
+	d := newDispatcher(t)
+	_, _ = d.Roster.AddOrUpdate(mustBytes(t, userHash), time.Now())
+
+	out := d.Dispatch(userHash, Parse("/textonly"))
+	if !strings.Contains(strings.ToLower(out), "text-only") {
+		t.Errorf("expected textonly ack, got %q", out)
+	}
+	if !d.Roster.IsTextOnly(userHash) {
+		t.Error("user should be marked text-only")
+	}
+}
+
+func TestTextOnlyTwiceIsIdempotent(t *testing.T) {
+	d := newDispatcher(t)
+	_, _ = d.Roster.AddOrUpdate(mustBytes(t, userHash), time.Now())
+
+	_ = d.Dispatch(userHash, Parse("/textonly"))
+	out := d.Dispatch(userHash, Parse("/textonly"))
+	if !strings.Contains(strings.ToLower(out), "already") {
+		t.Errorf("expected already-on ack, got %q", out)
+	}
+}
+
+func TestTextOnlyRequiresMembership(t *testing.T) {
+	d := newDispatcher(t)
+	out := d.Dispatch(userHash, Parse("/textonly"))
+	if !strings.Contains(strings.ToLower(out), "not in the chat") {
+		t.Errorf("expected non-member denial, got %q", out)
+	}
+}
+
+func TestShowAllClearsFlag(t *testing.T) {
+	d := newDispatcher(t)
+	_, _ = d.Roster.AddOrUpdate(mustBytes(t, userHash), time.Now())
+	_ = d.Roster.SetTextOnly(userHash, true)
+
+	out := d.Dispatch(userHash, Parse("/showall"))
+	if !strings.Contains(strings.ToLower(out), "showing all") {
+		t.Errorf("expected showall ack, got %q", out)
+	}
+	if d.Roster.IsTextOnly(userHash) {
+		t.Error("user should no longer be text-only")
+	}
+}
+
+func TestShowAllWithoutTextOnly(t *testing.T) {
+	d := newDispatcher(t)
+	_, _ = d.Roster.AddOrUpdate(mustBytes(t, userHash), time.Now())
+	out := d.Dispatch(userHash, Parse("/showall"))
+	if !strings.Contains(strings.ToLower(out), "already") {
+		t.Errorf("expected already-receiving message, got %q", out)
+	}
+}
+
+func TestMemberHelpIncludesTextOnlyCommands(t *testing.T) {
+	d := newDispatcher(t)
+	_, _ = d.Roster.AddOrUpdate(mustBytes(t, userHash), time.Now())
+	out := d.Dispatch(userHash, Parse("/?"))
+	for _, want := range []string{"/textonly", "/showall"} {
+		if !strings.Contains(out, want) {
+			t.Errorf("member help missing %q\n%s", want, out)
+		}
+	}
+}
+
 func TestKickRequiresMod(t *testing.T) {
 	d := newDispatcher(t)
 	now := time.Now()

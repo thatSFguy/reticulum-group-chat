@@ -46,20 +46,27 @@ const (
 // (success → removed from queue) or Attempts > maxDeliveryAttempts
 // (terminal fail_message). Persisted as-is to outbound.json so a service
 // restart resumes pending sends instead of dropping them.
+//
+// Fields is in-memory only (json:"-") — attachment payloads aren't
+// persisted across restart. A crash between Enqueue and Send loses the
+// attachment but keeps the text body; the sender can always resend.
+// Keeps the on-disk format JSON-friendly without a custom marshaller for
+// the msgpack-typed values inside Fields.
 type outboundMessage struct {
-	ID          string    `json:"id"`
-	Recipient   []byte    `json:"recipient"`    // 16-byte lxmf.delivery dest_hash
-	Body        []byte    `json:"body"`         // pre-formatted UTF-8 chat body or command reply
-	Attempts    int       `json:"attempts"`     // 0..maxDeliveryAttempts
-	NextAttempt time.Time `json:"next_attempt"` // zero = ready now
-	EnqueuedAt  time.Time `json:"enqueued_at"`
+	ID          string         `json:"id"`
+	Recipient   []byte         `json:"recipient"`    // 16-byte lxmf.delivery dest_hash
+	Body        []byte         `json:"body"`         // pre-formatted UTF-8 chat body or command reply
+	Fields      map[any]any    `json:"-"`            // LXMF fields (FIELD_IMAGE, etc.); not persisted
+	Attempts    int            `json:"attempts"`     // 0..maxDeliveryAttempts
+	NextAttempt time.Time      `json:"next_attempt"` // zero = ready now
+	EnqueuedAt  time.Time      `json:"enqueued_at"`
 }
 
 // outboundSender is the subset of *lxmf.Delivery + *rns.Transport the
 // queue calls into. Defined as an interface so tests can inject a fake
 // without standing up a real transport.
 type outboundSender interface {
-	SendLXMF(recipient, body []byte) error
+	SendLXMF(recipient, body []byte, fields map[any]any) error
 	RequestPath(recipient []byte) error
 	// LastAnnounceFor returns when the recipient most recently
 	// announced (verified inbound), or zero+false if we've never
@@ -138,10 +145,19 @@ func (q *OutboundQueue) Load() error {
 // crash between enqueue and the next drain tick doesn't lose the
 // message. Returns the message ID for telemetry.
 func (q *OutboundQueue) Enqueue(recipient, body []byte) string {
+	return q.EnqueueWithFields(recipient, body, nil)
+}
+
+// EnqueueWithFields is Enqueue with an attached LXMF fields map (e.g.
+// FIELD_IMAGE = 6). Fields are passed straight to Delivery.Send and not
+// persisted to outbound.json — a crash between enqueue and send loses
+// the attachment but keeps the text body. See outboundMessage docs.
+func (q *OutboundQueue) EnqueueWithFields(recipient, body []byte, fields map[any]any) string {
 	msg := &outboundMessage{
 		ID:         newMessageID(),
 		Recipient:  append([]byte(nil), recipient...),
 		Body:       append([]byte(nil), body...),
+		Fields:     fields,
 		EnqueuedAt: q.now(),
 	}
 	q.mu.Lock()
@@ -269,7 +285,7 @@ func (q *OutboundQueue) attempt(msg *outboundMessage) {
 	attempts := msg.Attempts
 	q.mu.Unlock()
 
-	err := q.sender.SendLXMF(msg.Recipient, msg.Body)
+	err := q.sender.SendLXMF(msg.Recipient, msg.Body, msg.Fields)
 
 	q.mu.Lock()
 	defer q.mu.Unlock()
@@ -351,8 +367,8 @@ type deliverySender struct {
 	transport *rns.Transport
 }
 
-func (d *deliverySender) SendLXMF(recipient, body []byte) error {
-	return d.delivery.Send(recipient, nil, body, nil)
+func (d *deliverySender) SendLXMF(recipient, body []byte, fields map[any]any) error {
+	return d.delivery.Send(recipient, nil, body, fields)
 }
 
 func (d *deliverySender) RequestPath(recipient []byte) error {

@@ -70,6 +70,29 @@ type ServiceConfig struct {
 	// would-be joiner is not added. Existing members and paused members
 	// both count toward the limit. 0 = unlimited (default).
 	MaxMembers int `toml:"max_members"`
+
+	// ForwardAttachments controls whether non-text LXMF fields
+	// (FIELD_IMAGE = 6, FIELD_FILE_ATTACHMENTS = 5, FIELD_AUDIO = 7, …)
+	// are passed through to roster recipients alongside the text body.
+	// When false, every inbound non-empty fields map is dropped silently
+	// and only the text body is forwarded. Default true.
+	ForwardAttachments bool `toml:"forward_attachments"`
+
+	// MaxAttachmentBytes caps the msgpack-encoded size of any single
+	// allowed field value. Oversized fields are dropped (text body still
+	// forwards, with a "[image not forwarded: NNN B > LIMIT B]" suffix);
+	// the whole message is not lost. 0 disables the cap (not
+	// recommended on LoRa). Default 32768 — matches Sideband's typical
+	// 20–30 KB output and the mobile app's defensive inbound cap.
+	MaxAttachmentBytes int `toml:"max_attachment_bytes"`
+
+	// ForwardedFields is the allowlist of LXMF field keys that pass
+	// through forwarding. Anything not in this list is dropped even when
+	// ForwardAttachments=true — defense against a misbehaving client
+	// stuffing weird keys, and an operator opt-in for new field types
+	// (FIELD_FILE_ATTACHMENTS = 5, FIELD_AUDIO = 7, etc.) once those
+	// clients shake out. Default [6] (FIELD_IMAGE only).
+	ForwardedFields []int `toml:"forwarded_fields"`
 }
 
 // InterfaceConfig declares a single Reticulum I/O interface. Currently
@@ -140,8 +163,11 @@ func defaults() *Config {
 			HistoryPath:      "~/.fwdsvc/history.json",
 			PruneAfter:       Duration(4 * 7 * 24 * time.Hour),
 			PruneInterval:    Duration(1 * time.Hour),
-			AnnounceInterval: Duration(10 * time.Minute),
-			MaxInboundChars:  500,
+			AnnounceInterval:   Duration(10 * time.Minute),
+			MaxInboundChars:    500,
+			ForwardAttachments: true,
+			MaxAttachmentBytes: 32768,
+			ForwardedFields:    []int{6},
 		},
 		Replay: ReplayConfig{
 			Count:  100,
@@ -181,6 +207,14 @@ func (c *Config) normalize() error {
 	}
 	if c.Service.MaxMembers < 0 {
 		return fmt.Errorf("service.max_members must be >= 0")
+	}
+	if c.Service.MaxAttachmentBytes < 0 {
+		return fmt.Errorf("service.max_attachment_bytes must be >= 0")
+	}
+	for i, k := range c.Service.ForwardedFields {
+		if k < 0 {
+			return fmt.Errorf("service.forwarded_fields[%d]: field key must be >= 0", i)
+		}
 	}
 	if s := strings.TrimSpace(c.Service.IdentityB64); s != "" {
 		raw, err := base64.StdEncoding.DecodeString(s)

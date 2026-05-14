@@ -159,6 +159,35 @@ func TestIdentityB64EmptyIsAllowed(t *testing.T) {
 	}
 }
 
+func TestAttachmentConfigDefaults(t *testing.T) {
+	c := defaults()
+	if !c.Service.ForwardAttachments {
+		t.Error("ForwardAttachments default should be true")
+	}
+	if c.Service.MaxAttachmentBytes != 32768 {
+		t.Errorf("MaxAttachmentBytes default = %d, want 32768", c.Service.MaxAttachmentBytes)
+	}
+	if len(c.Service.ForwardedFields) != 1 || c.Service.ForwardedFields[0] != 6 {
+		t.Errorf("ForwardedFields default = %v, want [6]", c.Service.ForwardedFields)
+	}
+}
+
+func TestNormalizeRejectsNegativeAttachmentBytes(t *testing.T) {
+	cfg := &Config{Service: validServiceConfig()}
+	cfg.Service.MaxAttachmentBytes = -1
+	if err := cfg.normalize(); err == nil {
+		t.Fatal("expected normalize to reject negative max_attachment_bytes")
+	}
+}
+
+func TestNormalizeRejectsNegativeForwardedFieldKey(t *testing.T) {
+	cfg := &Config{Service: validServiceConfig()}
+	cfg.Service.ForwardedFields = []int{6, -1}
+	if err := cfg.normalize(); err == nil {
+		t.Fatal("expected normalize to reject negative forwarded_fields entry")
+	}
+}
+
 func TestExpandPath(t *testing.T) {
 	out, err := ExpandPath("~/x")
 	if err != nil {

@@ -269,6 +269,8 @@ everything.
 | `/leave`                  | members     | Leave the chat (you can `/join` again later) |
 | `/pause`                  | members     | Stop receiving forwards (and stop forwarding yours) |
 | `/resume`                 | members     | Reverse `/pause` |
+| `/textonly`               | members     | Skip attachments — receive only the text body of forwarded messages. Intended for users on slow / metered links. |
+| `/showall`                | members     | Reverse `/textonly` — resume receiving attachments. |
 | `/nick <newname>`         | members     | Change own nickname (1–24 chars from `[A-Za-z0-9_-]`) |
 
 ### Mod / admin commands
@@ -338,6 +340,9 @@ Both lists MUST be declared at the top of the file, before any
 | `announce_interval`  | duration | `"10m"`                     | How often we re-announce ourselves. |
 | `max_inbound_chars`  | int      | `500`                       | Reject non-command messages longer than this many UTF-8 chars. `0` disables. |
 | `max_members`        | int      | `0`                         | Cap on roster size. `/join` past the cap is refused. `0` = unlimited. |
+| `forward_attachments`| bool     | `true`                      | Pass LXMF non-text fields (images, etc.) through forwarding. `false` drops all attachments silently. |
+| `max_attachment_bytes`| int     | `32768`                     | Per-field msgpack size cap. Oversize attachments are dropped with an inline `[image not forwarded: …]` note; text body still delivers. `0` disables the cap. |
+| `forwarded_fields`   | int list | `[6]`                       | Allowlist of LXMF field keys to forward when `forward_attachments=true`. Default is `[6]` (`FIELD_IMAGE`); add `5` for files, `7` for audio once your senders/receivers handle them. |
 
 Durations are Go `time.ParseDuration` plus `d` (days) and `w`
 (weeks): `"30s"`, `"5m"`, `"24h"`, `"7d"`, `"4w"`.

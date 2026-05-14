@@ -87,17 +87,27 @@ func (s *Service) onLXMFReceived(msg *lxmf.Message) {
 	// Strip C0 controls + DEL from the forwarded copy so a sender can't
 	// inject ANSI escape sequences (cursor moves, line clears, color
 	// resets) that would mess up receivers' terminals or impersonate
-	// other senders' output.
+	// other senders' output. Applied to the text body only — field
+	// values (image bytes, …) pass through raw.
 	content = sanitizeForward(content)
 
 	body := "[" + senderNick + "] " + content
+
+	// Apply the operator's attachment policy. Disallowed keys drop
+	// silently; oversized values drop with a "[image not forwarded: …]"
+	// suffix appended to the body so recipients know the sender tried.
+	fwdFields, drops := filterAttachments(msg.Fields, s.cfg.Service)
+	for _, note := range drops {
+		body += " " + note
+		s.logger.Printf("attachment dropped: from=%s %s", senderHex[:8], note)
+	}
 
 	// Delivery.Send routes opportunistic vs link automatically based on
 	// payload size, so we no longer need a pre-flight size check or the
 	// "message too large" reply path. The MaxInboundChars policy cap
 	// above (s.cfg.Service.MaxInboundChars) is the only ceiling on
 	// content length that's still enforced here.
-	delivered := s.forwardToRoster(senderHex, body)
+	delivered := s.forwardToRoster(senderHex, body, fwdFields)
 
 	if delivered > 0 {
 		_ = s.history.Append(history.Entry{

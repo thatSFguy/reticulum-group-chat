@@ -20,6 +20,14 @@ type User struct {
 	// messages, and rejects their non-command messages with a "you're
 	// paused" reply rather than forwarding. Toggled via /pause /resume.
 	Paused bool `json:"paused,omitempty"`
+
+	// TextOnly: when true, the forwarder strips LXMF non-text fields
+	// (FIELD_IMAGE, etc.) before delivering to this user — they still
+	// receive the text body of every group message but no image/audio/
+	// file attachments. For roster members on low-bandwidth links (LoRa,
+	// metered cellular) who want to stay in the conversation without
+	// paying for every photo. Toggled via /textonly and /showall.
+	TextOnly bool `json:"text_only,omitempty"`
 }
 
 func (u User) LastSeen() time.Time {
@@ -170,6 +178,28 @@ func (r *Roster) IsPaused(hashHex string) bool {
 	defer r.mu.Unlock()
 	u, ok := r.users[strings.ToLower(hashHex)]
 	return ok && u.Paused
+}
+
+// SetTextOnly toggles the user's text-only flag. Returns an error if the
+// user isn't in the roster. See User.TextOnly for the policy semantics.
+func (r *Roster) SetTextOnly(hashHex string, textOnly bool) error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	u, ok := r.users[strings.ToLower(hashHex)]
+	if !ok {
+		return fmt.Errorf("user not in roster")
+	}
+	u.TextOnly = textOnly
+	return r.persistLocked()
+}
+
+// IsTextOnly returns true iff the user is in the roster and has opted
+// into text-only delivery.
+func (r *Roster) IsTextOnly(hashHex string) bool {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	u, ok := r.users[strings.ToLower(hashHex)]
+	return ok && u.TextOnly
 }
 
 // ActiveHashes returns the hex hashes of all roster members whose Paused

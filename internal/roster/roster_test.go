@@ -151,6 +151,51 @@ func TestResolveByNickAndPrefix(t *testing.T) {
 	}
 }
 
+func TestSetTextOnlyPersists(t *testing.T) {
+	dir := t.TempDir()
+	storePath := filepath.Join(dir, "state.json")
+
+	{
+		store := NewStore(storePath)
+		r, err := New(store)
+		if err != nil {
+			t.Fatal(err)
+		}
+		_, _ = r.AddOrUpdate(mustHash(t, hashA), time.Now())
+		if err := r.SetTextOnly(hashA, true); err != nil {
+			t.Fatalf("SetTextOnly: %v", err)
+		}
+	}
+
+	store := NewStore(storePath)
+	r, err := New(store)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !r.IsTextOnly(hashA) {
+		t.Error("TextOnly flag should persist across reload")
+	}
+	// Clearing must also persist.
+	if err := r.SetTextOnly(hashA, false); err != nil {
+		t.Fatal(err)
+	}
+
+	r2, err := New(NewStore(storePath))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if r2.IsTextOnly(hashA) {
+		t.Error("cleared TextOnly flag should persist across reload")
+	}
+}
+
+func TestSetTextOnlyRejectsNonMember(t *testing.T) {
+	r, _ := newTestRoster(t)
+	if err := r.SetTextOnly(hashA, true); err == nil {
+		t.Error("SetTextOnly on non-member should return an error")
+	}
+}
+
 func TestPersistRoundTrip(t *testing.T) {
 	dir := t.TempDir()
 	storePath := filepath.Join(dir, "state.json")

@@ -27,13 +27,15 @@ func (r Role) atLeastMod() bool { return r == RoleMod || r == RoleAdmin }
 // Caller bundles everything a command handler needs to know about the
 // sender: their hash (hex + bytes), their role from the config (user /
 // mod / admin), whether they're currently in the roster (Member),
-// and whether they're paused. Derived once per inbound command.
+// whether they're paused, and whether they're on text-only delivery.
+// Derived once per inbound command.
 type Caller struct {
 	Hash      string // lowercase hex
 	HashBytes []byte
 	Role      Role
 	Member    bool
 	Paused    bool
+	TextOnly  bool
 }
 
 // PathInfo is the routing snapshot returned by Dispatcher.PathLookup.
@@ -119,6 +121,10 @@ func (d *Dispatcher) Dispatch(senderHash string, parsed Parsed) string {
 		return d.handlePause(caller)
 	case "resume":
 		return d.handleResume(caller)
+	case "textonly":
+		return d.handleTextOnly(caller)
+	case "showall":
+		return d.handleShowAll(caller)
 	case "nick":
 		return d.handleNick(caller, parsed.Args)
 	case "kick":
@@ -159,6 +165,7 @@ func (d *Dispatcher) deriveCaller(senderHash string) *Caller {
 	if c.Member {
 		if u, ok := d.Roster.Get(sh); ok {
 			c.Paused = u.Paused
+			c.TextOnly = u.TextOnly
 		}
 	}
 	return c
@@ -180,7 +187,7 @@ func aboutText() string {
 func helpText(c *Caller) string {
 	var b strings.Builder
 	b.WriteString("Commands:\n")
-	b.WriteString("/?, /help - this list\n")
+	b.WriteString("/?, /help\n")
 	b.WriteString("/about - version + repo\n")
 	b.WriteString("/users /mods /admin - lists\n")
 
@@ -189,8 +196,8 @@ func helpText(c *Caller) string {
 	} else {
 		b.WriteString("/nick NAME - rename self\n")
 		b.WriteString("/leave - leave the chat\n")
-		b.WriteString("/pause - mute (don't receive)\n")
-		b.WriteString("/resume - unmute\n")
+		b.WriteString("/pause /resume - mute/unmute\n")
+		b.WriteString("/textonly /showall - skip media\n")
 	}
 
 	if c.Role.atLeastMod() {
@@ -378,6 +385,39 @@ func (d *Dispatcher) handleResume(c *Caller) string {
 		return "Couldn't resume: " + err.Error()
 	}
 	return "Resumed. You'll receive forwarded messages again."
+}
+
+// handleTextOnly puts the caller into text-only delivery mode: future
+// forwards strip image/file/audio fields but keep the chat text body.
+// Intended for users on slow or metered links who want to stay in the
+// conversation without paying for every attachment. Reversed by
+// /showall.
+func (d *Dispatcher) handleTextOnly(c *Caller) string {
+	if !c.Member {
+		return "You're not in the chat. Send /join first."
+	}
+	if c.TextOnly {
+		return "You're already on text-only. Send /showall to start receiving attachments again."
+	}
+	if err := d.Roster.SetTextOnly(c.Hash, true); err != nil {
+		return "Couldn't switch to text-only: " + err.Error()
+	}
+	return "Text-only mode on. You'll get the chat text but no image/file attachments. Send /showall to switch back."
+}
+
+// handleShowAll reverses /textonly — caller resumes receiving every
+// allowed field type along with the chat body.
+func (d *Dispatcher) handleShowAll(c *Caller) string {
+	if !c.Member {
+		return "You're not in the chat. Send /join first."
+	}
+	if !c.TextOnly {
+		return "You're already receiving everything."
+	}
+	if err := d.Roster.SetTextOnly(c.Hash, false); err != nil {
+		return "Couldn't switch back: " + err.Error()
+	}
+	return "Showing all. You'll receive image and other attachments again."
 }
 
 var nickRE = regexp.MustCompile(`^[A-Za-z0-9_-]{1,24}$`)
