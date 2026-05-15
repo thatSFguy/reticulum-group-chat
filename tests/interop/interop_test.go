@@ -256,7 +256,7 @@ func TestInteropLXMFGoToPython(t *testing.T) {
 
 	// Build + Token-encrypt in Go.
 	bobDest := bob.DestinationHashFor(lxmf.FullName())
-	body, err := lxmf.SignAndPackOpportunistic(
+	body, _, err := lxmf.SignAndPackOpportunistic(
 		alice,
 		alice.DestinationHashFor(lxmf.FullName()),
 		bobDest,
