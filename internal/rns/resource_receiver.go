@@ -83,7 +83,15 @@ type ResourceReceiver struct {
 	state atomic.Int32
 	done  chan struct{}
 
-	mu sync.Mutex // guards parts / receivedFlags / receivedCount
+	// pendingTarget is the receivedCount value at which the current
+	// outstanding REQ window is fully satisfied. The receive loop only
+	// issues the NEXT window once receivedCount reaches it — without
+	// this, a fresh 10-part REQ would fire after every single placed
+	// part, amplifying sender traffic ~6x and congesting the path
+	// (the bug that stalled inbound image transfers at ~18/30 parts).
+	pendingTarget int
+
+	mu sync.Mutex // guards parts / receivedFlags / receivedCount / pendingTarget
 
 	// OnAssembled is called from the receiver goroutine with the
 	// fully-assembled, decrypted, prefix-stripped body. Wired by the
@@ -214,45 +222,62 @@ func (rr *ResourceReceiver) Run(ctx context.Context) error {
 		return err
 	}
 
-	const partTimeout = 12 * time.Second
-	timer := time.NewTimer(partTimeout)
+	// lossRecoveryInterval bounds how long the loop waits with no part
+	// arriving before re-requesting the gaps. Normal completion is
+	// driven by windowComplete (re-REQ fires the instant a window
+	// drains); this timer only covers parts lost in flight. Kept short
+	// — the old 12s value let stragglers sit long enough that a lossy
+	// multi-hop path never recovered within the receiver's lifetime.
+	const lossRecoveryInterval = 4 * time.Second
+	timer := time.NewTimer(lossRecoveryInterval)
 	defer timer.Stop()
 
 	for rr.receivedCount < len(rr.parts) {
 		select {
 		case <-ctx.Done():
+			rr.logger.Printf("resource receiver: timed out link=%x resource=%s — %d/%d parts received",
+				rr.link.ID[:4], ResourceHashShortHex(rr.resourceHash), rr.receivedCount, len(rr.parts))
 			rr.state.Store(int32(ResourceStateFailed))
 			return ctx.Err()
 
 		case <-rr.cancelCh:
+			rr.logger.Printf("resource receiver: cancelled link=%x resource=%s — %d/%d parts received",
+				rr.link.ID[:4], ResourceHashShortHex(rr.resourceHash), rr.receivedCount, len(rr.parts))
 			rr.state.Store(int32(ResourceStateCancelled))
 			return ErrResourceCancelled
 
 		case <-timer.C:
-			// No parts arrived in the timeout window — re-request the
-			// gaps. If we've used up MaxRetries worth of timeouts,
-			// give up. (Very simple watchdog; stage 5 can add adaptive
-			// RTT-based timing.)
+			// No parts arrived recently — re-request the outstanding
+			// gaps. The receiver's overall lifetime is bounded by the
+			// caller's context, so this loops until ctx fires.
 			if err := rr.requestNextWindow(); err != nil {
 				rr.logger.Printf("resource receiver: re-REQ: %v", err)
 			}
-			timer.Reset(partTimeout)
+			timer.Reset(lossRecoveryInterval)
 
 		case part := <-rr.partCh:
-			if err := rr.placePart(part); err != nil {
+			switch err := rr.placePart(part); {
+			case err == nil:
+				// progress
+			case errors.Is(err, errResourceDuplicatePart):
+				// A retransmit of an already-placed part — normal on a
+				// lossy link, not worth logging or resetting timers for.
+				continue
+			default:
 				rr.logger.Printf("resource receiver: place part: %v", err)
 				continue
 			}
-			// Whenever a part arrives, push the timer out — progress.
+			// A real part landed — push the loss-recovery timer out.
 			if !timer.Stop() {
 				select {
 				case <-timer.C:
 				default:
 				}
 			}
-			timer.Reset(partTimeout)
+			timer.Reset(lossRecoveryInterval)
 
-			// If we just filled a window's worth, request the next.
+			// Request the next window only once the outstanding one has
+			// fully drained — NOT after every part (see pendingTarget).
 			if rr.windowComplete() && rr.receivedCount < len(rr.parts) {
 				if err := rr.requestNextWindow(); err != nil {
 					rr.logger.Printf("resource receiver: window REQ: %v", err)
@@ -305,40 +330,60 @@ func (rr *ResourceReceiver) Run(ctx context.Context) error {
 	return nil
 }
 
-// placePart locates the part's hashmap slot via map_hash, drops it
-// in. Idempotent on duplicate parts (they just no-op).
+// errResourceDuplicatePart marks a part whose map_hash matches an
+// already-filled slot — a routine retransmit on a lossy link, not an
+// error worth logging. placePart returns it so the receive loop can
+// drop the part quietly while still surfacing genuinely unknown parts
+// (a map_hash matching no slot at all).
+var errResourceDuplicatePart = errors.New("resource receiver: duplicate part (retransmit)")
+
+// placePart locates the part's hashmap slot via map_hash and drops it
+// in. Returns nil when the part filled a new slot, errResourceDuplicatePart
+// when it matched an already-received slot, or a plain error when its
+// map_hash matches no slot in the hashmap.
 func (rr *ResourceReceiver) placePart(part []byte) error {
 	mh := ResourceMapHash(part, rr.randomR)
 	rr.mu.Lock()
 	defer rr.mu.Unlock()
+	dup := false
 	for i := 0; i < len(rr.parts); i++ {
-		if rr.receivedFlags[i] {
+		off := i * ResourceMapHashLen
+		if !bytesEqual(rr.hashmap[off:off+ResourceMapHashLen], mh) {
 			continue
 		}
-		off := i * ResourceMapHashLen
-		if bytesEqual(rr.hashmap[off:off+ResourceMapHashLen], mh) {
-			rr.parts[i] = part
-			rr.receivedFlags[i] = true
-			rr.receivedCount++
-			return nil
+		if rr.receivedFlags[i] {
+			// map_hash matches a slot we already filled. Keep scanning
+			// in case an unreceived slot shares this map_hash (only
+			// possible outside the sender's collision-guard window),
+			// but remember we saw a duplicate.
+			dup = true
+			continue
 		}
+		rr.parts[i] = part
+		rr.receivedFlags[i] = true
+		rr.receivedCount++
+		return nil
 	}
-	// Either a duplicate (already-received slot) or a part with a
-	// map_hash we don't know about (sender bug or malicious peer).
-	// Either way, drop quietly — the legitimate parts will fill the
-	// remaining slots eventually.
-	return errors.New("part map_hash not in remaining hashmap (duplicate or unknown)")
+	if dup {
+		return errResourceDuplicatePart
+	}
+	// A map_hash matching no slot — sender bug, or a part leaking in
+	// from a different resource on the same link.
+	return errors.New("part map_hash not in hashmap (unknown)")
 }
 
-// windowComplete returns true when no parts remain outstanding from
-// the most recent REQ window — i.e. the next REQ should be issued.
+// windowComplete reports whether the parts requested in the most
+// recent REQ window have all arrived — i.e. it is time to request the
+// next window. requestNextWindow records pendingTarget as the
+// receivedCount value that marks the window satisfied; until then we
+// keep collecting parts without issuing redundant REQs. (The previous
+// implementation returned true after any single part, which made the
+// receive loop fire a fresh window-sized REQ per part — a request
+// storm that congested multi-hop paths and stalled large transfers.)
 func (rr *ResourceReceiver) windowComplete() bool {
-	// Trivial heuristic: if we have any unreceived part, we have an
-	// outstanding window slot. The receiver issues a REQ whenever a
-	// gap exists. Stage 5 can add proper window tracking.
 	rr.mu.Lock()
 	defer rr.mu.Unlock()
-	return rr.receivedCount > 0 // any progress → consider window done
+	return rr.receivedCount >= rr.pendingTarget
 }
 
 // applyHmu validates an inbound RESOURCE_HMU against the receiver's
@@ -413,6 +458,11 @@ func (rr *ResourceReceiver) requestNextWindow() error {
 		off := (scanLimit - 1) * ResourceMapHashLen
 		lastMapHash = append([]byte(nil), rr.hashmap[off:off+ResourceMapHashLen]...)
 	}
+	// Mark when this outstanding window will be satisfied: once
+	// receivedCount climbs by len(requested), windowComplete fires and
+	// the receive loop asks for the next window. Set under the lock so
+	// it stays consistent with the receivedCount snapshot above.
+	rr.pendingTarget = rr.receivedCount + len(requested)
 	rr.mu.Unlock()
 	if len(requested) == 0 && !exhausted {
 		return nil
