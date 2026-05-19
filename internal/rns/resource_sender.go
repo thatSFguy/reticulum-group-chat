@@ -131,7 +131,7 @@ func NewResourceSender(t *Transport, link *Link, body []byte, transportID []byte
 		return nil, errors.New("resource sender: zero parts after split (impossible — body validated non-empty)")
 	}
 	if len(parts) > MaxAcceptedResourceParts {
-		return nil, fmt.Errorf("resource sender: %d parts exceeds single-segment cap %d (multi-segment not yet implemented)",
+		return nil, fmt.Errorf("resource sender: %d parts exceeds single-segment cap %d (body too large to forward — multi-segment not implemented)",
 			len(parts), MaxAcceptedResourceParts)
 	}
 
@@ -359,11 +359,16 @@ func (rs *ResourceSender) Run(ctx context.Context) error {
 				rs.state.Store(int32(ResourceStateTransferring))
 			}
 			if req.Exhausted {
-				// HMU path — Stage 5 will handle. For now (single-hashmap
-				// only) we ignore exhausted requests; a well-behaved
-				// receiver won't send one for a single-segment ADV.
-				rs.logger.Printf("resource sender: HMU requested for %s but multi-hashmap not implemented — ignoring",
-					ResourceHashShortHex(rs.resourceHash))
+				// The receiver has consumed every map_hash it knows and
+				// needs the next hashmap segment — answer with a
+				// RESOURCE_HMU (SPEC §10.7). A sequencing error here is
+				// unrecoverable, so it fails the transfer.
+				if err := rs.serveHmu(req); err != nil {
+					rs.logger.Printf("resource sender: serve HMU for %s: %v",
+						ResourceHashShortHex(rs.resourceHash), err)
+					rs.fail(err)
+					return err
+				}
 				continue
 			}
 			n, err := rs.fulfillRequest(req)
@@ -448,9 +453,68 @@ func (rs *ResourceSender) fulfillRequest(req *ResourceRequest) (int, error) {
 	return delivered, nil
 }
 
+// serveHmu answers an exhausted RESOURCE_REQ by sending the next
+// hashmap segment as a RESOURCE_HMU packet (SPEC §10.7). The
+// receiver's LastMapHash is the last map_hash it already has; the
+// segment of HashmapMaxLen entries immediately after it is what we
+// send. Mirrors upstream Resource.request()'s wants_more_hashmap
+// branch — including the segment-boundary sequencing check.
+//
+// Re-serving the same segment (a duplicate exhausted REQ on a lossy
+// link) is harmless: the lookup is deterministic and the receiver's
+// applyHmu is idempotent.
+func (rs *ResourceSender) serveHmu(req *ResourceRequest) error {
+	if len(req.LastMapHash) != ResourceMapHashLen {
+		return fmt.Errorf("exhausted REQ has no last_map_hash")
+	}
+	k := rs.findPartByMapHash(req.LastMapHash)
+	if k < 0 {
+		return fmt.Errorf("exhausted REQ last_map_hash %x not in hashmap", req.LastMapHash)
+	}
+	// The receiver knows map_hashes [0, k]; the next part index is the
+	// start of the segment it still needs. It MUST land on a segment
+	// boundary — otherwise the receiver and sender disagree on
+	// segmentation (a protocol error).
+	partIndex := k + 1
+	if partIndex%HashmapMaxLen != 0 {
+		return fmt.Errorf("HMU sequencing error: last_map_hash at index %d is not a segment boundary", k)
+	}
+	segment := partIndex / HashmapMaxLen
+	start := segment * HashmapMaxLen
+	end := start + HashmapMaxLen
+	if end > len(rs.parts) {
+		end = len(rs.parts)
+	}
+	if start >= end {
+		return fmt.Errorf("HMU requested past end of resource: segment=%d n=%d", segment, len(rs.parts))
+	}
+	hmuBody, err := BuildResourceHmu(&ResourceHmu{
+		ResourceHash: rs.resourceHash,
+		SegmentIndex: segment,
+		HashmapBytes: rs.hashmap[start*ResourceMapHashLen : end*ResourceMapHashLen],
+	})
+	if err != nil {
+		return fmt.Errorf("build HMU: %w", err)
+	}
+	ciphertext, err := LinkTokenEncrypt(hmuBody, rs.linkSigning, rs.linkEncryption)
+	if err != nil {
+		return fmt.Errorf("encrypt HMU: %w", err)
+	}
+	pkt, err := buildResourceCtxPacket(rs.link.ID, ciphertext, ContextResourceHMU, false)
+	if err != nil {
+		return err
+	}
+	rs.logger.Printf("resource sender: HMU segment=%d entries=%d for %s",
+		segment, end-start, ResourceHashShortHex(rs.resourceHash))
+	return rs.transport.Broadcast(pkt)
+}
+
 // findPartByMapHash scans the hashmap for the requested map_hash and
-// returns the part index, or -1 if not found. O(N) is fine — N is
-// capped at HashmapMaxLen=74 and REQs are infrequent.
+// returns the part index, or -1 if not found. A 4-byte map_hash is
+// unique only within a CollisionGuardSize window, so on a large
+// resource a far-apart collision could return the wrong index — the
+// receiver's end-to-end SHA-256 over the assembled body catches that
+// (the transfer fails cleanly rather than delivering corruption).
 func (rs *ResourceSender) findPartByMapHash(mh []byte) int {
 	for i := 0; i < len(rs.parts); i++ {
 		off := i * ResourceMapHashLen

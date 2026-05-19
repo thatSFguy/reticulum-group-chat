@@ -52,6 +52,13 @@ func (a *ResourceAdvertisement) MapHashAt(i int) []byte {
 // body of a Link DATA packet with context = RESOURCE_ADV. Validates
 // field consistency before encoding so callers can't ship a half-
 // constructed ADV.
+//
+// adv.Hashmap MUST hold the FULL hashmap (NumParts map_hashes). When
+// NumParts exceeds HashmapMaxLen the whole hashmap can't fit one
+// advertisement packet, so only the first segment (HashmapMaxLen
+// entries) is placed on the wire; the receiver pulls the rest on
+// demand via RESOURCE_HMU (SPEC §10.7). Mirrors upstream
+// ResourceAdvertisement.pack(segment=0).
 func PackResourceAdv(adv *ResourceAdvertisement) ([]byte, error) {
 	if adv == nil {
 		return nil, fmt.Errorf("resource adv: nil")
@@ -68,23 +75,24 @@ func PackResourceAdv(adv *ResourceAdvertisement) ([]byte, error) {
 	if adv.NumParts <= 0 {
 		return nil, fmt.Errorf("resource adv: n must be positive, got %d", adv.NumParts)
 	}
-	if adv.NumParts > HashmapMaxLen {
-		// We deliberately cap at HashmapMaxLen for now — a fwdsvc
-		// reply that needs more parts is a configuration smell, and
-		// HMU senders need additional state machine plumbing that
-		// stage 5 covers. Rejecting at the build edge is loud and
-		// safe.
-		return nil, fmt.Errorf("resource adv: n=%d exceeds single-hashmap cap %d (HMU not yet implemented for sender)", adv.NumParts, HashmapMaxLen)
-	}
 	expectedHashmapBytes := adv.NumParts * ResourceMapHashLen
 	if len(adv.Hashmap) != expectedHashmapBytes {
-		return nil, fmt.Errorf("resource adv: hashmap = %d bytes, expected %d (n=%d × MAPHASH_LEN=%d)",
+		return nil, fmt.Errorf("resource adv: hashmap = %d bytes, expected full %d (n=%d × MAPHASH_LEN=%d)",
 			len(adv.Hashmap), expectedHashmapBytes, adv.NumParts, ResourceMapHashLen)
 	}
 	if adv.SegmentIndex <= 0 || adv.SegmentIndex > adv.TotalSegments {
 		return nil, fmt.Errorf("resource adv: bad segment_index=%d / total_segments=%d", adv.SegmentIndex, adv.TotalSegments)
 	}
-	return msgpack.Marshal(adv)
+	// Emit only the first hashmap segment on the wire; HMU delivers
+	// the rest. wire is a shallow copy so the caller's full hashmap is
+	// left intact (the sender keeps it to serve HMU + part requests).
+	seg0Parts := adv.NumParts
+	if seg0Parts > HashmapMaxLen {
+		seg0Parts = HashmapMaxLen
+	}
+	wire := *adv
+	wire.Hashmap = adv.Hashmap[:seg0Parts*ResourceMapHashLen]
+	return msgpack.Marshal(&wire)
 }
 
 // ParseResourceAdv decodes an inbound RESOURCE_ADV body and applies
@@ -147,6 +155,15 @@ func ParseResourceAdv(body []byte) (*ResourceAdvertisement, error) {
 	// Apply receiver caps AFTER structural validation. Order matters:
 	// a malformed ADV should report the structural error, not "too
 	// large" — easier to debug interop issues that way.
+	//
+	// fwdsvc reassembles only single-segment resources. A body larger
+	// than MaxEfficientSize is split by RNS into l>1 segments (§10.11);
+	// accepting one segment of such a transfer would hand a truncated
+	// body to the LXMF parser. Reject the whole transfer up front.
+	if adv.TotalSegments > 1 {
+		return nil, fmt.Errorf("%w: multi-segment resource (l=%d) — fwdsvc accepts single-segment only",
+			ErrResourceTooLarge, adv.TotalSegments)
+	}
 	if adv.TransferSize > MaxAcceptedResourceSize || adv.DataSize > MaxAcceptedResourceSize {
 		return nil, fmt.Errorf("%w: t=%d d=%d cap=%d hash=%s",
 			ErrResourceTooLarge, adv.TransferSize, adv.DataSize, MaxAcceptedResourceSize, hex.EncodeToString(adv.Hash[:8]))

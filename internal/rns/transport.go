@@ -993,6 +993,14 @@ func (t *Transport) SendOverLink(responderDestHash []byte, plaintext []byte, tim
 		if known := t.Recall(responderDestHash); known != nil {
 			transportID = known.TransportID
 		}
+		// A Resource transfer of this size needs far longer than the
+		// caller's link-DATA timeout (the handshake already completed
+		// under the original deadline). Extend the deadline to a
+		// size-proportional budget so a multi-minute ~1 MiB transfer
+		// isn't cut off mid-stream.
+		if d := time.Now().Add(resourceTransferTimeout(len(plaintext))); d.After(deadline) {
+			deadline = d
+		}
 		ctx, cancel := context.WithDeadline(context.Background(), deadline)
 		defer cancel()
 		err := t.SendResourceOverLink(ctx, link, plaintext, transportID)

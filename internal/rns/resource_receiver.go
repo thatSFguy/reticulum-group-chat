@@ -91,7 +91,15 @@ type ResourceReceiver struct {
 	// (the bug that stalled inbound image transfers at ~18/30 parts).
 	pendingTarget int
 
-	mu sync.Mutex // guards parts / receivedFlags / receivedCount / pendingTarget
+	// consecutiveHeight is the highest index H such that parts[0..H]
+	// have all been received (-1 until part 0 arrives). placePart
+	// anchors its bounded-window map_hash search here — map_hashes are
+	// only guaranteed unique within CollisionGuardSize of each other,
+	// so a whole-hashmap scan could mis-place a part on a large
+	// transfer where two distant parts collide on their 4-byte hash.
+	consecutiveHeight int
+
+	mu sync.Mutex // guards parts / receivedFlags / receivedCount / pendingTarget / consecutiveHeight
 
 	// OnAssembled is called from the receiver goroutine with the
 	// fully-assembled, decrypted, prefix-stripped body. Wired by the
@@ -145,6 +153,7 @@ func (t *Transport) openResourceReceiver(link *Link, adv *ResourceAdvertisement)
 		flags:              adv.Flags,
 		hashmap:            fullHashmap,
 		hashmapKnownPrefix: knownPrefix,
+		consecutiveHeight:  -1,
 		parts:              make([][]byte, adv.NumParts),
 		receivedFlags:      make([]bool, adv.NumParts),
 		partCh:             make(chan []byte, 32),
@@ -166,13 +175,35 @@ func (t *Transport) openResourceReceiver(link *Link, adv *ResourceAdvertisement)
 	}
 
 	// Run synchronously in a goroutine — caller (handleResourceAdv)
-	// returns immediately.
+	// returns immediately. The goroutine's lifetime is budgeted from
+	// the advertised transfer size: a small link DATA needs ~30s, but
+	// a ~1 MiB image over a multi-hop mesh is minutes — a fixed 30s
+	// would time the transfer out long before it completes.
 	go func() {
-		ctx, cancel := context.WithTimeout(context.Background(), DefaultLinkSendTimeout)
+		ctx, cancel := context.WithTimeout(context.Background(), resourceTransferTimeout(adv.TransferSize))
 		defer cancel()
 		_ = rr.Run(ctx)
 	}()
 	return nil
+}
+
+// resourceTransferTimeout budgets how long one Resource transfer of
+// `transferSize` wire bytes may take — a fixed base plus a
+// conservative ~2 KiB/s throughput floor. A ~1 MiB transfer gets
+// ~9 min; tiny transfers stay near the old 30s. Clamped so a bogus
+// size can't pin a goroutine for hours. Used for both the receiver
+// goroutine lifetime and the outbound SendResourceOverLink deadline.
+func resourceTransferTimeout(transferSize int) time.Duration {
+	const (
+		base             = 30 * time.Second
+		floorBytesPerSec = 2048
+		maxTimeout       = 20 * time.Minute
+	)
+	d := base + time.Duration(transferSize/floorBytesPerSec)*time.Second
+	if d > maxTimeout {
+		d = maxTimeout
+	}
+	return d
 }
 
 // HandleCancel is invoked when the peer (initiator) sends RESOURCE_ICL
@@ -189,6 +220,12 @@ func (rr *ResourceReceiver) HandleCancel() {
 // is the raw ciphertext slice; receiver matches by computing its
 // 4-byte map_hash against its hashmap window.
 func (rr *ResourceReceiver) HandlePart(partCiphertext []byte) {
+	// An inbound part is link activity — refresh the link timer so the
+	// idle sweeper doesn't tear down a long (multi-minute) transfer
+	// that carries no other link DATA while it runs.
+	rr.link.mu.Lock()
+	rr.link.LastActivity = time.Now()
+	rr.link.mu.Unlock()
 	select {
 	case rr.partCh <- append([]byte(nil), partCiphertext...):
 	default:
@@ -340,36 +377,56 @@ var errResourceDuplicatePart = errors.New("resource receiver: duplicate part (re
 // placePart locates the part's hashmap slot via map_hash and drops it
 // in. Returns nil when the part filled a new slot, errResourceDuplicatePart
 // when it matched an already-received slot, or a plain error when its
-// map_hash matches no slot in the hashmap.
+// map_hash matches no slot in the active window.
+//
+// The scan is bounded to CollisionGuardSize slots anchored at the
+// consecutive-completed frontier. The sender only guarantees map_hash
+// uniqueness within a CollisionGuardSize sliding window (SPEC §10.2 /
+// §10.6), so a whole-hashmap scan on a large transfer (thousands of
+// parts) could mis-place a part when two distant parts collide on
+// their 4-byte map_hash. A window of exactly CollisionGuardSize sees
+// at most one match. Inbound parts always fall in this window: the
+// receiver only requests parts within ~WindowMax of the frontier and
+// the sender serves from the same bounded range.
 func (rr *ResourceReceiver) placePart(part []byte) error {
 	mh := ResourceMapHash(part, rr.randomR)
 	rr.mu.Lock()
 	defer rr.mu.Unlock()
+	base := rr.consecutiveHeight
+	if base < 0 {
+		base = 0
+	}
+	end := base + CollisionGuardSize
+	if end > rr.hashmapKnownPrefix {
+		end = rr.hashmapKnownPrefix
+	}
 	dup := false
-	for i := 0; i < len(rr.parts); i++ {
+	for i := base; i < end; i++ {
 		off := i * ResourceMapHashLen
 		if !bytesEqual(rr.hashmap[off:off+ResourceMapHashLen], mh) {
 			continue
 		}
 		if rr.receivedFlags[i] {
-			// map_hash matches a slot we already filled. Keep scanning
-			// in case an unreceived slot shares this map_hash (only
-			// possible outside the sender's collision-guard window),
-			// but remember we saw a duplicate.
 			dup = true
 			continue
 		}
 		rr.parts[i] = part
 		rr.receivedFlags[i] = true
 		rr.receivedCount++
+		// Advance the consecutive-completed frontier as far as the
+		// contiguous run of received parts now reaches.
+		for rr.consecutiveHeight+1 < len(rr.parts) && rr.receivedFlags[rr.consecutiveHeight+1] {
+			rr.consecutiveHeight++
+		}
 		return nil
 	}
 	if dup {
 		return errResourceDuplicatePart
 	}
-	// A map_hash matching no slot — sender bug, or a part leaking in
-	// from a different resource on the same link.
-	return errors.New("part map_hash not in hashmap (unknown)")
+	// No match in the active window — a duplicate of a long-since-
+	// completed part, or a part leaking in from another resource on
+	// the same link. Either way it's safe to drop.
+	return errors.New("part map_hash not in active window")
 }
 
 // windowComplete reports whether the parts requested in the most

@@ -135,17 +135,24 @@ const MaxEfficientSize = (1 << 20) - 1 // 1 MiB - 1
 // 3-byte big-endian uint24 length prefix (SPEC §10.2 step 1). 16 MiB - 1.
 const MetadataMaxSize = (1 << 24) - 1
 
-// Receive-side caps. fwdsvc isn't a NomadNet page server or file
-// receiver — every legitimate inbound Resource is an LXMF DM, capped
-// at LXMF's 24 KiB content limit by the encoding side. We allow ~256
-// KiB to absorb worst-case framing/metadata overhead; anything larger
-// is rejected at the ADV parse step before we allocate a parts buffer
-// or open a request loop. This is the spec-strongly-recommended
-// guard against allocation bombs (SPEC §10.4 callout) and
-// bz2-decompression bombs.
+// Receive-side caps. fwdsvc forwards LXMF DMs and group-chat messages
+// including image/file attachments. A single-segment Resource tops
+// out at MaxEfficientSize (1 MiB - 1) of plaintext — RNS splits
+// anything larger into multiple segments (§10.11), which fwdsvc does
+// not reassemble (multi-segment ADVs are rejected at parse). We
+// therefore accept up to one full segment. The size cap is the
+// spec-strongly-recommended guard against allocation bombs (SPEC
+// §10.4 callout) and bz2-decompression bombs.
 const (
-	MaxAcceptedResourceSize    = 256 * 1024 // bytes — `t` and `d` reject threshold
-	MaxAcceptedResourceParts   = HashmapMaxLen
+	// MaxAcceptedResourceSize is the `t`/`d` reject threshold — one
+	// full single-segment resource (MaxEfficientSize of plaintext)
+	// plus headroom for the random-hash prefix and link-Token framing.
+	MaxAcceptedResourceSize = MaxEfficientSize + 8*1024
+	// MaxAcceptedResourceParts caps `n`. One segment slices into at
+	// most ceil(MaxAcceptedResourceSize / ResourceSDU) parts; +4 slack.
+	// Far above HashmapMaxLen (74) — anything past 74 parts has its
+	// hashmap delivered segment-by-segment via RESOURCE_HMU.
+	MaxAcceptedResourceParts   = MaxAcceptedResourceSize/ResourceSDU + 4
 	MaxDecompressedResourceLen = MaxAcceptedResourceSize
 )
 

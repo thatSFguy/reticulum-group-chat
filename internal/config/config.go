@@ -82,8 +82,11 @@ type ServiceConfig struct {
 	// allowed field value. Oversized fields are dropped (text body still
 	// forwards, with a "[image not forwarded: NNN B > LIMIT B]" suffix);
 	// the whole message is not lost. 0 disables the cap (not
-	// recommended on LoRa). Default 32768 — matches Sideband's typical
-	// 20–30 KB output and the mobile app's defensive inbound cap.
+	// recommended on LoRa). Default 1000 KiB — a forwarded attachment
+	// rides a single-segment Resource transfer, which tops out near
+	// 1 MiB; the default leaves headroom for LXMF framing so the
+	// relayed message stays single-segment. Operators on slow links
+	// may want a much lower value.
 	MaxAttachmentBytes int `toml:"max_attachment_bytes"`
 
 	// IDCacheTTL is how long fwdsvc remembers each fan-out's per-
@@ -194,7 +197,7 @@ func defaults() *Config {
 			AnnounceInterval:   Duration(10 * time.Minute),
 			MaxInboundChars:    500,
 			ForwardAttachments: true,
-			MaxAttachmentBytes: 32768,
+			MaxAttachmentBytes: 1000 * 1024,
 			ForwardedFields:    []int{6, 16, 48, 49},
 			IDCacheTTL:         Duration(24 * time.Hour),
 			IDCacheMax:         10000,

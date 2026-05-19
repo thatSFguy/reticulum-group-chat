@@ -164,8 +164,8 @@ func TestAttachmentConfigDefaults(t *testing.T) {
 	if !c.Service.ForwardAttachments {
 		t.Error("ForwardAttachments default should be true")
 	}
-	if c.Service.MaxAttachmentBytes != 32768 {
-		t.Errorf("MaxAttachmentBytes default = %d, want 32768", c.Service.MaxAttachmentBytes)
+	if c.Service.MaxAttachmentBytes != 1000*1024 {
+		t.Errorf("MaxAttachmentBytes default = %d, want %d", c.Service.MaxAttachmentBytes, 1000*1024)
 	}
 	// Default allowlist: FIELD_IMAGE plus the message-meta fields
 	// (reactions = 16, MeshChatX reply-to hash = 48, reply-to quoted
