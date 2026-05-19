@@ -358,6 +358,21 @@ func (rs *ResourceSender) Run(ctx context.Context) error {
 				gotFirstReq = true
 				rs.state.Store(int32(ResourceStateTransferring))
 			}
+			// Serve requested parts for every REQ. An exhausted REQ
+			// (req.Exhausted) may STILL carry a non-empty
+			// requested_map_hashes trailer (SPEC §10.7): the receiver
+			// bundles outstanding parts from the known hashmap region
+			// with the exhausted flag in a single REQ. Upstream
+			// Resource.request() runs part fulfilment unconditionally
+			// and only then takes its wants_more_hashmap branch — part
+			// fulfilment and the HMU are independent, not either/or.
+			// fulfillRequest no-ops on an empty RequestedMap.
+			n, err := rs.fulfillRequest(req)
+			if err != nil {
+				rs.fail(err)
+				return err
+			}
+			deliveredParts += n
 			if req.Exhausted {
 				// The receiver has consumed every map_hash it knows and
 				// needs the next hashmap segment — answer with a
@@ -369,14 +384,7 @@ func (rs *ResourceSender) Run(ctx context.Context) error {
 					rs.fail(err)
 					return err
 				}
-				continue
 			}
-			n, err := rs.fulfillRequest(req)
-			if err != nil {
-				rs.fail(err)
-				return err
-			}
-			deliveredParts += n
 			if deliveredParts >= expectedParts {
 				rs.state.Store(int32(ResourceStateAwaitingProof))
 			}
@@ -453,12 +461,17 @@ func (rs *ResourceSender) fulfillRequest(req *ResourceRequest) (int, error) {
 	return delivered, nil
 }
 
-// serveHmu answers an exhausted RESOURCE_REQ by sending the next
-// hashmap segment as a RESOURCE_HMU packet (SPEC §10.7). The
-// receiver's LastMapHash is the last map_hash it already has; the
-// segment of HashmapMaxLen entries immediately after it is what we
-// send. Mirrors upstream Resource.request()'s wants_more_hashmap
-// branch — including the segment-boundary sequencing check.
+// serveHmu sends the next hashmap segment as a RESOURCE_HMU packet in
+// response to an exhausted RESOURCE_REQ (SPEC §10.7). The receiver's
+// LastMapHash is the last map_hash it already has; the segment of
+// HashmapMaxLen entries immediately after it is what we send.
+//
+// This is only the HMU half of handling an exhausted REQ. The caller
+// MUST also run fulfillRequest: an exhausted REQ may still carry a
+// requested_map_hashes trailer, and upstream Resource.request() fulfils
+// those parts unconditionally before taking its wants_more_hashmap
+// branch. serveHmu corresponds to that branch only — including its
+// segment-boundary sequencing check.
 //
 // Re-serving the same segment (a duplicate exhausted REQ on a lossy
 // link) is harmless: the lookup is deterministic and the receiver's

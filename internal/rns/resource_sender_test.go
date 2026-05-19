@@ -378,3 +378,86 @@ func TestSenderCloseLinkCancelsTransfer(t *testing.T) {
 		t.Fatal("Run did not exit after CloseLink")
 	}
 }
+
+// TestSenderExhaustedReqAlsoServesBundledParts is the regression guard
+// for the 2026-05-19 incident (playbook §7): an exhausted RESOURCE_REQ
+// may still carry a requested_map_hashes trailer, and the sender MUST
+// serve those parts in ADDITION to the RESOURCE_HMU — not instead of
+// it. Upstream Resource.request() fulfils parts unconditionally, then
+// sends the HMU. A sender that skips part fulfilment for exhausted
+// REQs silently drops every bundled part (the bug fixed here).
+func TestSenderExhaustedReqAlsoServesBundledParts(t *testing.T) {
+	link, tp, iface := makeActiveTestLink(t)
+
+	// Body large enough to span more than one hashmap segment, so an
+	// exhausted REQ followed by a RESOURCE_HMU is meaningful
+	// (HashmapMaxLen = 74 parts per segment).
+	body := bytes.Repeat([]byte{0x42}, 40*1024)
+	rs, err := NewResourceSender(tp, link, body, nil, noopLogger{})
+	if err != nil {
+		t.Fatalf("NewResourceSender: %v", err)
+	}
+	if len(rs.parts) <= HashmapMaxLen {
+		t.Fatalf("test needs a multi-segment resource: got %d parts, need > %d", len(rs.parts), HashmapMaxLen)
+	}
+	if err := tp.linkManager.registerResourceSender(link.ID, rs.ResourceHash(), rs); err != nil {
+		t.Fatal(err)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	runDone := make(chan error, 1)
+	go func() { runDone <- rs.Run(ctx) }()
+
+	if !iface.WaitForN(1, time.Now().Add(2*time.Second)) {
+		t.Fatal("sender did not broadcast ADV")
+	}
+
+	// map_hashes taken straight from the sender's full hashmap. Bundle
+	// one segment-0 part (index 10) into an exhausted REQ whose
+	// last_map_hash is the final entry of segment 0 (index
+	// HashmapMaxLen-1) — that lands the next part index on a segment
+	// boundary so serveHmu produces segment 1 cleanly.
+	mapHashAt := func(i int) []byte {
+		return append([]byte(nil), rs.hashmap[i*ResourceMapHashLen:(i+1)*ResourceMapHashLen]...)
+	}
+	rs.HandleRequest(&ResourceRequest{
+		Exhausted:    true,
+		LastMapHash:  mapHashAt(HashmapMaxLen - 1),
+		ResourceHash: rs.ResourceHash(),
+		RequestedMap: [][]byte{mapHashAt(10)},
+	})
+
+	// Expect ADV + the bundled part + the HMU = 3 wire packets. With
+	// the pre-fix `continue`, the part was never emitted (only 2).
+	if !iface.WaitForN(3, time.Now().Add(2*time.Second)) {
+		t.Fatalf("sender emitted %d packets, want 3 (ADV + part + HMU) — bundled part likely dropped", len(iface.Snapshot()))
+	}
+
+	var sawPart, sawHMU bool
+	for i, raw := range iface.Snapshot()[1:] {
+		pkt, err := ParsePacket(raw)
+		if err != nil {
+			t.Fatalf("parse packet %d: %v", i+1, err)
+		}
+		switch pkt.Context {
+		case ContextResource:
+			sawPart = true
+		case ContextResourceHMU:
+			sawHMU = true
+		}
+	}
+	if !sawPart {
+		t.Error("sender did not emit the part bundled into the exhausted REQ")
+	}
+	if !sawHMU {
+		t.Error("sender did not emit the RESOURCE_HMU for the exhausted REQ")
+	}
+
+	cancel()
+	select {
+	case <-runDone:
+	case <-time.After(2 * time.Second):
+		t.Fatal("Run did not exit after ctx cancel")
+	}
+}
