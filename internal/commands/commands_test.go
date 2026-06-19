@@ -92,13 +92,21 @@ func helpTextMsgpackPayload(t *testing.T, c *Caller) []byte {
 	return payload
 }
 
-// TestHelpTextFitsOpportunisticPacket guards against ANY caller state
-// producing a help text that exceeds the single-packet opportunistic
-// LXMF cap (upstream LXMessage.ENCRYPTED_PACKET_MAX_CONTENT = 295). All
-// four states need to fit because /? is dispatched without knowing in
-// advance which the caller is.
-func TestHelpTextFitsOpportunisticPacket(t *testing.T) {
-	const maxOpportunisticPayload = 295
+// TestHelpTextStaysReasonable is a regression guard on help-text size
+// across ALL caller states (/? is dispatched without knowing the caller
+// in advance).
+//
+// It is NOT the old single-packet cap. Since v1.1.0 Delivery.Send
+// auto-routes any reply that exceeds the opportunistic packet limit
+// (lxmf.MaxOpportunisticPayload = 295 B msgpack) through a Reticulum
+// Link, so help text larger than 295 B is delivered fine — it just
+// costs a Link round-trip instead of a single fire-and-forget packet.
+// The opportunistic limit is recorded here only as the soft fast-path
+// threshold; the hard bound is a generous sanity cap that catches help
+// text ballooning by accident, nothing more.
+func TestHelpTextStaysReasonable(t *testing.T) {
+	const opportunisticFastPath = 295 // soft: under this, /? ships in one packet
+	const sanityCap = 600             // hard: anything larger is a bug, not a design choice
 	cases := []struct {
 		name string
 		c    *Caller
@@ -111,9 +119,13 @@ func TestHelpTextFitsOpportunisticPacket(t *testing.T) {
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			payload := helpTextMsgpackPayload(t, tc.c)
-			if len(payload) > maxOpportunisticPayload {
-				t.Errorf("helpText for %s = %d bytes msgpack, must be <= %d (single-packet cap)\n--- text:\n%s",
-					tc.name, len(payload), maxOpportunisticPayload, helpText(tc.c))
+			if len(payload) > sanityCap {
+				t.Errorf("helpText for %s = %d bytes msgpack, exceeds sanity cap %d\n--- text:\n%s",
+					tc.name, len(payload), sanityCap, helpText(tc.c))
+			}
+			if len(payload) > opportunisticFastPath {
+				t.Logf("note: helpText for %s = %d bytes msgpack > %d, so /? ships via Link (fine since v1.1.0, not single-packet)",
+					tc.name, len(payload), opportunisticFastPath)
 			}
 		})
 	}

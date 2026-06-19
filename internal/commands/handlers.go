@@ -228,16 +228,16 @@ func helpText(c *Caller) string {
 	var b strings.Builder
 	b.WriteString("Commands:\n")
 	b.WriteString("/?, /help\n")
-	b.WriteString("/about - version\n")
+	b.WriteString("/about - version + repo\n")
 	b.WriteString("/users /mods /admin - lists\n")
 
 	if !c.Member {
 		b.WriteString("/join - join the chat\n")
 	} else {
-		b.WriteString("/nick NAME - rename\n")
-		b.WriteString("/leave - leave\n")
-		b.WriteString("/pause /resume - mute\n")
-		b.WriteString("/textonly /showall - media\n")
+		b.WriteString("/nick NAME - rename self\n")
+		b.WriteString("/leave - leave the chat\n")
+		b.WriteString("/pause /resume - mute/unmute\n")
+		b.WriteString("/textonly /showall - skip media\n")
 	}
 
 	if c.Role.atLeastMod() {
