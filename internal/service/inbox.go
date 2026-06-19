@@ -110,8 +110,8 @@ func (s *Service) onLXMFReceived(msg *lxmf.Message) {
 	// suffix appended to the body so recipients know the sender tried.
 	fwdFields, drops := filterAttachments(msg.Fields, s.cfg.Service)
 
-	// Compose the forwarded body. Reactions (Columba/MeshChatX
-	// fields[16]) and reply-to-only messages can arrive with content=""
+	// Compose the forwarded body. Reactions (FIELD_REACTION 0x40) and
+	// reply-to-only messages can arrive with content=""
 	// — the metadata IS the field payload, and clients render the chip
 	// on the original message bubble. In that case the "[nick] " prefix
 	// would broadcast a trailing-space empty bubble, so we omit it and

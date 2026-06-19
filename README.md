@@ -342,7 +342,7 @@ Both lists MUST be declared at the top of the file, before any
 | `max_members`        | int      | `0`                         | Cap on roster size. `/join` past the cap is refused. `0` = unlimited. |
 | `forward_attachments`| bool     | `true`                      | Pass LXMF non-text fields (images, etc.) through forwarding. `false` drops all attachments silently. |
 | `max_attachment_bytes`| int     | `32768`                     | Per-field msgpack size cap. Oversize attachments are dropped with an inline `[image not forwarded: …]` note; text body still delivers. `0` disables the cap. |
-| `forwarded_fields`   | int list | `[6, 16, 48, 49]`           | Allowlist of LXMF field keys to forward when `forward_attachments=true`. Default covers `FIELD_IMAGE` (6), tap-back reactions (16 — Columba + MeshChatX convention), and MeshChatX reply-to (`0x30`=48 message-id, `0x31`=49 quoted text). Add `5` for files, `7` for audio once your senders/receivers handle them. |
+| `forwarded_fields`   | int list | `[6, 48, 49, 64, 65, 66]`   | Allowlist of LXMF field keys to forward when `forward_attachments=true`. Default covers `FIELD_IMAGE` (6) plus the upstream LXMF 1.0.0 message-meta fields: reply-to (`FIELD_REPLY_TO 0x30`=48 message-id, `FIELD_REPLY_QUOTE 0x31`=49 quoted text), tap-back reactions (`FIELD_REACTION 0x40`=64), comments (`FIELD_COMMENT 0x41`=65), and continuations (`FIELD_CONTINUATION 0x42`=66). Add `5` for files, `7` for audio once your senders/receivers handle them. |
 | `id_cache_ttl`       | duration | `24h`                       | How long fwdsvc remembers each fan-out's per-recipient LXMF `message_id` so reactions and reply-to fields can be rewritten per recipient (v1.6.0+). `0` disables — reactions then show "[someone reacted]" without landing on a bubble. Going longer just grows memory; each cache entry is ~50 bytes × roster size. |
 | `id_cache_max`       | int      | `10000`                     | Hard cap on `id_cache_ttl` entry count (LRU evicts oldest). One fan-out to N recipients counts as N entries. `0` = unbounded. |
 
@@ -682,10 +682,11 @@ LXMF to run a group-chat hub. Notable gaps:
   are decryptable.
 - **No stamps / proof-of-work anti-spam.** Peers that *require*
   stamps will silently reject our outbound LXMF.
-- **Limited LXMF field support.** `FIELD_IMAGE` (6), tap-back
-  reactions (16), and MeshChatX reply-to (`0x30`=48 +
-  `0x31`=49) are forwarded through group chat by default (v1.4.0+
-  / v1.5.0+); `FIELD_FILE_ATTACHMENTS` (5) and `FIELD_AUDIO` (7) can
+- **Limited LXMF field support.** `FIELD_IMAGE` (6) and the upstream
+  LXMF 1.0.0 message-meta fields — reply-to (`0x30`=48 + `0x31`=49),
+  reactions (`FIELD_REACTION 0x40`=64), comments (`0x41`=65), and
+  continuations (`0x42`=66) — are forwarded through group chat by
+  default; `FIELD_FILE_ATTACHMENTS` (5) and `FIELD_AUDIO` (7) can
   be enabled per-operator via `forwarded_fields`. Stickers, embedded
   LXMs, telemetry, icon-appearance, and command fields are still
   parsed but discarded.

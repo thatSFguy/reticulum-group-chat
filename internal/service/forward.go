@@ -13,9 +13,10 @@ import (
 // (text-only forwards from a command reply, say).
 type forwardOpts struct {
 	// rewrite, when non-nil, lets the inbox transform the fields map
-	// per recipient before enqueue (used for reaction and reply-to
-	// rewrites so each member's reaction_to / fields[0x30] matches
-	// their own view of the original message_id). The function may
+	// per recipient before enqueue (used for reaction/comment/
+	// continuation and reply-to rewrites so each member's target
+	// message_id matches their own view of the original message_id).
+	// The function may
 	// return nil to indicate "skip this recipient" — e.g. when we
 	// can't find the recipient's view of the original bubble, so the
 	// reaction would land on nothing on their side anyway.

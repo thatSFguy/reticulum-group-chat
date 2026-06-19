@@ -145,9 +145,11 @@ func TestFieldLabelKnownNumbers(t *testing.T) {
 		5:  "file",
 		6:  "image",
 		7:  "audio",
-		16: "reaction",
-		48: "reply-to",   // 0x30 — MeshChatX reply-to hash
-		49: "reply text", // 0x31 — MeshChatX reply-to quoted text
+		48: "reply-to",     // 0x30 — FIELD_REPLY_TO hash
+		49: "reply text",   // 0x31 — FIELD_REPLY_QUOTE text
+		64: "reaction",     // 0x40 — FIELD_REACTION
+		65: "comment",      // 0x41 — FIELD_COMMENT
+		66: "continuation", // 0x42 — FIELD_CONTINUATION
 		42: "field 42",
 	}
 	for k, want := range cases {
@@ -158,26 +160,27 @@ func TestFieldLabelKnownNumbers(t *testing.T) {
 }
 
 func TestFilterAttachmentsPassesReactionAndReplyFields(t *testing.T) {
-	// Issue #8: tap-back reactions ride on fields[16]; MeshChatX reply-
-	// to rides on fields[48] / fields[49]. The default allowlist must
-	// pass all three through unchanged.
+	// Issue #8: upstream LXMF 1.0.0 fields — reactions on 0x40, comments
+	// 0x41, continuations 0x42, reply-to 0x30 + quote 0x31. The default
+	// allowlist must pass all of them through unchanged.
 	cfg := defaultAttachmentCfg()
-	cfg.ForwardedFields = []int{6, 16, 48, 49}
+	cfg.ForwardedFields = []int{6, 48, 49, 64, 65, 66}
 
 	in := map[any]any{
-		16: map[any]any{
-			"reaction_to": "deadbeef",
-			"emoji":       "👍",
-			"sender":      "cafef00d",
+		64: map[any]any{ // 0x40 FIELD_REACTION
+			0x00: bytes.Repeat([]byte{0xDE}, 32),
+			0x01: []byte("👍"),
 		},
-		48: bytes.Repeat([]byte{0xAA}, 32),
-		49: []byte("> original message"),
+		65: map[any]any{0x00: bytes.Repeat([]byte{0xCC}, 32)}, // 0x41 FIELD_COMMENT
+		66: map[any]any{0x00: bytes.Repeat([]byte{0xEE}, 32)}, // 0x42 FIELD_CONTINUATION
+		48: bytes.Repeat([]byte{0xAA}, 32),                    // 0x30 reply-to hash
+		49: []byte("> original message"),                      // 0x31 quote
 	}
 	out, drops := filterAttachments(in, cfg)
 	if len(drops) != 0 {
 		t.Errorf("unexpected drops for reaction/reply fields: %v", drops)
 	}
-	for _, k := range []int{16, 48, 49} {
+	for _, k := range []int{48, 49, 64, 65, 66} {
 		if _, ok := out[k]; !ok {
 			t.Errorf("field %d missing from out: %v", k, out)
 		}

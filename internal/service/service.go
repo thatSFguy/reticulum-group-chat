@@ -51,10 +51,10 @@ type Service struct {
 	outbound   *OutboundQueue
 
 	// idmap caches per-recipient LXMF message_id views for relayed
-	// bubbles so cross-client reactions (fields[16].reaction_to) and
-	// MeshChatX reply-to (fields[0x30]) can be rewritten per recipient
-	// at fan-out time. Nil if cfg.Service.IDCacheTTL == 0 (the legacy
-	// "reactions don't bind" behavior).
+	// bubbles so reactions (fields[0x40]), comments (0x41),
+	// continuations (0x42) and reply-to (fields[0x30]) can be rewritten
+	// per recipient at fan-out time. Nil if cfg.Service.IDCacheTTL == 0
+	// (the legacy "reactions don't bind" behavior).
 	idmap *idmap.Cache
 
 	logger *log.Logger

@@ -1,8 +1,8 @@
 // Package idmap is a TTL'd in-memory store that maps LXMF message_ids
 // to the per-recipient views computed during fan-out forwarding. It
-// exists to make tap-back reactions and MeshChatX reply-to fields
-// (fields[16].reaction_to / fields[0x30]) bind on receiving clients in
-// a rebroadcast-model relay.
+// exists to make tap-back reactions, comments, continuations and
+// reply-to fields (fields[0x40]/[0x41]/[0x42] inner 0x00 /
+// fields[0x30]) bind on receiving clients in a rebroadcast-model relay.
 //
 // The fundamental problem: LXMF message_id is SHA-256(dest||source||
 // payload). When fwdsvc re-emits a relayed bubble under its own

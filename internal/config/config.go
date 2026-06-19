@@ -90,8 +90,8 @@ type ServiceConfig struct {
 	MaxAttachmentBytes int `toml:"max_attachment_bytes"`
 
 	// IDCacheTTL is how long fwdsvc remembers each fan-out's per-
-	// recipient LXMF message_id views. The cache exists so cross-client
-	// reactions (fields[16].reaction_to) and MeshChatX reply-to
+	// recipient LXMF message_id views. The cache exists so reactions
+	// (fields[0x40]), comments (0x41), continuations (0x42) and reply-to
 	// (fields[0x30]) can be rewritten per recipient on fan-out — the
 	// bare rebroadcast model would otherwise compute a different
 	// message_id on every recipient and the binding fails. Set to 0 to
@@ -113,16 +113,20 @@ type ServiceConfig struct {
 	// ForwardAttachments=true — defense against a misbehaving client
 	// stuffing weird keys, and an operator opt-in for new field types
 	// (FIELD_FILE_ATTACHMENTS = 5, FIELD_AUDIO = 7, etc.) once those
-	// clients shake out. Default [6, 16, 48, 49]:
+	// clients shake out. Default [6, 48, 49, 64, 65, 66] (upstream LXMF
+	// 1.0.0 field allocation, markqvist/LXMF):
 	//
 	//   6  FIELD_IMAGE          ["ext", bytes]
-	//   16 reactions            {"reaction_to": <hex>, "emoji": "👍",
-	//                            "sender": <hex>} — Columba + MeshChatX
-	//                            tap-back convention.
-	//   48 reply-to hash        raw 32-byte message_id being replied to
-	//                            (MeshChatX 0x30 shape).
-	//   49 reply-to quoted text optional UTF-8 quote preview (MeshChatX
-	//                            0x31). Tiny by design — usually <100 B.
+	//   48 FIELD_REPLY_TO       0x30 — raw 32-byte message_id being
+	//                           replied to.
+	//   49 FIELD_REPLY_QUOTE    0x31 — optional UTF-8 quote preview.
+	//                           Tiny by design — usually <100 B.
+	//   64 FIELD_REACTION       0x40 — tap-back reaction dict
+	//                           {0x00: raw msgid, 0x01: UTF-8 content}.
+	//   65 FIELD_COMMENT        0x41 — message-as-comment dict
+	//                           {0x00: raw msgid}; text rides in content.
+	//   66 FIELD_CONTINUATION   0x42 — message-as-continuation dict
+	//                           {0x00: raw msgid}; text rides in content.
 	ForwardedFields []int `toml:"forwarded_fields"`
 }
 
@@ -198,7 +202,7 @@ func defaults() *Config {
 			MaxInboundChars:    500,
 			ForwardAttachments: true,
 			MaxAttachmentBytes: 1000 * 1024,
-			ForwardedFields:    []int{6, 16, 48, 49},
+			ForwardedFields:    []int{6, 48, 49, 64, 65, 66},
 			IDCacheTTL:         Duration(24 * time.Hour),
 			IDCacheMax:         10000,
 		},

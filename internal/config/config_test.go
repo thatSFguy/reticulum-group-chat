@@ -167,10 +167,11 @@ func TestAttachmentConfigDefaults(t *testing.T) {
 	if c.Service.MaxAttachmentBytes != 1000*1024 {
 		t.Errorf("MaxAttachmentBytes default = %d, want %d", c.Service.MaxAttachmentBytes, 1000*1024)
 	}
-	// Default allowlist: FIELD_IMAGE plus the message-meta fields
-	// (reactions = 16, MeshChatX reply-to hash = 48, reply-to quoted
-	// text = 49). See issue #8 for the cross-client convention.
-	wantFields := map[int]bool{6: true, 16: true, 48: true, 49: true}
+	// Default allowlist: FIELD_IMAGE plus the upstream LXMF 1.0.0
+	// message-meta fields — reply-to 0x30 (48) + quote 0x31 (49),
+	// reaction 0x40 (64), comment 0x41 (65), continuation 0x42 (66).
+	// See issue #8.
+	wantFields := map[int]bool{6: true, 48: true, 49: true, 64: true, 65: true, 66: true}
 	if len(c.Service.ForwardedFields) != len(wantFields) {
 		t.Errorf("ForwardedFields default = %v, want keys %v",
 			c.Service.ForwardedFields, wantFields)
