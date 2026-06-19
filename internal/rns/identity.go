@@ -140,7 +140,19 @@ func (id *Identity) PublicKey() []byte {
 
 // Hash returns the 16-byte identity hash: SHA-256(public_key)[:16].
 func (id *Identity) Hash() []byte {
-	h := sha256.Sum256(id.PublicKey())
+	return IdentityHashFromPublicKey(id.PublicKey())
+}
+
+// IdentityHashFromPublicKey returns the RNS identity hash,
+// SHA-256(public_key)[:16], for a 64-byte announced public key
+// (X25519 pub || Ed25519 pub). This is the identity hash, NOT a
+// destination hash — destinations derive from it via DestinationHash.
+// Returns nil for a wrong-length key.
+func IdentityHashFromPublicKey(pub []byte) []byte {
+	if len(pub) != PublicKeyLen {
+		return nil
+	}
+	h := sha256.Sum256(pub)
 	out := make([]byte, IdentityHashLen)
 	copy(out, h[:IdentityHashLen])
 	return out

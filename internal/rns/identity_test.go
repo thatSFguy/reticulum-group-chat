@@ -2,12 +2,40 @@ package rns
 
 import (
 	"bytes"
+	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
 	"os"
 	"path/filepath"
 	"testing"
 )
+
+func TestIdentityHashFromPublicKey(t *testing.T) {
+	pub := bytes.Repeat([]byte{0x5A}, PublicKeyLen)
+	sum := sha256.Sum256(pub)
+	want := sum[:IdentityHashLen]
+
+	got := IdentityHashFromPublicKey(pub)
+	if !bytes.Equal(got, want) {
+		t.Errorf("IdentityHashFromPublicKey = %x, want %x", got, want)
+	}
+	if len(got) != IdentityHashLen {
+		t.Errorf("len = %d, want %d", len(got), IdentityHashLen)
+	}
+	// Wrong-length key → nil (not a panic, not a partial hash).
+	if IdentityHashFromPublicKey(pub[:10]) != nil {
+		t.Error("short public key should return nil")
+	}
+	// KnownIdentity.IdentityHash mirrors the free function and is
+	// distinct from the destination hash.
+	k := &KnownIdentity{PublicKey: pub, DestHash: bytes.Repeat([]byte{0x99}, IdentityHashLen)}
+	if !bytes.Equal(k.IdentityHash(), want) {
+		t.Errorf("KnownIdentity.IdentityHash = %x, want %x", k.IdentityHash(), want)
+	}
+	if bytes.Equal(k.IdentityHash(), k.DestHash) {
+		t.Error("identity hash must not equal destination hash (the gotcha this guards)")
+	}
+}
 
 // testVectorsPath points at the spec repo's identities.json. The repo is a
 // sibling of this project on the dev machine; tests are skipped if it isn't

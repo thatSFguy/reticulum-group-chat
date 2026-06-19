@@ -5,6 +5,7 @@
 package lxmf
 
 import (
+	"bytes"
 	"crypto/ed25519"
 	"crypto/sha256"
 	"errors"
@@ -335,6 +336,34 @@ func (m *Message) MessageID() []byte {
 	return ComputeMessageID(m.DestHash, m.SourceHash, m.rawPayload)
 }
 
+// msgpackNil is the msgpack format byte for nil (0xc0).
+const msgpackNil = 0xc0
+
+// decodeFields decodes the LXMF "fields" payload element into a
+// map[any]any with interface-keyed maps at EVERY nesting level.
+//
+// The default msgpack interface-map decoder produces
+// map[string]interface{} for nested map *values*, which rejects the
+// integer-keyed inner dicts that FIELD_REACTION (0x40), FIELD_COMMENT
+// (0x41), and FIELD_CONTINUATION (0x42) use: it fails with "invalid
+// code=0 decoding string/bytes length" the moment it hits inner key
+// 0x00, and the whole message is dropped before it ever reaches the
+// relay logic. (Top-level reply-to 0x30 raw bytes and image arrays
+// decode fine, which is why only reactions/comments/continuations
+// vanished.) Wiring DecodeUntypedMap in as the map decoder makes every
+// level decode into map[any]any regardless of key type.
+func decodeFields(raw []byte) (map[any]any, error) {
+	// msgpack nil → no fields (tolerated like an empty map).
+	if len(raw) == 1 && raw[0] == msgpackNil {
+		return nil, nil
+	}
+	dec := msgpack.NewDecoder(bytes.NewReader(raw))
+	dec.SetMapDecoder(func(d *msgpack.Decoder) (interface{}, error) {
+		return d.DecodeUntypedMap()
+	})
+	return dec.DecodeUntypedMap()
+}
+
 // unpackPayload extracts Timestamp/Title/Content/Fields/Stamp from rawPayload.
 func (m *Message) unpackPayload() error {
 	var elems []msgpack.RawMessage
@@ -369,18 +398,11 @@ func (m *Message) unpackPayload() error {
 			return fmt.Errorf("decode content: %w", err)
 		}
 	}
-	if err := safeUnmarshal(elems[3], &m.Fields); err != nil {
-		// Some payloads use string-keyed maps; tolerate.
-		var sm map[string]any
-		if err2 := safeUnmarshal(elems[3], &sm); err2 == nil {
-			m.Fields = make(map[any]any, len(sm))
-			for k, v := range sm {
-				m.Fields[k] = v
-			}
-		} else {
-			return fmt.Errorf("decode fields: %w", err)
-		}
+	fields, err := decodeFields(elems[3])
+	if err != nil {
+		return fmt.Errorf("decode fields: %w", err)
 	}
+	m.Fields = fields
 	if len(elems) >= 5 {
 		_ = safeUnmarshal(elems[4], &m.Stamp) // best-effort; stamp is optional
 	}

@@ -115,6 +115,75 @@ func TestExtractDictTarget(t *testing.T) {
 	}
 }
 
+func TestStampReactorIdentity(t *testing.T) {
+	idHash := bytes.Repeat([]byte{0xAB}, 16)
+
+	// Reaction present → stamps both custom fields.
+	react := map[any]any{
+		fieldReaction: map[any]any{targetIdx: bytes.Repeat([]byte{0x01}, 32), 0x01: []byte("👍")},
+	}
+	if !stampReactorIdentity(react, idHash) {
+		t.Fatal("stampReactorIdentity returned false for a reaction")
+	}
+	if react[fieldCustomType] != originatorIdentityType {
+		t.Errorf("FIELD_CUSTOM_TYPE = %v, want %q", react[fieldCustomType], originatorIdentityType)
+	}
+	if got, _ := react[fieldCustomData].([]byte); !bytes.Equal(got, idHash) {
+		t.Errorf("FIELD_CUSTOM_DATA = %x, want %x", got, idHash)
+	}
+
+	// No reaction → no-op (replies/comments carry a body, no stamp).
+	noReact := map[any]any{fieldReplyTo: bytes.Repeat([]byte{0x02}, 32)}
+	if stampReactorIdentity(noReact, idHash) {
+		t.Error("stampReactorIdentity should be a no-op without a reaction")
+	}
+	if _, ok := noReact[fieldCustomType]; ok {
+		t.Error("non-reaction map must not be stamped")
+	}
+
+	// Missing identity hash → no-op (degrades to source attribution).
+	react2 := map[any]any{fieldReaction: map[any]any{targetIdx: bytes.Repeat([]byte{0x03}, 32)}}
+	if stampReactorIdentity(react2, nil) {
+		t.Error("stampReactorIdentity should be a no-op with an empty identity hash")
+	}
+}
+
+func TestStampedReactionSurvivesPerRecipientRewrite(t *testing.T) {
+	const aliceHex = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+	aliceView := bytes.Repeat([]byte{0xA1}, 32)
+	senderView := bytes.Repeat([]byte{0x77}, 32)
+	idHash := bytes.Repeat([]byte{0xAB}, 16)
+
+	cache := idmap.New(time.Minute, 0)
+	bubble := idmap.NewBubble(time.Minute, time.Now())
+	cache.RegisterView(bubble, aliceHex, hex.EncodeToString(aliceView))
+	cache.RegisterView(bubble, "reactor", hex.EncodeToString(senderView))
+	s := &Service{idmap: cache, logger: log.New(io.Discard, "", 0)}
+
+	in := map[any]any{fieldReaction: map[any]any{targetIdx: senderView, 0x01: []byte("👍")}}
+	stampReactorIdentity(in, idHash)
+
+	rewrite := s.buildRewrite(in)
+	if rewrite == nil {
+		t.Fatal("buildRewrite returned nil for a stamped reaction with a cached target")
+	}
+	out, ok := rewrite(aliceHex, in)
+	if !ok {
+		t.Fatal("rewrite(alice) returned ok=false")
+	}
+	// Reaction target rewritten to alice's view…
+	if got := out[fieldReaction].(map[any]any)[targetIdx].([]byte); !bytes.Equal(got, aliceView) {
+		t.Errorf("REACTION_TO = %x, want %x", got, aliceView)
+	}
+	// …and the originator-identity stamp passed through unchanged.
+	if out[fieldCustomType] != originatorIdentityType {
+		t.Errorf("custom type lost in rewrite: %v", out[fieldCustomType])
+	}
+	if got, _ := out[fieldCustomData].([]byte); !bytes.Equal(got, idHash) {
+		t.Errorf("custom data = %x, want %x", got, idHash)
+	}
+}
+
 func TestSubstituteReplyHashRewritesRawBytes(t *testing.T) {
 	const aliceHex = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
 	aliceMsgID := bytes.Repeat([]byte{0xCA, 0xFE}, 16) // 32 bytes

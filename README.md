@@ -717,6 +717,18 @@ LXMF to run a group-chat hub. Notable gaps:
   service restart, since the cache is not persisted) the binding
   falls back to legacy behavior — reactions don't render, replies
   show only their `fields[0x31]` quote preview.
+- **Reaction attribution.** Because the relay re-signs each reaction as
+  itself, a reaction's `source_hash` becomes fwdsvc — and a reaction
+  has no body to carry a `[Nick]` prefix, so naive relaying collapses
+  every reaction onto the service identity. fwdsvc stamps the original
+  reactor's RNS identity hash into the upstream custom fields
+  (`FIELD_CUSTOM_TYPE 0xFB = "originator-identity"`, `FIELD_CUSTOM_DATA
+  0xFC = SHA-256(pubkey)[:16]`) so cooperating clients attribute the
+  reaction to the reactor, not the relay. The `0x40` wire format is
+  untouched and the stamp is purely additive (spec-only clients ignore
+  it). This is an app-layer interop convention documented for other
+  clients in [`docs/reaction-attribution.md`](docs/reaction-attribution.md).
+  Replies need no stamp — they carry a body and ride the `[Nick]` path.
 - **No voice / audio.** Text-only. We register only the
   `lxmf.delivery` aspect — never `call.audio`. Some MeshChat users
   see a brief "incoming call" notification attributed to `fwdsvc`

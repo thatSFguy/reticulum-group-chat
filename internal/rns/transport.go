@@ -134,6 +134,14 @@ func (k *KnownIdentity) X25519Public() []byte { return k.PublicKey[:32] }
 // Ed25519Public returns the last 32 bytes of PublicKey.
 func (k *KnownIdentity) Ed25519Public() []byte { return k.PublicKey[32:] }
 
+// IdentityHash returns this peer's RNS identity hash,
+// SHA-256(public_key)[:16] — NOT its destination hash (DestHash). Used
+// to attribute relayed reactions to the original reactor's identity.
+// Returns nil if the cached public key is malformed.
+func (k *KnownIdentity) IdentityHash() []byte {
+	return IdentityHashFromPublicKey(k.PublicKey)
+}
+
 // LocalDestination is a destination we own (typically our LXMF delivery
 // destination). Inbound DATA packets matching DestHash are handed to OnPacket.
 // OnPacket is called from the transport's dispatcher goroutine; if the

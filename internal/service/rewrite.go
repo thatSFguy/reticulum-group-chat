@@ -39,7 +39,58 @@ const (
 	// message_id inside a reaction/comment/continuation dict —
 	// REACTION_TO / COMMENT_FOR / CONTINUATION_OF, all 0x00 upstream.
 	targetIdx = 0x00
+
+	// fieldCustomType is FIELD_CUSTOM_TYPE = 0xFB (251) and
+	// fieldCustomData is FIELD_CUSTOM_DATA = 0xFC (252) — upstream's
+	// app-convention fields (SPEC §5.9.1 / LXMF/LXMF.py). fwdsvc uses
+	// them to carry reactor attribution on relayed reactions; see
+	// stampReactorIdentity.
+	fieldCustomType = 0xFB
+	fieldCustomData = 0xFC
 )
+
+// originatorIdentityType is the exact FIELD_CUSTOM_TYPE tag cooperating
+// clients match to read the original reactor's identity hash from
+// FIELD_CUSTOM_DATA. It MUST be byte-exact: a client that doesn't match
+// it silently falls back to source-based attribution — which, for a
+// relayed reaction, means attributing it to fwdsvc instead of the
+// reactor. Documented for other clients in docs/reaction-attribution.md.
+const originatorIdentityType = "originator-identity"
+
+// hasReactionField reports whether the field map carries a
+// FIELD_REACTION (0x40), tolerating whatever integer type the msgpack
+// decoder produced for the key.
+func hasReactionField(fields map[any]any) bool {
+	for k := range fields {
+		if ki, ok := keyAsInt(k); ok && ki == fieldReaction {
+			return true
+		}
+	}
+	return false
+}
+
+// stampReactorIdentity adds the originator-identity custom fields
+// (FIELD_CUSTOM_TYPE 0xFB = "originator-identity", FIELD_CUSTOM_DATA
+// 0xFC = the reactor's raw 16-byte RNS identity hash) to a relayed
+// reaction's field map, so cooperating clients attribute the reaction to
+// the original reactor rather than the relay's source_hash.
+//
+// identityHash MUST be the reactor's RNS identity hash
+// (SHA-256(public_key)[:16]), NOT their lxmf delivery destination hash —
+// clients aggregate reactions by identity hash.
+//
+// No-op (returns false) when the map carries no reaction or identityHash
+// is missing/empty. Reactions only: replies/comments/continuations carry
+// a body whose author rides the relay's "[nick]" prefix, so they need no
+// stamp.
+func stampReactorIdentity(fields map[any]any, identityHash []byte) bool {
+	if fields == nil || len(identityHash) == 0 || !hasReactionField(fields) {
+		return false
+	}
+	fields[fieldCustomType] = originatorIdentityType
+	fields[fieldCustomData] = identityHash
+	return true
+}
 
 // viewer is the part of idmap.Bubble the substitute helpers depend on:
 // "what message_id will this recipient compute for the targeted

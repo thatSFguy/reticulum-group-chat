@@ -48,6 +48,95 @@ func TestSignParseVerifyRoundTrip(t *testing.T) {
 	}
 }
 
+// TestParseDecodesNestedIntKeyedReactionFields is the regression guard
+// for the dropped-reaction bug: a FIELD_REACTION (0x40) carries a nested
+// integer-keyed dict {0x00: raw msgid, 0x01: emoji}. The default msgpack
+// interface-map decoder decodes nested map values as map[string]any and
+// chokes on the integer keys ("invalid code=0 decoding string/bytes
+// length"), dropping the whole message before it reaches the relay. This
+// round-trips the exact wire shape a client emits and asserts the inner
+// dict survives parse with its integer keys intact.
+func TestParseDecodesNestedIntKeyedReactionFields(t *testing.T) {
+	sender, _ := rns.NewIdentity()
+	recipient, _ := rns.NewIdentity()
+	senderDest := sender.DestinationHashFor(FullName())
+	recipientDest := recipient.DestinationHashFor(FullName())
+
+	target := bytes.Repeat([]byte{0xAB}, 32)
+	fields := map[any]any{
+		0x40: map[any]any{ // FIELD_REACTION
+			0x00: target,        // REACTION_TO (raw 32B)
+			0x01: []byte("👍"), // REACTION_CONTENT
+		},
+	}
+
+	// Reactions carry empty content; the field map is the payload.
+	body, _, err := SignAndPackOpportunistic(sender, senderDest, recipientDest, nil, nil, fields)
+	if err != nil {
+		t.Fatalf("SignAndPackOpportunistic: %v", err)
+	}
+
+	m, err := ParseOpportunisticBody(body, recipientDest)
+	if err != nil {
+		t.Fatalf("ParseOpportunisticBody (this failed before the fix): %v", err)
+	}
+
+	// Keys may decode as int8/int64/etc depending on value; look them up
+	// tolerantly, exactly as the relay does via keyAsInt.
+	reactV, ok := fieldByInt(m.Fields, 0x40)
+	if !ok {
+		t.Fatalf("fields has no 0x40; full fields=%#v", m.Fields)
+	}
+	react, ok := reactV.(map[any]any)
+	if !ok {
+		t.Fatalf("fields[0x40] = %T, want map[any]any", reactV)
+	}
+	to, _ := fieldByInt(react, 0x00)
+	if got, _ := to.([]byte); !bytes.Equal(got, target) {
+		t.Errorf("REACTION_TO = %x, want %x", got, target)
+	}
+	content, _ := fieldByInt(react, 0x01)
+	if c, _ := content.([]byte); string(c) != "👍" {
+		t.Errorf("REACTION_CONTENT = %q, want 👍", c)
+	}
+}
+
+// fieldByInt looks up a map[any]any entry by integer value, tolerating
+// whatever integer width the msgpack decoder produced for the key.
+func fieldByInt(m map[any]any, want int) (any, bool) {
+	for k, v := range m {
+		var got int
+		switch n := k.(type) {
+		case int:
+			got = n
+		case int8:
+			got = int(n)
+		case int16:
+			got = int(n)
+		case int32:
+			got = int(n)
+		case int64:
+			got = int(n)
+		case uint:
+			got = int(n)
+		case uint8:
+			got = int(n)
+		case uint16:
+			got = int(n)
+		case uint32:
+			got = int(n)
+		case uint64:
+			got = int(n)
+		default:
+			continue
+		}
+		if got == want {
+			return v, true
+		}
+	}
+	return nil, false
+}
+
 func TestVerifyRejectsTamperedContent(t *testing.T) {
 	sender, _ := rns.NewIdentity()
 	recipient, _ := rns.NewIdentity()
