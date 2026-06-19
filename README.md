@@ -38,9 +38,10 @@ binary on a Pi.
 6. [Deployment recipes](#deployment-recipes)
 7. [Operations](#operations)
 8. [Wire-format support](#wire-format-support)
-9. [Limitations](#limitations)
-10. [Build from source](#build-from-source)
-11. [Project info](#project-info)
+9. [Reactions: what a client must implement](#reactions-what-a-client-must-implement)
+10. [Limitations](#limitations)
+11. [Build from source](#build-from-source)
+12. [Project info](#project-info)
 
 ---
 
@@ -676,6 +677,58 @@ Delivery-path selection is automatic: ≤ ~280 bytes is opportunistic,
 DATA, anything bigger is Resource transfer over that same Link. So
 long `/users` replies on a big roster ship the full list — size is
 not a delivery constraint.
+
+---
+
+## Reactions: what a client must implement
+
+Reactions ride on `FIELD_REACTION` (`0x40`, LXMF 1.0.0). Because `fwdsvc`
+re-originates every message (re-signs it as the service), a client needs
+the four things below for reactions to work *through the relay*. Full
+wire detail, rationale, and the cross-client convention are in
+[`docs/reaction-attribution.md`](docs/reaction-attribution.md) — written
+so Sideband / MeshChatX / Columba / ratspeak (or any LXMF client) can
+implement against it.
+
+1. **Decode nested integer-keyed field maps.** A reaction's fields are
+   `{0x40: {0x00: <raw 32-byte target message_id>, 0x01: <UTF-8 content>}}`
+   — the inner dict has **integer** keys. Many msgpack libraries decode
+   a nested map *value* into a string-keyed map and reject integer keys;
+   Go's `vmihailenco/msgpack` fails with `invalid code=0 decoding
+   string/bytes length` and **drops the entire message**. Decode into an
+   untyped / any-keyed map at *every* nesting level (Go:
+   `Decoder.SetMapDecoder(func(d){ return d.DecodeUntypedMap() })`), and
+   tolerate any integer key width (`int8`/`int64`/…) and `bytes`-or-`str`
+   values. The same applies to `FIELD_COMMENT` (`0x41`) and
+   `FIELD_CONTINUATION` (`0x42`). **This is the #1 cause of "reactions
+   silently don't work"** — the tell is that replies (`0x30`, raw bytes
+   at the top level) work but reactions vanish, and over a Link the
+   sender retries forever (it never gets a delivery proof).
+
+2. **Emit reactions on `0x40`** with empty `content`/`title`: `0x00` =
+   the raw 32-byte `message_id` of the target *as your client received
+   it*, `0x01` = the reaction text (e.g. an emoji). Do **not** use the
+   pre-1.0.0 `fields[16]` shape — `fwdsvc` no longer accepts it.
+
+3. **Send the reaction to the relay.** No special routing needed: the
+   relayed message's `source_hash` *is* the relay (we re-sign), so a
+   reaction addressed to the message you're reacting to naturally goes
+   back to the relay for fan-out.
+
+4. **Attribute by the originator stamp.** So reactions aren't all
+   attributed to the relay, `fwdsvc` stamps the reactor's identity into
+   custom fields. When a received reaction carries
+   `fields[0xFB] == "originator-identity"` (exact UTF-8) and
+   `fields[0xFC]` (raw **16-byte RNS identity hash** =
+   `SHA-256(public_key)[:16]` — *not* a destination hash), attribute /
+   aggregate by that identity instead of the carrying `source_hash`;
+   fall back to `source_hash` when the stamp is absent. Aggregate by
+   `(reactor-identity, reaction-content)`.
+
+Target binding "just works": the relay rewrites the reaction's target
+`message_id` per recipient (each member computed a different id for the
+same bubble), so you react with the id your client holds and it lands on
+the right message everywhere.
 
 ---
 
