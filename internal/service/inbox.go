@@ -46,6 +46,16 @@ func (s *Service) onLXMFReceived(msg *lxmf.Message) {
 		s.logger.Printf("new sender contact: full dest_hash = %s", senderHex)
 	}
 
+	// Any inbound traffic from a member — a command, an over-limit
+	// message, or a message from a paused member — counts as activity so
+	// Prune doesn't sweep a demonstrably present user. Most of those
+	// paths return before the forward step below, so the refresh has to
+	// happen up here. No-op for non-members (they must /join before
+	// anything counts).
+	if _, err := s.roster.Touch(senderBytes, now); err != nil {
+		s.logger.Printf("roster touch: %v", err)
+	}
+
 	content := strings.TrimRight(string(msg.Content), "\r\n")
 
 	// Commands route to the dispatcher regardless of membership state —
@@ -86,12 +96,9 @@ func (s *Service) onLXMFReceived(msg *lxmf.Message) {
 		return
 	}
 
-	// Refresh last_message_at so prune doesn't sweep an active member.
-	if _, err := s.roster.AddOrUpdate(senderBytes, now); err != nil {
-		s.logger.Printf("roster update: %v", err)
-		return
-	}
-
+	// last_message_at was already refreshed by the Touch above (which
+	// runs for every member, paused or not), so the forward path doesn't
+	// need to re-update the roster here.
 	senderUser, _ := s.roster.Get(senderHex)
 	senderNick := senderUser.Nickname
 	if senderNick == "" {
