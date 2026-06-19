@@ -87,6 +87,67 @@ func TestPruneRespectsAnnounceFreshness(t *testing.T) {
 	}
 }
 
+func TestLastSeenFloorsOnJoinedAt(t *testing.T) {
+	joined := time.Date(2026, 5, 1, 0, 0, 0, 0, time.UTC)
+
+	// Only JoinedAt set (e.g. a fresh join, or a user loaded from a state
+	// file predating the last_*_at fields) — LastSeen falls back to it.
+	u := User{JoinedAt: joined}
+	if !u.LastSeen().Equal(joined) {
+		t.Errorf("LastSeen with only JoinedAt = %v, want %v", u.LastSeen(), joined)
+	}
+
+	// A later message beats the join floor.
+	msg := joined.Add(time.Hour)
+	u.LastMessageAt = msg
+	if !u.LastSeen().Equal(msg) {
+		t.Errorf("LastSeen = %v, want last message %v", u.LastSeen(), msg)
+	}
+
+	// A later announce beats both.
+	ann := msg.Add(time.Hour)
+	u.LastAnnounceAt = ann
+	if !u.LastSeen().Equal(ann) {
+		t.Errorf("LastSeen = %v, want last announce %v", u.LastSeen(), ann)
+	}
+}
+
+func TestTouchRefreshesMemberAndIgnoresNonMember(t *testing.T) {
+	r, _ := newTestRoster(t)
+	t0 := time.Date(2026, 5, 5, 12, 0, 0, 0, time.UTC)
+
+	// Non-member: Touch is a no-op and reports false — it must not
+	// auto-create a user (that's reserved for /join + actual messages).
+	ok, err := r.Touch(mustHash(t, hashA), t0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if ok {
+		t.Error("Touch on a non-member should report false")
+	}
+	if r.Has(mustHash(t, hashA)) {
+		t.Error("Touch must not create a non-member")
+	}
+
+	// Member who joined 5 weeks ago, then touched an hour ago (e.g. via a
+	// command) — the touch must keep them alive past a 4-week prune.
+	_, _ = r.AddOrUpdate(mustHash(t, hashB), t0.Add(-5*7*24*time.Hour))
+	ok, err = r.Touch(mustHash(t, hashB), t0.Add(-1*time.Hour))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !ok {
+		t.Error("Touch on a member should report true")
+	}
+	pruned, err := r.Prune(t0, 4*7*24*time.Hour)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(pruned) != 0 {
+		t.Errorf("a recently-touched member should not be pruned, got %v", pruned)
+	}
+}
+
 func TestUpdateLastAnnounceDoesNotAutoJoin(t *testing.T) {
 	r, _ := newTestRoster(t)
 	t0 := time.Date(2026, 5, 5, 12, 0, 0, 0, time.UTC)

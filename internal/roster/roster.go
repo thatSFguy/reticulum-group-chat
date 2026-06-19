@@ -30,11 +30,23 @@ type User struct {
 	TextOnly bool `json:"text_only,omitempty"`
 }
 
+// LastSeen reports the most recent moment we have evidence the user was
+// present: the latest of their join, last message, and last announce.
+//
+// JoinedAt is a floor so a member who just joined (or one loaded from a
+// state file predating the last_message_at/last_announce_at fields) is
+// never swept by Prune before they've had a chance to send a message or
+// announce — without it those users would carry a zero LastSeen and be
+// pruned on the first tick.
 func (u User) LastSeen() time.Time {
-	if u.LastAnnounceAt.After(u.LastMessageAt) {
-		return u.LastAnnounceAt
+	last := u.JoinedAt
+	if u.LastMessageAt.After(last) {
+		last = u.LastMessageAt
 	}
-	return u.LastMessageAt
+	if u.LastAnnounceAt.After(last) {
+		last = u.LastAnnounceAt
+	}
+	return last
 }
 
 type Roster struct {
@@ -88,6 +100,27 @@ func (r *Roster) AddOrUpdate(hashBytes []byte, now time.Time) (bool, error) {
 	}
 	u.LastMessageAt = now
 	return !exists, r.persistLocked()
+}
+
+// Touch refreshes last_message_at for an existing member so Prune
+// counts them as active. Unlike AddOrUpdate it never creates a user —
+// it's a no-op for non-members (returns false). Used for any inbound
+// traffic from a member that isn't itself a forwardable message
+// (commands, and messages from paused members), so a demonstrably
+// present user isn't swept for inactivity.
+func (r *Roster) Touch(hashBytes []byte, now time.Time) (bool, error) {
+	h, err := normalizeHash(hashBytes)
+	if err != nil {
+		return false, err
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	u, ok := r.users[h]
+	if !ok {
+		return false, nil
+	}
+	u.LastMessageAt = now
+	return true, r.persistLocked()
 }
 
 // UpdateLastAnnounce only refreshes existing users; announces from
