@@ -203,7 +203,7 @@ Open `~/.fwdsvc/config.toml` and edit:
 First lines on stdout:
 
 ```
-fwdsvc 1.3.6 starting (linux/amd64)
+fwdsvc 1.10.2 starting (linux/amd64)
 fwdsvc 2026/05/11 16:00:00 interface tcp_client connected: rns.chicagonomad.net:4242
 fwdsvc 2026/05/11 16:00:00 service identity hash: 359fc3967f984a529874d0960c6ee782
 fwdsvc 2026/05/11 16:00:00 delivery destination : 4c87fb86ccfdff39a3d1e22060ba1789
