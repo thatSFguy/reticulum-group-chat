@@ -392,6 +392,22 @@ func TestResourceAdvRejectsHashmapNotMultipleOfMapHash(t *testing.T) {
 	}
 }
 
+// TestParseResourceAdvRejectsMetadataFlag guards the SPEC §10.2.1 metadata
+// (x=1) reject: fwdsvc doesn't strip the `uint24-len ‖ msgpack` metadata
+// prefix, so accepting x=1 would feed it to the LXMF parser as body. Reject
+// up front rather than silently mis-deliver.
+func TestParseResourceAdvRejectsMetadataFlag(t *testing.T) {
+	adv := minimalValidAdv(t)
+	adv.Flags |= int(ResourceFlagHasMetadata) // x=1
+	body, err := msgpackMarshalAdvForTest(adv) // bypass sender-side validation
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := ParseResourceAdv(body); !errors.Is(err, ErrResourceADVMalformed) {
+		t.Errorf("x=1 ADV: got err=%v, want wrap of ErrResourceADVMalformed", err)
+	}
+}
+
 // --- helpers ---------------------------------------------------------
 
 func minimalValidAdv(t *testing.T) *ResourceAdvertisement {

@@ -716,14 +716,17 @@ implement against it.
    back to the relay for fan-out.
 
 4. **Attribute by the originator stamp.** So reactions aren't all
-   attributed to the relay, `fwdsvc` stamps the reactor's identity into
-   custom fields. When a received reaction carries
+   attributed to the relay, `fwdsvc` stamps the reactor's `source_hash`
+   into custom fields. When a received reaction carries
    `fields[0xFB] == "originator-identity"` (exact UTF-8) and
-   `fields[0xFC]` (raw **16-byte RNS identity hash** =
-   `SHA-256(public_key)[:16]` — *not* a destination hash), attribute /
-   aggregate by that identity instead of the carrying `source_hash`;
-   fall back to `source_hash` when the stamp is absent. Aggregate by
-   `(reactor-identity, reaction-content)`.
+   `fields[0xFC]` (the reactor's raw **16-byte `source_hash`** — its
+   `lxmf.delivery` destination hash, the same value a direct reaction
+   carries and what contacts are keyed by, per SPEC §5.9.8 / §9.1; **not**
+   the identity hash, which would orphan the lookup), attribute /
+   aggregate by that hash instead of the carrying `source_hash`; fall
+   back to `source_hash` when the stamp is absent. Aggregate by
+   `(reactor-identity, reaction-content)`. Full convention:
+   [`docs/reaction-attribution.md`](docs/reaction-attribution.md).
 
 Target binding "just works": the relay rewrites the reaction's target
 `message_id` per recipient (each member computed a different id for the
@@ -773,10 +776,11 @@ LXMF to run a group-chat hub. Notable gaps:
 - **Reaction attribution.** Because the relay re-signs each reaction as
   itself, a reaction's `source_hash` becomes fwdsvc — and a reaction
   has no body to carry a `[Nick]` prefix, so naive relaying collapses
-  every reaction onto the service identity. fwdsvc stamps the original
-  reactor's RNS identity hash into the upstream custom fields
+  every reaction onto the service. fwdsvc stamps the original reactor's
+  `source_hash` (its destination hash, what contacts are keyed by — SPEC
+  §9.1) into the upstream custom fields
   (`FIELD_CUSTOM_TYPE 0xFB = "originator-identity"`, `FIELD_CUSTOM_DATA
-  0xFC = SHA-256(pubkey)[:16]`) so cooperating clients attribute the
+  0xFC = reactor source_hash`) so cooperating clients attribute the
   reaction to the reactor, not the relay. The `0x40` wire format is
   untouched and the stamp is purely additive (spec-only clients ignore
   it). This is an app-layer interop convention documented for other

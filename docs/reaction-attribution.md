@@ -44,13 +44,13 @@ out-of-band.)
 ## The convention
 
 On **every re-originated reaction**, the relay stamps the original
-reactor's **RNS identity hash** into the upstream app-convention custom
+reactor's **`source_hash`** into the upstream app-convention custom
 fields (`SPEC.md` §5.9.1; `FIELD_CUSTOM_TYPE`/`FIELD_CUSTOM_DATA` in
 `LXMF/LXMF.py`):
 
 ```
 fields[0xFB]  FIELD_CUSTOM_TYPE  = "originator-identity"   # UTF-8 string, EXACT
-fields[0xFC]  FIELD_CUSTOM_DATA  = <reactor identity hash, raw 16 bytes>
+fields[0xFC]  FIELD_CUSTOM_DATA  = <reactor source_hash, raw 16 bytes>
 ```
 
 Full field map of a re-originated reaction:
@@ -59,7 +59,7 @@ Full field map of a re-originated reaction:
 {
   0x40: { 0x00: <32B target message_id>, 0x01: <emoji> },
   0xFB: "originator-identity",
-  0xFC: <16B reactor identity hash>,
+  0xFC: <16B reactor source_hash>,
 }
 # carrying LXMF: empty content, empty title, source_hash = relay
 ```
@@ -69,20 +69,23 @@ Full field map of a re-originated reaction:
 1. **`fields[0xFB]` MUST be the exact UTF-8 string `originator-identity`.**
    A receiver that doesn't match it byte-for-byte MUST fall back to
    source-based attribution (i.e. it will mis-attribute to the relay —
-   the unfixed behaviour). There is no versioning or fuzzy match.
+   the unfixed behaviour). There is no versioning or fuzzy match. (The
+   tag string keeps this exact wording for wire compatibility even though
+   the value it labels is a source_hash, not an identity hash.)
 
-2. **`fields[0xFC]` is the reactor's RNS _identity hash_, raw 16 bytes** —
-   `SHA-256(public_key)[:16]`, where `public_key` is the 64-byte
-   announced key (X25519 pub ‖ Ed25519 pub).
-   - ⚠️ **It is the identity hash, NOT the `lxmf.delivery` destination
-     hash.** Destination hash = `SHA-256(name_hash ‖ identity_hash)[:16]`
-     — a *different* value. Clients aggregate reactions by identity, so
-     stamping the destination hash mis-attributes exactly as
-     `source_hash` does. This is the same dest-vs-identity gotcha that
-     bites `source_hash`.
-   - The relay already holds the reactor's public key — it verified the
-     inbound reaction's signature with it — and derives the identity
-     hash from that.
+2. **`fields[0xFC]` is the reactor's `source_hash`, raw 16 bytes** — i.e.
+   the reactor's **`lxmf.delivery` destination hash**
+   (`SHA-256(name_hash ‖ identity_hash)[:16]`), which is exactly the
+   value a *direct* reaction carries in its LXMF `source_hash`. The relay
+   just copies the inbound reaction's `source_hash` here.
+   - ⚠️ **It is the destination hash, NOT the raw RNS identity hash**
+     (`SHA-256(public_key)[:16]`). Per `SPEC.md` §5.9.8, reaction
+     attribution rides on `source_hash`; per §9.1, an LXMF `source_hash`
+     is the **destination** hash and receivers key their contacts by it —
+     *"sending the identity hash here means the recipient can't look you
+     up in their contacts … and the conversation gets orphaned."* Using
+     the destination hash keeps direct and relayed reactions one
+     consistent key that resolves to a contact.
 
 3. **Reactions only.** Only stamp messages whose fields contain `0x40`.
    Replies (`0x30`/`0x31`), comments (`0x41`), and continuations
@@ -92,24 +95,28 @@ Full field map of a re-originated reaction:
 ### Sender (relay) behaviour
 
 - For each re-originated reaction, set `0xFB`/`0xFC` as above before
-  fan-out, deriving `0xFC` from the **verified** inbound signing
-  identity (never from a client-supplied field — see Security).
+  fan-out, copying `0xFC` from the **verified** inbound reaction's
+  `source_hash` (never from a client-supplied field — see Security).
 
 ### Receiver (client) behaviour
 
 When you receive a reaction (`fields[0x40]` present):
 
 - If `fields[0xFB] == "originator-identity"` and `fields[0xFC]` is
-  present, **attribute/aggregate the reaction to the identity hash in
-  `0xFC`**, not to the carrying message's `source_hash`.
+  present, **attribute/aggregate the reaction to the `source_hash` in
+  `0xFC`**, not to the carrying message's `source_hash`. The `0xFC` value
+  is in the same hash space as a direct reaction's `source_hash`, so it
+  resolves against your contacts (keyed by destination hash, §9.1) with
+  no special handling.
 - Otherwise, attribute by `source_hash` as today.
 
 Aggregate by `(reactor-identity, REACTION_CONTENT)` per §5.9.8, where
-`reactor-identity` is the `0xFC` hash when present.
+`reactor-identity` is the `0xFC` `source_hash` when present, else the
+carrying message's `source_hash`.
 
 ## Security
 
-The relay MUST set `0xFC` from the identity it cryptographically
+The relay MUST set `0xFC` from the `source_hash` it cryptographically
 verified on the inbound reaction, and MUST ignore any `0xFB`/`0xFC` a
 client included on the inbound message (fwdsvc does this by keeping
 `0xFB`/`0xFC`/`0xFD` out of its forward allowlist, so client-supplied
@@ -126,9 +133,13 @@ client breaks. Cooperating clients gain correct per-reactor attribution.
 
 `FIELD_REACTION` (`0x40`), `FIELD_COMMENT` (`0x41`), and
 `FIELD_CONTINUATION` (`0x42`) all carry a **nested map with integer
-keys** (`0x00`, `0x01`). This trips a common msgpack-library default:
-when decoding a map *value* into a generic type, many libraries produce
-a **string-keyed** map and choke on the integer keys.
+keys** (`0x00`, `0x01`). `SPEC.md` §5.9.8 makes this a normative receiver
+requirement ("Inner-map decode tolerance … Receivers MUST tolerate this
+via a runtime cast that does not depend on the outer map's static key
+type. A silent type-assertion failure produces a no-log no-error drop").
+This trips a common msgpack-library default: when decoding a map *value*
+into a generic type, many libraries produce a **string-keyed** map and
+choke on the integer keys.
 
 - **Go (`vmihailenco/msgpack`):** a nested map value decodes into
   `map[string]interface{}` by default and fails on inner key `0x00` with
@@ -182,5 +193,19 @@ still do.
 fwdsvc stamps this on relay in
 [`internal/service/inbox.go`](../internal/service/inbox.go) /
 [`internal/service/rewrite.go`](../internal/service/rewrite.go)
-(`stampReactorIdentity`), deriving the identity hash via
-`KnownIdentity.IdentityHash()` (`SHA-256(public_key)[:16]`).
+(`stampReactorIdentity`), copying `0xFC` straight from the inbound
+reaction's verified `source_hash` (`msg.SourceHash`).
+
+## Spec basis
+
+| Concern | Spec |
+|---|---|
+| `FIELD_REACTION 0x40` shape (`REACTION_TO` raw bytes, `REACTION_CONTENT` UTF-8), bytes/str + inner-map decode tolerance, attribution rides on `source_hash` | `SPEC.md` §5.9.8 |
+| `FIELD_CUSTOM_TYPE 0xFB` / `FIELD_CUSTOM_DATA 0xFC` (app-defined type + opaque data) | §5.9.1 |
+| `source_hash` is the destination hash, contacts keyed by it (why `0xFC` is the destination hash, not the identity hash) | §9.1 |
+| Reply-to `0x30` / `0x31` (untouched) | §5.9.9 |
+| `message_id` over raw wire bytes (target resolution) | §5.5 / §5.7 |
+
+The `"originator-identity"` stamp convention itself is **not** part of
+`SPEC.md` — it is an app-layer interop convention built on those
+spec-defined primitives, kept out of the spec by design.

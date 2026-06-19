@@ -184,5 +184,15 @@ func ParseResourceAdv(body []byte) (*ResourceAdvertisement, error) {
 		return nil, fmt.Errorf("%w: compressed (c=1) resources rejected — fwdsvc has no use case + bz2 decompression-bomb risk",
 			ErrResourceTooLarge)
 	}
+	// Reject metadata-bearing resources (x=1, SPEC §10.2.1). fwdsvc never
+	// sets x, and it does NOT strip the leading `uint24-len ‖ msgpack`
+	// metadata prefix on receive — accepting x=1 would hand that prefix to
+	// the LXMF parser as if it were body content (the §10.8 hash still
+	// passes, since it covers plaintext-including-metadata), silently
+	// corrupting the parse. Reject up front rather than mis-deliver.
+	if adv.Flags&int(ResourceFlagHasMetadata) != 0 {
+		return nil, fmt.Errorf("%w: metadata (x=1) resources rejected — fwdsvc does not strip the §10.2.1 metadata prefix",
+			ErrResourceADVMalformed)
+	}
 	return &adv, nil
 }

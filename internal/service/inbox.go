@@ -178,28 +178,24 @@ func (s *Service) onLXMFReceived(msg *lxmf.Message) {
 		}
 	}
 
-	// Stamp the original reactor's identity onto relayed reactions. A
-	// reaction has no body to carry the "[nick]" prefix, and per SPEC
-	// §5.9.8 attribution is the carrying LXMF's source identity — which,
-	// after we re-sign and re-emit, is fwdsvc. Without this stamp every
-	// relayed reaction collapses onto the service identity. The
-	// originator-identity custom fields (0xFB/0xFC) let cooperating
-	// clients attribute it to the reactor instead. Reactions only;
-	// replies/comments/continuations carry a body and need no stamp.
+	// Stamp the original reactor onto relayed reactions. A reaction has no
+	// body to carry the "[nick]" prefix, and per SPEC §5.9.8 attribution
+	// rides on the carrying LXMF's source_hash — which, after we re-sign
+	// and re-emit, is fwdsvc. Without this stamp every relayed reaction
+	// collapses onto the service. The originator-identity custom fields
+	// (0xFB/0xFC) carry the reactor's own source_hash (= its lxmf.delivery
+	// destination hash, the value receivers key contacts by per SPEC §9.1),
+	// so cooperating clients attribute it to the reactor — the same value a
+	// direct reaction would carry. senderBytes IS that source_hash.
+	// Reactions only; replies/comments/continuations carry a body.
 	//
 	// Done here (after the isPrimaryBubble check, before fan-out) on
-	// purpose: the custom-field keys aren't reaction markers, so
-	// stamping earlier would make isPrimaryBubble treat an empty-content
-	// reaction as a reactable bubble. The per-recipient rewrite closure
-	// clones these fields through unchanged.
-	if hasReactionField(fwdFields) {
-		if idh := s.reactorIdentityHash(senderBytes); stampReactorIdentity(fwdFields, idh) {
-			s.logger.Printf("reaction relay: stamped originator-identity=%s for %s",
-				hex.EncodeToString(idh), senderHex[:8])
-		} else {
-			s.logger.Printf("reaction relay: no recalled identity for %s — attribution falls back to source",
-				senderHex[:8])
-		}
+	// purpose: the custom-field keys aren't reaction markers, so stamping
+	// earlier would make isPrimaryBubble treat an empty-content reaction as
+	// a reactable bubble. The per-recipient rewrite closure clones these
+	// fields through unchanged.
+	if stampReactorIdentity(fwdFields, senderBytes) {
+		s.logger.Printf("reaction relay: stamped originator source_hash=%s", senderHex)
 	}
 
 	// Delivery.Send routes opportunistic vs link automatically based on

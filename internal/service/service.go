@@ -332,21 +332,6 @@ func (s *Service) announceNow() error {
 	return s.transport.Broadcast(pkt)
 }
 
-// reactorIdentityHash returns the RNS identity hash (SHA-256(pubkey)[:16])
-// of the peer behind sourceHash (an lxmf delivery destination hash), or
-// nil if we have no recalled announce for them. Used to stamp reactor
-// attribution onto relayed reactions. The inbound reaction was
-// signature-verified against this peer's public key upstream, so the
-// announce is present in the normal path; nil only on the degenerate
-// race where the announce expired between verify and forward.
-func (s *Service) reactorIdentityHash(sourceHash []byte) []byte {
-	known := s.transport.Recall(sourceHash)
-	if known == nil {
-		return nil
-	}
-	return known.IdentityHash()
-}
-
 func (s *Service) runPrune(now time.Time) {
 	pruned, err := s.roster.Prune(now, s.cfg.Service.PruneAfter.Std())
 	if err != nil {

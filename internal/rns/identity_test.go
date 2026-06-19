@@ -26,15 +26,6 @@ func TestIdentityHashFromPublicKey(t *testing.T) {
 	if IdentityHashFromPublicKey(pub[:10]) != nil {
 		t.Error("short public key should return nil")
 	}
-	// KnownIdentity.IdentityHash mirrors the free function and is
-	// distinct from the destination hash.
-	k := &KnownIdentity{PublicKey: pub, DestHash: bytes.Repeat([]byte{0x99}, IdentityHashLen)}
-	if !bytes.Equal(k.IdentityHash(), want) {
-		t.Errorf("KnownIdentity.IdentityHash = %x, want %x", k.IdentityHash(), want)
-	}
-	if bytes.Equal(k.IdentityHash(), k.DestHash) {
-		t.Error("identity hash must not equal destination hash (the gotcha this guards)")
-	}
 }
 
 // testVectorsPath points at the spec repo's identities.json. The repo is a

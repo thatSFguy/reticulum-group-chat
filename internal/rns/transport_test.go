@@ -3,6 +3,7 @@ package rns
 import (
 	"bytes"
 	"context"
+	"encoding/hex"
 	"sync"
 	"testing"
 	"time"
@@ -102,6 +103,31 @@ func TestTransportDispatchesVerifiedAnnounceToHandlers(t *testing.T) {
 	}
 	if !bytes.Equal(known.PublicKey, id.PublicKey()) {
 		t.Errorf("known.PublicKey mismatch")
+	}
+}
+
+// TestAnnounceRejectsPublicKeyCollision covers SPEC §4.5 step 4
+// (first-announcer-wins): an announce for a dest_hash already bound to a
+// DIFFERENT public key is rejected. A verifiable announce can never produce
+// this (dest_hash is bound to the key), so we pre-seed a bogus key under the
+// real announce's dest_hash and confirm the genuine announce doesn't
+// overwrite it.
+func TestAnnounceRejectsPublicKeyCollision(t *testing.T) {
+	tr := NewTransport(nil)
+	id, _ := NewIdentity()
+	pkt, _ := BuildAnnounce(id, FullName("lxmf", "delivery"), nil, nil)
+	dest := id.DestinationHashFor(FullName("lxmf", "delivery"))
+
+	other := bytes.Repeat([]byte{0x42}, PublicKeyLen)
+	tr.mu.Lock()
+	tr.known[hex.EncodeToString(dest)] = &KnownIdentity{DestHash: dest, PublicKey: other}
+	tr.mu.Unlock()
+
+	tr.handleAnnounce(pkt) // genuine, verifiable — but a colliding key is cached
+
+	got := tr.Recall(dest)
+	if got == nil || !bytes.Equal(got.PublicKey, other) {
+		t.Fatalf("collision announce was not rejected: cached key changed")
 	}
 }
 

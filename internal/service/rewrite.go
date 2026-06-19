@@ -50,11 +50,14 @@ const (
 )
 
 // originatorIdentityType is the exact FIELD_CUSTOM_TYPE tag cooperating
-// clients match to read the original reactor's identity hash from
+// clients match to read the original reactor's source_hash from
 // FIELD_CUSTOM_DATA. It MUST be byte-exact: a client that doesn't match
 // it silently falls back to source-based attribution — which, for a
 // relayed reaction, means attributing it to fwdsvc instead of the
 // reactor. Documented for other clients in docs/reaction-attribution.md.
+//
+// (The tag string keeps its original wording for wire compatibility; the
+// value it labels is the reactor's source_hash, see stampReactorIdentity.)
 const originatorIdentityType = "originator-identity"
 
 // hasReactionField reports whether the field map carries a
@@ -71,24 +74,27 @@ func hasReactionField(fields map[any]any) bool {
 
 // stampReactorIdentity adds the originator-identity custom fields
 // (FIELD_CUSTOM_TYPE 0xFB = "originator-identity", FIELD_CUSTOM_DATA
-// 0xFC = the reactor's raw 16-byte RNS identity hash) to a relayed
-// reaction's field map, so cooperating clients attribute the reaction to
-// the original reactor rather than the relay's source_hash.
+// 0xFC = the reactor's raw 16-byte source_hash) to a relayed reaction's
+// field map, so cooperating clients attribute the reaction to the
+// original reactor rather than the relay's source_hash.
 //
-// identityHash MUST be the reactor's RNS identity hash
-// (SHA-256(public_key)[:16]), NOT their lxmf delivery destination hash —
-// clients aggregate reactions by identity hash.
+// reactorHash MUST be the reactor's source_hash — i.e. their
+// lxmf.delivery DESTINATION hash, the same value a direct reaction would
+// carry in its LXMF source_hash and the value receivers key contacts by
+// (SPEC §5.9.8 attribution + §9.1; NOT the raw identity hash, which would
+// orphan the contact lookup). The inbound reaction's source_hash is
+// exactly this, so the caller passes it straight through.
 //
-// No-op (returns false) when the map carries no reaction or identityHash
+// No-op (returns false) when the map carries no reaction or reactorHash
 // is missing/empty. Reactions only: replies/comments/continuations carry
 // a body whose author rides the relay's "[nick]" prefix, so they need no
 // stamp.
-func stampReactorIdentity(fields map[any]any, identityHash []byte) bool {
-	if fields == nil || len(identityHash) == 0 || !hasReactionField(fields) {
+func stampReactorIdentity(fields map[any]any, reactorHash []byte) bool {
+	if fields == nil || len(reactorHash) == 0 || !hasReactionField(fields) {
 		return false
 	}
 	fields[fieldCustomType] = originatorIdentityType
-	fields[fieldCustomData] = identityHash
+	fields[fieldCustomData] = reactorHash
 	return true
 }
 
@@ -187,7 +193,7 @@ func (s *Service) buildRewrite(fields map[any]any) func(recipientHex string, fie
 				dicts = append(dicts, dictTarget{key: ki, bubble: b})
 			}
 		case fieldReplyTo:
-			raw, ok := v.([]byte)
+			raw, ok := asHashBytes(v)
 			if !ok {
 				continue
 			}
@@ -275,11 +281,49 @@ func extractDictTarget(v any) string {
 		if ki, ok := keyAsInt(mk); !ok || ki != targetIdx {
 			continue
 		}
-		if b, ok := mv.([]byte); ok {
+		if b, ok := asHashBytes(mv); ok {
 			return hex.EncodeToString(b)
 		}
 	}
 	return ""
+}
+
+// asHashBytes coerces a msgpack field value that carries a raw hash into
+// bytes, tolerating both the bin form ([]byte) and the str form. SPEC
+// §5.9.8 (reactions) and §5.9.9 (reply-to) require receivers to accept
+// both — the §5.6 str/bin precedent — including the case where "an
+// encoder ships the hash hex-encoded by mistake": a 32-byte message_id
+// hex-encodes to 64 chars, so an all-hex 64-char string is decoded from
+// hex; any other string is taken as the raw bytes it carries. Returns
+// false for values that are neither bytes nor str.
+func asHashBytes(v any) ([]byte, bool) {
+	switch t := v.(type) {
+	case []byte:
+		return t, true
+	case string:
+		if len(t) == 64 && isHexString(t) {
+			if b, err := hex.DecodeString(t); err == nil {
+				return b, true
+			}
+		}
+		return []byte(t), true
+	default:
+		return nil, false
+	}
+}
+
+// isHexString reports whether s is non-empty and entirely hex digits.
+func isHexString(s string) bool {
+	if s == "" {
+		return false
+	}
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		if !((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F')) {
+			return false
+		}
+	}
+	return true
 }
 
 // substituteDictTarget rewrites the inner 0x00 target of a reaction/
@@ -341,7 +385,7 @@ func substituteReplyHash(fields map[any]any, recipientHex string, bubble viewer)
 		if !ok || ki != fieldReplyTo {
 			continue
 		}
-		if _, ok := v.([]byte); !ok {
+		if _, ok := asHashBytes(v); !ok {
 			continue
 		}
 		view, ok := bubble.ViewFor(recipientHex)

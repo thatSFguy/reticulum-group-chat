@@ -134,14 +134,6 @@ func (k *KnownIdentity) X25519Public() []byte { return k.PublicKey[:32] }
 // Ed25519Public returns the last 32 bytes of PublicKey.
 func (k *KnownIdentity) Ed25519Public() []byte { return k.PublicKey[32:] }
 
-// IdentityHash returns this peer's RNS identity hash,
-// SHA-256(public_key)[:16] — NOT its destination hash (DestHash). Used
-// to attribute relayed reactions to the original reactor's identity.
-// Returns nil if the cached public key is malformed.
-func (k *KnownIdentity) IdentityHash() []byte {
-	return IdentityHashFromPublicKey(k.PublicKey)
-}
-
 // LocalDestination is a destination we own (typically our LXMF delivery
 // destination). Inbound DATA packets matching DestHash are handed to OnPacket.
 // OnPacket is called from the transport's dispatcher goroutine; if the
@@ -482,6 +474,16 @@ func (t *Transport) handleAnnounce(p *Packet) {
 	// suffices for a leaf forwarder.
 	if prev != nil && bytesEqual(prev.LastRandom, a.RandomHash) {
 		t.mu.Unlock()
+		return
+	}
+	// SPEC §4.5 step 4 — first-announcer-wins. dest_hash is cryptographically
+	// bound to the public key (the §4.5 step 3 recompute is verified before we
+	// get here), so a *different* key cached under the same dest_hash can only
+	// mean a 16-byte SHA-256 collision; reject rather than let a later announce
+	// hijack the destination.
+	if prev != nil && len(prev.PublicKey) > 0 && !bytesEqual(prev.PublicKey, a.PublicKey) {
+		t.mu.Unlock()
+		t.logger.Printf("announce REJECTED: dest=%x already bound to a different public key (first-announcer-wins, SPEC §4.5)", a.DestHash[:4])
 		return
 	}
 	// Snapshot prior-state fields BEFORE we update prev so the post-unlock

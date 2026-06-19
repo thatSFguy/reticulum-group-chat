@@ -91,16 +91,24 @@ func TestExtractDictTarget(t *testing.T) {
 		v    any
 		want string
 	}{
-		"int-keyed raw bytes": {
+		"int-keyed raw bytes (bin)": {
 			v:    map[any]any{targetIdx: raw, 0x01: []byte("👍")},
+			want: hex.EncodeToString(raw),
+		},
+		"str carrier carrying raw bytes (§5.6/§5.9.8 tolerance)": {
+			v:    map[any]any{targetIdx: string(raw)},
+			want: hex.EncodeToString(raw),
+		},
+		"str carrier hex-encoded by mistake (§5.9.9)": {
+			v:    map[any]any{targetIdx: hex.EncodeToString(raw)},
 			want: hex.EncodeToString(raw),
 		},
 		"no target key": {
 			v:    map[any]any{0x01: []byte("👍")},
 			want: "",
 		},
-		"target not bytes (str carrier unsupported → pass-through)": {
-			v:    map[any]any{targetIdx: "not-bytes"},
+		"target neither bytes nor str (number)": {
+			v:    map[any]any{targetIdx: 42},
 			want: "",
 		},
 		"not a dict": {
@@ -116,35 +124,36 @@ func TestExtractDictTarget(t *testing.T) {
 }
 
 func TestStampReactorIdentity(t *testing.T) {
-	idHash := bytes.Repeat([]byte{0xAB}, 16)
+	// The reactor's source_hash (16-byte lxmf.delivery destination hash).
+	reactorHash := bytes.Repeat([]byte{0xAB}, 16)
 
 	// Reaction present → stamps both custom fields.
 	react := map[any]any{
 		fieldReaction: map[any]any{targetIdx: bytes.Repeat([]byte{0x01}, 32), 0x01: []byte("👍")},
 	}
-	if !stampReactorIdentity(react, idHash) {
+	if !stampReactorIdentity(react, reactorHash) {
 		t.Fatal("stampReactorIdentity returned false for a reaction")
 	}
 	if react[fieldCustomType] != originatorIdentityType {
 		t.Errorf("FIELD_CUSTOM_TYPE = %v, want %q", react[fieldCustomType], originatorIdentityType)
 	}
-	if got, _ := react[fieldCustomData].([]byte); !bytes.Equal(got, idHash) {
-		t.Errorf("FIELD_CUSTOM_DATA = %x, want %x", got, idHash)
+	if got, _ := react[fieldCustomData].([]byte); !bytes.Equal(got, reactorHash) {
+		t.Errorf("FIELD_CUSTOM_DATA = %x, want %x", got, reactorHash)
 	}
 
 	// No reaction → no-op (replies/comments carry a body, no stamp).
 	noReact := map[any]any{fieldReplyTo: bytes.Repeat([]byte{0x02}, 32)}
-	if stampReactorIdentity(noReact, idHash) {
+	if stampReactorIdentity(noReact, reactorHash) {
 		t.Error("stampReactorIdentity should be a no-op without a reaction")
 	}
 	if _, ok := noReact[fieldCustomType]; ok {
 		t.Error("non-reaction map must not be stamped")
 	}
 
-	// Missing identity hash → no-op (degrades to source attribution).
+	// Missing reactor hash → no-op (degrades to source attribution).
 	react2 := map[any]any{fieldReaction: map[any]any{targetIdx: bytes.Repeat([]byte{0x03}, 32)}}
 	if stampReactorIdentity(react2, nil) {
-		t.Error("stampReactorIdentity should be a no-op with an empty identity hash")
+		t.Error("stampReactorIdentity should be a no-op with an empty reactor hash")
 	}
 }
 
@@ -152,7 +161,7 @@ func TestStampedReactionSurvivesPerRecipientRewrite(t *testing.T) {
 	const aliceHex = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
 	aliceView := bytes.Repeat([]byte{0xA1}, 32)
 	senderView := bytes.Repeat([]byte{0x77}, 32)
-	idHash := bytes.Repeat([]byte{0xAB}, 16)
+	reactorHash := bytes.Repeat([]byte{0xAB}, 16)
 
 	cache := idmap.New(time.Minute, 0)
 	bubble := idmap.NewBubble(time.Minute, time.Now())
@@ -161,7 +170,7 @@ func TestStampedReactionSurvivesPerRecipientRewrite(t *testing.T) {
 	s := &Service{idmap: cache, logger: log.New(io.Discard, "", 0)}
 
 	in := map[any]any{fieldReaction: map[any]any{targetIdx: senderView, 0x01: []byte("👍")}}
-	stampReactorIdentity(in, idHash)
+	stampReactorIdentity(in, reactorHash)
 
 	rewrite := s.buildRewrite(in)
 	if rewrite == nil {
@@ -179,8 +188,49 @@ func TestStampedReactionSurvivesPerRecipientRewrite(t *testing.T) {
 	if out[fieldCustomType] != originatorIdentityType {
 		t.Errorf("custom type lost in rewrite: %v", out[fieldCustomType])
 	}
-	if got, _ := out[fieldCustomData].([]byte); !bytes.Equal(got, idHash) {
-		t.Errorf("custom data = %x, want %x", got, idHash)
+	if got, _ := out[fieldCustomData].([]byte); !bytes.Equal(got, reactorHash) {
+		t.Errorf("custom data = %x, want %x", got, reactorHash)
+	}
+}
+
+func TestRewriteToleratesStrCarriers(t *testing.T) {
+	const aliceHex = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+	aliceView := bytes.Repeat([]byte{0xA1}, 32)
+	target := bytes.Repeat([]byte{0x77}, 32)
+
+	cache := idmap.New(time.Minute, 0)
+	bubble := idmap.NewBubble(time.Minute, time.Now())
+	cache.RegisterView(bubble, aliceHex, hex.EncodeToString(aliceView))
+	cache.RegisterView(bubble, "reactor", hex.EncodeToString(target))
+	s := &Service{idmap: cache, logger: log.New(io.Discard, "", 0)}
+
+	// SPEC §5.9.8: a reaction's REACTION_TO may arrive as msgpack str
+	// (raw bytes carried as a string); the relay MUST still bind it.
+	react := map[any]any{fieldReaction: map[any]any{targetIdx: string(target), 0x01: []byte("👍")}}
+	rw := s.buildRewrite(react)
+	if rw == nil {
+		t.Fatal("buildRewrite nil for a str-carrier reaction target")
+	}
+	out, ok := rw(aliceHex, react)
+	if !ok {
+		t.Fatal("rewrite(alice) ok=false for str reaction")
+	}
+	if got, _ := out[fieldReaction].(map[any]any)[targetIdx].([]byte); !bytes.Equal(got, aliceView) {
+		t.Errorf("str-carrier REACTION_TO not rewritten: got %x, want %x", got, aliceView)
+	}
+
+	// SPEC §5.9.9: same for FIELD_REPLY_TO (0x30) carried as str.
+	reply := map[any]any{fieldReplyTo: string(target)}
+	rw2 := s.buildRewrite(reply)
+	if rw2 == nil {
+		t.Fatal("buildRewrite nil for a str-carrier reply-to")
+	}
+	rout, ok := rw2(aliceHex, reply)
+	if !ok {
+		t.Fatal("rewrite(alice) ok=false for str reply-to")
+	}
+	if got, _ := rout[fieldReplyTo].([]byte); !bytes.Equal(got, aliceView) {
+		t.Errorf("str-carrier reply-to not rewritten: got %x, want %x", got, aliceView)
 	}
 }
 
