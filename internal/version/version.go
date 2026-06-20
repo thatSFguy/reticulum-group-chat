@@ -11,4 +11,4 @@ const Version = "1.10.2"
 // RepoURL is the canonical source location. Surfaced in /about so users
 // running an unfamiliar deployment can find the project, file issues,
 // and confirm what code their forwarder is actually running.
-const RepoURL = "https://github.com/thatSFguy/reticulum-forwarding-service"
+const RepoURL = "https://github.com/thatSFguy/reticulum-group-chat"

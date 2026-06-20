@@ -8,7 +8,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/thatSFguy/reticulum-forwarding-service/internal/idmap"
+	"github.com/thatSFguy/reticulum-group-chat/internal/idmap"
 )
 
 // fakeBubble implements just the ViewFor lookup the substitute helpers

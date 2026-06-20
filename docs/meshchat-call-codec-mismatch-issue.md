@@ -10,7 +10,7 @@ Submit at: https://github.com/liamcottle/reticulum-meshchat/issues/new
 
 ## Summary
 
-A MeshChat user receives an "incoming call" UI notification attributed to a peer that has only an `lxmf.delivery` destination — no `call.audio` destination at all. The notification fires shortly after the peer's announce reaches the user's MeshChat, presents briefly with a codec-mismatch / failed-call message, and ends. This is reproducible against any text-only LXMF peer; we hit it consistently against [`reticulum-forwarding-service`](https://github.com/thatSFguy/reticulum-forwarding-service) **v1.2.4**, a Go LXMF group-chat relay that registers only `lxmf.delivery` and never opens links to anything other than other peers' `lxmf.delivery` destinations. The fwdsvc side has been exercised end-to-end against an upstream Python RNS/LXMF client (the known-good reference implementation) for every command path.
+A MeshChat user receives an "incoming call" UI notification attributed to a peer that has only an `lxmf.delivery` destination — no `call.audio` destination at all. The notification fires shortly after the peer's announce reaches the user's MeshChat, presents briefly with a codec-mismatch / failed-call message, and ends. This is reproducible against any text-only LXMF peer; we hit it consistently against [`reticulum-group-chat`](https://github.com/thatSFguy/reticulum-group-chat) **v1.2.4**, a Go LXMF group-chat relay that registers only `lxmf.delivery` and never opens links to anything other than other peers' `lxmf.delivery` destinations. The fwdsvc side has been exercised end-to-end against an upstream Python RNS/LXMF client (the known-good reference implementation) for every command path.
 
 ## What we expect
 

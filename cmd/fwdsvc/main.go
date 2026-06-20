@@ -10,9 +10,9 @@ import (
 	"runtime"
 	"syscall"
 
-	"github.com/thatSFguy/reticulum-forwarding-service/internal/config"
-	"github.com/thatSFguy/reticulum-forwarding-service/internal/service"
-	"github.com/thatSFguy/reticulum-forwarding-service/internal/version"
+	"github.com/thatSFguy/reticulum-group-chat/internal/config"
+	"github.com/thatSFguy/reticulum-group-chat/internal/service"
+	"github.com/thatSFguy/reticulum-group-chat/internal/version"
 )
 
 // Version is the human-readable release marker for this build. Sourced

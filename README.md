@@ -1,4 +1,4 @@
-# reticulum-forwarding-service (`fwdsvc`)
+# reticulum-group-chat (`fwdsvc`)
 
 **A Reticulum group chat.** `fwdsvc` is a small daemon that hosts a
 multi-user text chat over the [Reticulum
@@ -159,7 +159,7 @@ messages addressed to a destination hash, deliverable opportunistically
 
 ### 1. Get the binary
 
-[Download the latest release](https://github.com/thatSFguy/reticulum-forwarding-service/releases/latest)
+[Download the latest release](https://github.com/thatSFguy/reticulum-group-chat/releases/latest)
 for your platform:
 
 | Asset | Target |
@@ -179,7 +179,7 @@ Or [build from source](#build-from-source).
 
 ```sh
 mkdir -p ~/.fwdsvc
-curl -L https://raw.githubusercontent.com/thatSFguy/reticulum-forwarding-service/main/configs/fwdsvc.example.toml \
+curl -L https://raw.githubusercontent.com/thatSFguy/reticulum-group-chat/main/configs/fwdsvc.example.toml \
   -o ~/.fwdsvc/config.toml
 ```
 
@@ -809,8 +809,8 @@ LXMF to run a group-chat hub. Notable gaps:
 Requires Go 1.26 or newer.
 
 ```sh
-git clone https://github.com/thatSFguy/reticulum-forwarding-service
-cd reticulum-forwarding-service
+git clone https://github.com/thatSFguy/reticulum-group-chat
+cd reticulum-group-chat
 go mod tidy
 go build -o fwdsvc ./cmd/fwdsvc
 go test ./...

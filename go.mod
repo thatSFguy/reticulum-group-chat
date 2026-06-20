@@ -1,4 +1,4 @@
-module github.com/thatSFguy/reticulum-forwarding-service
+module github.com/thatSFguy/reticulum-group-chat
 
 go 1.26.1
 

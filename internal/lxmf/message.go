@@ -14,7 +14,7 @@ import (
 
 	"github.com/vmihailenco/msgpack/v5"
 
-	"github.com/thatSFguy/reticulum-forwarding-service/internal/rns"
+	"github.com/thatSFguy/reticulum-group-chat/internal/rns"
 )
 
 // safeUnmarshal wraps msgpack.Unmarshal for inbound attacker-controlled

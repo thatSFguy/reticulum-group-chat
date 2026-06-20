@@ -5,7 +5,7 @@ import (
 	"fmt"
 	"time"
 
-	"github.com/thatSFguy/reticulum-forwarding-service/internal/rns"
+	"github.com/thatSFguy/reticulum-group-chat/internal/rns"
 )
 
 // ErrRecipientUnknown is returned by Send when the recipient hasn't

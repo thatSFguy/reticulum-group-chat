@@ -1,4 +1,4 @@
-# reticulum-forwarding-service config.
+# reticulum-group-chat config.
 
 # admins / mods are LXMF DESTINATION hashes (16 raw bytes / 32 hex chars,
 # specifically the lxmf.delivery destination hash of the user's identity —

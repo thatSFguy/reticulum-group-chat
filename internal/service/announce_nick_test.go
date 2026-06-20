@@ -9,8 +9,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/thatSFguy/reticulum-forwarding-service/internal/rns"
-	"github.com/thatSFguy/reticulum-forwarding-service/internal/roster"
+	"github.com/thatSFguy/reticulum-group-chat/internal/rns"
+	"github.com/thatSFguy/reticulum-group-chat/internal/roster"
 )
 
 // newTestTap builds the smallest *Service skeleton announceTap reads: a

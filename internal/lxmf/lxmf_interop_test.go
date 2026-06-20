@@ -9,7 +9,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/thatSFguy/reticulum-forwarding-service/internal/rns"
+	"github.com/thatSFguy/reticulum-group-chat/internal/rns"
 )
 
 // TestLXMFVectorsBytewiseInterop loads

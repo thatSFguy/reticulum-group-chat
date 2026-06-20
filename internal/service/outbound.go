@@ -14,9 +14,9 @@ import (
 	"sync"
 	"time"
 
-	"github.com/thatSFguy/reticulum-forwarding-service/internal/idmap"
-	"github.com/thatSFguy/reticulum-forwarding-service/internal/lxmf"
-	"github.com/thatSFguy/reticulum-forwarding-service/internal/rns"
+	"github.com/thatSFguy/reticulum-group-chat/internal/idmap"
+	"github.com/thatSFguy/reticulum-group-chat/internal/lxmf"
+	"github.com/thatSFguy/reticulum-group-chat/internal/rns"
 )
 
 // Constants mirror LXMF 0.9.7's LXMRouter.process_outbound retry policy.

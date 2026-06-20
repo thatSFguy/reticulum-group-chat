@@ -3,7 +3,7 @@
 **Status:** app-layer interop convention (not part of `SPEC.md`).
 **Applies to:** any LXMF client that displays tap-back reactions in a
 relayed/group context — Sideband, MeshChatX, Columba, ratspeak, and
-relays such as `reticulum-forwarding-service` (fwdsvc).
+relays such as `reticulum-group-chat` (fwdsvc).
 **Wire impact:** purely additive. Spec-compliant clients that ignore it
 keep working; they just fall back to source-based attribution.
 

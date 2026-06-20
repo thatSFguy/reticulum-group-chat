@@ -11,7 +11,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/thatSFguy/reticulum-forwarding-service/internal/rns"
+	"github.com/thatSFguy/reticulum-group-chat/internal/rns"
 )
 
 // link_send_e2e_test.go: end-to-end positive AND negative scenarios for

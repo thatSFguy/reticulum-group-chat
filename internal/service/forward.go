@@ -4,7 +4,7 @@ import (
 	"encoding/hex"
 	"time"
 
-	"github.com/thatSFguy/reticulum-forwarding-service/internal/idmap"
+	"github.com/thatSFguy/reticulum-group-chat/internal/idmap"
 )
 
 // forwardOpts bundles the optional per-fan-out knobs forwardToRoster

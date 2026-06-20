@@ -6,9 +6,9 @@ import (
 	"strings"
 	"unicode/utf8"
 
-	"github.com/thatSFguy/reticulum-forwarding-service/internal/commands"
-	"github.com/thatSFguy/reticulum-forwarding-service/internal/history"
-	"github.com/thatSFguy/reticulum-forwarding-service/internal/lxmf"
+	"github.com/thatSFguy/reticulum-group-chat/internal/commands"
+	"github.com/thatSFguy/reticulum-group-chat/internal/history"
+	"github.com/thatSFguy/reticulum-group-chat/internal/lxmf"
 )
 
 // onLXMFReceived is the lxmf.Delivery callback for verified inbound

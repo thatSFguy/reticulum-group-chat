@@ -7,7 +7,7 @@ import (
 
 	"github.com/vmihailenco/msgpack/v5"
 
-	"github.com/thatSFguy/reticulum-forwarding-service/internal/config"
+	"github.com/thatSFguy/reticulum-group-chat/internal/config"
 )
 
 // filterAttachments applies the operator's attachment policy to an

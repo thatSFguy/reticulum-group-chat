@@ -17,13 +17,13 @@ import (
 	"strings"
 	"time"
 
-	"github.com/thatSFguy/reticulum-forwarding-service/internal/commands"
-	"github.com/thatSFguy/reticulum-forwarding-service/internal/config"
-	"github.com/thatSFguy/reticulum-forwarding-service/internal/history"
-	"github.com/thatSFguy/reticulum-forwarding-service/internal/idmap"
-	"github.com/thatSFguy/reticulum-forwarding-service/internal/lxmf"
-	"github.com/thatSFguy/reticulum-forwarding-service/internal/rns"
-	"github.com/thatSFguy/reticulum-forwarding-service/internal/roster"
+	"github.com/thatSFguy/reticulum-group-chat/internal/commands"
+	"github.com/thatSFguy/reticulum-group-chat/internal/config"
+	"github.com/thatSFguy/reticulum-group-chat/internal/history"
+	"github.com/thatSFguy/reticulum-group-chat/internal/idmap"
+	"github.com/thatSFguy/reticulum-group-chat/internal/lxmf"
+	"github.com/thatSFguy/reticulum-group-chat/internal/rns"
+	"github.com/thatSFguy/reticulum-group-chat/internal/roster"
 )
 
 // replyContentBudget WAS the byte cap on command replies back when
