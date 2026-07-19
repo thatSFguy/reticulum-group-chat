@@ -203,6 +203,7 @@ func (s *Service) Run(ctx context.Context) error {
 	s.logger.Printf("service identity hash: %s", s.identity.HexHash())
 	s.logger.Printf("delivery destination : %s", hex.EncodeToString(s.delivery.Hash()))
 	s.logger.Printf("display name        : %s", s.cfg.Service.DisplayName)
+	s.logger.Printf("locked (invite-only): %v", s.cfg.Service.Locked)
 	s.logger.Printf("roster size         : %d", len(s.roster.Hashes()))
 	s.logger.Printf("history size        : %d", s.history.Len())
 
