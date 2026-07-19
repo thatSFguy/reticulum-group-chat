@@ -2,6 +2,7 @@ package config
 
 import (
 	"encoding/base64"
+	"os"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -197,6 +198,43 @@ func TestNormalizeRejectsNegativeForwardedFieldKey(t *testing.T) {
 	cfg.Service.ForwardedFields = []int{6, -1}
 	if err := cfg.normalize(); err == nil {
 		t.Fatal("expected normalize to reject negative forwarded_fields entry")
+	}
+}
+
+func TestLockedDefaultAndParse(t *testing.T) {
+	// Default: open chat.
+	if defaults().Service.Locked {
+		t.Error("Locked default should be false (open chat)")
+	}
+
+	dir := t.TempDir()
+
+	// `locked = true` under [service] binds (exercises the toml:"locked" tag).
+	good := filepath.Join(dir, "good.toml")
+	if err := os.WriteFile(good, []byte("[service]\ndisplay_name = \"x\"\nlocked = true\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	c, err := Load(good)
+	if err != nil {
+		t.Fatalf("Load good: %v", err)
+	}
+	if !c.Service.Locked {
+		t.Error("locked = true under [service] should parse to Service.Locked == true")
+	}
+
+	// The operator footgun: `locked` ABOVE [service] is a top-level key TOML
+	// silently ignores, so it must NOT bind (and must not error). This guards
+	// the "I set locked=true but /join still works" support case.
+	bad := filepath.Join(dir, "bad.toml")
+	if err := os.WriteFile(bad, []byte("locked = true\n[service]\ndisplay_name = \"x\"\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	badCfg, err := Load(bad)
+	if err != nil {
+		t.Fatalf("Load bad: %v", err)
+	}
+	if badCfg.Service.Locked {
+		t.Error("locked placed above [service] is a top-level key and must NOT bind to Service.Locked")
 	}
 }
 
