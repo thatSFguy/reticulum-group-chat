@@ -72,6 +72,13 @@ type Dispatcher struct {
 	// hex hash; safe to call from the dispatcher goroutine.
 	OnJoin func(senderHash string)
 
+	// OnAdminAdd is invoked AFTER an admin/mod adds a user via /adduser so
+	// the service layer can proactively welcome the added user and replay
+	// recent history to them (the added user is NOT the command sender, so
+	// this is an out-of-band send to their hash). Called with the added
+	// user's hex hash. No-op when nil (e.g. unit tests).
+	OnAdminAdd func(addedHash string)
+
 	// LookupAnnouncedName, when set, returns the announced display name
 	// for a 16-byte destination hash (from the LXMF app_data blob on
 	// the peer's most recent verified announce), or an empty string if
@@ -129,6 +136,10 @@ func (d *Dispatcher) Dispatch(senderHash string, parsed Parsed) string {
 		return d.handleNick(caller, parsed.Args)
 	case "usermode":
 		return d.handleUserMode(caller, parsed.Args)
+	case "adduser":
+		return d.handleAddUser(caller.Role, parsed.Args)
+	case "removeuser":
+		return d.handleRemoveUser(caller.Role, parsed.Args)
 	case "kick":
 		return d.handleKick(caller.Role, parsed.Args)
 	case "ban":
@@ -243,6 +254,7 @@ func helpText(c *Caller) string {
 	if c.Role.atLeastMod() {
 		b.WriteString("/nick USER NAME - mod\n")
 		b.WriteString("/kick /ban /unban /path USER - mod\n")
+		b.WriteString("/adduser HASH /removeuser USER - mod\n")
 		b.WriteString("/announce - mod\n")
 		if c.Role == RoleAdmin {
 			b.WriteString("/usermode ROLE USER - admin\n")
@@ -361,6 +373,15 @@ func (d *Dispatcher) handleJoin(c *Caller) string {
 	}
 	if c.HashBytes == nil {
 		return "Couldn't join: malformed sender hash."
+	}
+	// Locked (invite-only) chat: regular users can't self-join. Config
+	// admins/mods bypass the gate (c.Role is at least mod for them) so an
+	// operator can never lock themselves out. The bounce echoes the user
+	// their own destination hash — it's already in the message envelope,
+	// so there's no privacy loss, and it saves them digging it out of a
+	// client to hand to an admin.
+	if d.Cfg.Service.Locked && !c.Role.atLeastMod() {
+		return "This is a closed group — you need to be invited.\nGive an admin your address to be added:\n" + c.Hash
 	}
 	if d.Roster.IsBanned(c.HashBytes) {
 		return "You're banned from this chat."
@@ -621,6 +642,93 @@ func (d *Dispatcher) handleUserMode(c *Caller, args []string) string {
 			label, roleName(floor), roleName(effective))
 	}
 	return fmt.Sprintf("Set %s's role to %s.", label, roleName(effective))
+}
+
+// handleAddUser implements /adduser <hash> — the invite path for a locked
+// group. A mod/admin supplies a 32-hex destination hash; the user is added
+// to the roster (marked Invited so a not-yet-online invitee is prune-exempt
+// until first contact) and the service layer welcomes + replays to them via
+// OnAdminAdd. Works whether or not the group is locked — it's the operator's
+// direct roster-add tool — but it's the ONLY way in when locked.
+func (d *Dispatcher) handleAddUser(role Role, args []string) string {
+	if !role.atLeastMod() {
+		return "Only mods or admins can add users."
+	}
+	if len(args) != 1 {
+		return "Usage: /adduser <hash>   (32 hex chars — the user's LXMF address)"
+	}
+	hashHex := strings.ToLower(strings.TrimSpace(args[0]))
+	hb := mustHexBytes(hashHex)
+	if hb == nil {
+		return "That doesn't look like a valid address — expected 32 hex characters."
+	}
+	if d.Roster.IsBanned(hb) {
+		return fmt.Sprintf("%s is banned. /unban them first, then /adduser.", hashHex[:8])
+	}
+	if d.Roster.Has(hb) {
+		return fmt.Sprintf("%s is already in the group.", hashHex[:8])
+	}
+	// Same member cap /join enforces — an admin add shouldn't blow past it.
+	if max := d.Cfg.Service.MaxMembers; max > 0 {
+		if cur := d.Roster.Len(); cur >= max {
+			return fmt.Sprintf("Can't add — the group is full (%d/%d members).", cur, max)
+		}
+	}
+	if _, err := d.Roster.AddInvited(hb, time.Now()); err != nil {
+		return "Couldn't add user: " + err.Error()
+	}
+	// Default their nickname to the announced display name, sanitized, if
+	// we've heard an announce carrying one — mirrors /join's behavior.
+	if d.LookupAnnouncedName != nil {
+		if announced := d.LookupAnnouncedName(hb); announced != "" {
+			if sanitized := SanitizeNickname(announced); sanitized != "" {
+				_ = d.Roster.SetNickname(hashHex, sanitized)
+			}
+		}
+	}
+	if d.OnAdminAdd != nil {
+		d.OnAdminAdd(hashHex)
+	}
+	// If we already have a path/announce for them the welcome goes out
+	// immediately; otherwise the outbound queue path-requests and delivers
+	// it once they surface. Tell the operator which case they're in.
+	if d.PathLookup != nil && !d.PathLookup(hashHex).Known {
+		return fmt.Sprintf("Added %s — they'll be welcomed once we hear from them.", hashHex[:8])
+	}
+	return fmt.Sprintf("Added %s and sent them a welcome.", hashHex[:8])
+}
+
+// handleRemoveUser implements /removeuser <user> — an admin/mod removes a
+// member. It's the counterpart to /adduser: in a locked group a removed
+// user can't return until a fresh /adduser, since /join stays refused. It's
+// distinct from /ban — no banlist entry, no message-dropping; the user is
+// simply out of the roster.
+func (d *Dispatcher) handleRemoveUser(role Role, args []string) string {
+	if !role.atLeastMod() {
+		return "Only mods or admins can remove users."
+	}
+	if len(args) != 1 {
+		return "Usage: /removeuser <user>"
+	}
+	target, err := d.Roster.Resolve(args[0])
+	if err != nil {
+		return err.Error()
+	}
+	removed, err := d.Roster.Remove(target.Hash)
+	if err != nil {
+		return "Couldn't remove: " + err.Error()
+	}
+	if !removed {
+		return fmt.Sprintf("%s was not in the group.", target.Hash[:8])
+	}
+	label := target.Nickname
+	if label == "" {
+		label = target.Hash[:8]
+	}
+	if d.Cfg.Service.Locked {
+		return fmt.Sprintf("Removed %s. They can't rejoin until an admin runs /adduser.", label)
+	}
+	return fmt.Sprintf("Removed %s. They can rejoin with /join.", label)
 }
 
 func (d *Dispatcher) handleKick(role Role, args []string) string {

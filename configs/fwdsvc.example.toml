@@ -81,6 +81,16 @@ max_members = 0
 # 0 to disable. Default "1h".
 dedup_window = "1h"
 
+# Make the chat invite-only. When true, /join from a regular user is
+# refused with a "closed group" reply (which echoes them their own
+# address to hand to an admin), and the only way into the roster is an
+# admin or mod running `/adduser <hash>`. The added user is welcomed and
+# replayed automatically. `/removeuser <user>` takes them back out; in a
+# locked chat they can't return until re-added. Config admins/mods always
+# bypass the gate, so you can't lock yourself out. Default false (open
+# chat: anyone with the destination hash can /join).
+locked = false
+
 # Reticulum I/O interfaces. Currently only "tcp_client" is supported, which
 # dials a TCPServerInterface peer (e.g. a public testnet entry node) and
 # exchanges HDLC-framed packets in both directions. You can list multiple.

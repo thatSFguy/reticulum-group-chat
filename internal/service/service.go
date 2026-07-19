@@ -108,7 +108,8 @@ func New(cfg *config.Config) (*Service, error) {
 	// already holds the lock for this state_path — this catches the most
 	// common cause of duplicate delivery: an orphaned process left running
 	// by a restart that didn't kill the old one. flock is released on exit
-	// (even a crash), so a clean restart hands off automatically.
+	// (even a crash), so a clean restart hands off automatically. Taken
+	// before touching state below.
 	if err := os.MkdirAll(filepath.Dir(cfg.Service.StatePath), 0o700); err != nil {
 		return nil, fmt.Errorf("create state dir: %w", err)
 	}
@@ -120,6 +121,24 @@ func New(cfg *config.Config) (*Service, error) {
 				"(check with: pgrep -af fwdsvc)", cfg.Service.StatePath)
 		}
 		logger.Printf("single-instance lock unavailable (%v); continuing without it", lockErr)
+	}
+
+	// Auto-enroll config admins/mods as roster members. Being listed in
+	// admins/mods grants command powers but NOT message delivery — the
+	// forwarder only fans out to roster members. Without this, an operator
+	// who locks a group and lists themselves as admin silently receives
+	// nothing until they remember to /join, which is a footgun. Enrolling
+	// here makes "you administer this chat" imply "you're in it."
+	//
+	// Idempotent: only hashes not already present are added, so existing
+	// members keep their nickname/pause/role state. Added as invited so a
+	// config admin who is offline isn't pruned before first contact. To
+	// moderate without the message firehose, an admin uses /pause (stays a
+	// member, keeps powers, receives nothing). An admin who /leaves is
+	// re-enrolled on the next restart — remove them from the config for a
+	// permanent opt-out.
+	if n := enrollConfigRoles(r, cfg, time.Now()); n > 0 {
+		logger.Printf("auto-enrolled %d config admin/mod(s) as members", n)
 	}
 
 	id, err := loadOrCreateIdentity(cfg.Service.IdentityB64, cfg.Service.IdentityPath, logger)
@@ -191,6 +210,7 @@ func New(cfg *config.Config) (*Service, error) {
 		Announce:            svc.announceNow,
 		PathLookup:          svc.pathLookup,
 		OnJoin:              svc.onJoin,
+		OnAdminAdd:          svc.onAdminAdd,
 		LookupAnnouncedName: svc.lookupAnnouncedName,
 		// MaxReplyContentBytes intentionally left at 0 (unlimited) — see
 		// replyContentBudget docstring. Delivery.Send routes oversize
@@ -252,6 +272,7 @@ func (s *Service) Run(ctx context.Context) error {
 	s.logger.Printf("service identity hash: %s", s.identity.HexHash())
 	s.logger.Printf("delivery destination : %s", hex.EncodeToString(s.delivery.Hash()))
 	s.logger.Printf("display name        : %s", s.cfg.Service.DisplayName)
+	s.logger.Printf("locked (invite-only): %v", s.cfg.Service.Locked)
 	s.logger.Printf("roster size         : %d", len(s.roster.Hashes()))
 	s.logger.Printf("history size        : %d", s.history.Len())
 
@@ -315,6 +336,53 @@ func (s *Service) onJoin(senderHex string) {
 	if err != nil || len(bytes) != 16 {
 		return
 	}
+	if s.cfg.Replay.Count > 0 {
+		go s.replayHistoryTo(bytes, s.now())
+	}
+}
+
+// enrollConfigRoles adds every config admin/mod not already in the roster
+// as an invited member, returning how many were newly enrolled. Being an
+// admin/mod grants command powers but not message delivery (the forwarder
+// only fans out to roster members), so without this an operator who locks
+// a group and lists themselves as admin would silently receive nothing.
+// Idempotent — hashes already in the roster are left untouched. Config
+// hashes are already validated as 16-byte hex by config.Load, so the
+// decode/length guards here are purely defensive. Extracted from New for
+// testability.
+func enrollConfigRoles(r *roster.Roster, cfg *config.Config, now time.Time) int {
+	enrolled := 0
+	for _, h := range append(append([]string(nil), cfg.Admins...), cfg.Mods...) {
+		hb, err := hex.DecodeString(h)
+		if err != nil || len(hb) != 16 {
+			continue
+		}
+		if r.Has(hb) {
+			continue
+		}
+		if _, err := r.AddInvited(hb, now); err != nil {
+			continue
+		}
+		enrolled++
+	}
+	return enrolled
+}
+
+// onAdminAdd is the /adduser post-action hook. The added user is not the
+// command sender, so unlike /join we can't rely on the dispatcher's reply
+// to reach them — we enqueue a welcome directly to their hash and fire
+// replay-on-join. The welcome is enqueued first (the outbound queue is
+// sequential) so it lands ahead of the replay backlog. If we have no path
+// for them yet, the outbound queue path-requests and delivers when they
+// next surface.
+func (s *Service) onAdminAdd(addedHex string) {
+	bytes, err := hex.DecodeString(addedHex)
+	if err != nil || len(bytes) != 16 {
+		return
+	}
+	welcome := fmt.Sprintf("You've been added to %s. Send /? for help, /leave to exit.",
+		s.cfg.Service.DisplayName)
+	s.outbound.Enqueue(bytes, []byte(welcome))
 	if s.cfg.Replay.Count > 0 {
 		go s.replayHistoryTo(bytes, s.now())
 	}
