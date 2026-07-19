@@ -506,6 +506,76 @@ After that, `config.toml` alone is enough to restore the service on
 any machine — same identity, same destination hash, same chat for
 every existing member.
 
+### Running multiple groups in parallel
+
+Each group chat is **one `fwdsvc` instance** — one identity, one
+destination hash, one config, one running process. To host several
+groups on the same machine, run one instance per group. The only hard
+rule:
+
+> **Every instance needs its own `identity_path`, `state_path`, and
+> `history_path`.** Two processes sharing an identity both answer to the
+> same destination hash and both fan out every message, so members
+> receive **duplicates**. This is also why a restart *script* is a bad
+> idea — if it starts a new process without reliably killing the old
+> one, the leftovers keep forwarding and you get echoes. Let a supervisor
+> (systemd) own the single process instead.
+
+Give each group a config with distinct paths — e.g.
+`/etc/fwdsvc/groupA.toml`:
+
+```toml
+[service]
+display_name  = "Group A"
+identity_path = "/var/lib/fwdsvc/groupA/identity"
+state_path    = "/var/lib/fwdsvc/groupA/state.json"
+history_path  = "/var/lib/fwdsvc/groupA/history.json"
+```
+
+and `/etc/fwdsvc/groupB.toml` the same but under `groupB/` with
+`display_name = "Group B"`. They can share one upstream interface (the
+same `tcp_client` peer or a local `rnsd`) or use different ones — that's
+independent of keeping their state separate.
+
+With systemd, a **templated unit** runs one supervised process per group.
+Drop this in `/etc/systemd/system/fwdsvc@.service`:
+
+```ini
+[Unit]
+Description=Reticulum group chat (%i)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=fwdsvc
+Group=fwdsvc
+ExecStart=/usr/local/bin/fwdsvc -config /etc/fwdsvc/%i.toml
+Restart=on-failure
+RestartSec=5
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/lib/fwdsvc
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target
+```
+
+`%i` expands to the name after the `@`, so `fwdsvc@groupA` reads
+`/etc/fwdsvc/groupA.toml`. Enable each group and tail its own journal:
+
+```sh
+sudo systemctl enable --now fwdsvc@groupA fwdsvc@groupB
+sudo journalctl -u fwdsvc@groupA -f
+```
+
+To confirm you're running exactly one process per group (and no orphans
+from an earlier manual start), `pgrep -af fwdsvc` should list one line
+per group and nothing more. Each instance is independent for resource
+purposes — see [Scaling and resource use](#scaling-and-resource-use).
+
 ---
 
 ## Operations
