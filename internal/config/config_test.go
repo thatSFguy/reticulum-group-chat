@@ -2,6 +2,7 @@ package config
 
 import (
 	"encoding/base64"
+	"os"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -197,6 +198,34 @@ func TestNormalizeRejectsNegativeForwardedFieldKey(t *testing.T) {
 	cfg.Service.ForwardedFields = []int{6, -1}
 	if err := cfg.normalize(); err == nil {
 		t.Fatal("expected normalize to reject negative forwarded_fields entry")
+	}
+}
+
+func TestDedupWindowDefaultAndParse(t *testing.T) {
+	if got := defaults().Service.DedupWindow.Std(); got != time.Hour {
+		t.Errorf("DedupWindow default = %s, want 1h", got)
+	}
+	// Full Load exercises the `toml:"dedup_window"` tag binding (a tag typo
+	// would silently leave the default, so assert on a non-default value).
+	dir := t.TempDir()
+	path := filepath.Join(dir, "c.toml")
+	if err := os.WriteFile(path, []byte("[service]\ndisplay_name = \"x\"\ndedup_window = \"30m\"\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	c, err := Load(path)
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if got := c.Service.DedupWindow.Std(); got != 30*time.Minute {
+		t.Errorf("DedupWindow parsed = %s, want 30m", got)
+	}
+}
+
+func TestNormalizeRejectsNegativeDedupWindow(t *testing.T) {
+	cfg := &Config{Service: validServiceConfig()}
+	cfg.Service.DedupWindow = Duration(-time.Minute)
+	if err := cfg.normalize(); err == nil {
+		t.Fatal("expected normalize to reject negative dedup_window")
 	}
 }
 

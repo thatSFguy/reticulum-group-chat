@@ -20,6 +20,21 @@ func (s *Service) onLXMFReceived(msg *lxmf.Message) {
 	senderBytes := msg.SourceHash
 	senderHex := hex.EncodeToString(senderBytes)
 
+	// Duplicate suppression. Reticulum can deliver the same message more
+	// than once (multiple paths, retransmits, propagation-node replay) and
+	// neither the transport nor the LXMF layer dedups, so without this a
+	// single duplicate would be fanned out to the whole roster again. Drop
+	// any message whose message_id we've already seen inside DedupWindow.
+	// Done before anything else so a duplicate command (e.g. /join) can't
+	// re-fire its side effects either. No-op when dedup is disabled.
+	if id := msg.MessageID(); len(id) > 0 {
+		msgIDHex := hex.EncodeToString(id)
+		if s.dedup.seenBefore(msgIDHex, now) {
+			s.logger.Printf("duplicate inbound dropped: from=%s msgid=%s", senderHex[:8], msgIDHex[:8])
+			return
+		}
+	}
+
 	// Diagnostic: dump the inbound shape (sender prefix, content length,
 	// raw fields-map key list with concrete Go types). Lets us see exactly
 	// what the wire is delivering when reactions / replies vanish before

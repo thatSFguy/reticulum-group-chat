@@ -73,6 +73,14 @@ max_inbound_chars = 500
 # unlimited.
 max_members = 0
 
+# How long to remember an inbound message's ID so a message Reticulum
+# delivers more than once (multiple paths, retransmits, or a propagation
+# node replaying it) is forwarded to the roster only once. This is the
+# main defense against duplicate/echoed messages. Two genuinely different
+# messages never collide (the ID includes the sender's timestamp). Set to
+# 0 to disable. Default "1h".
+dedup_window = "1h"
+
 # Reticulum I/O interfaces. Currently only "tcp_client" is supported, which
 # dials a TCPServerInterface peer (e.g. a public testnet entry node) and
 # exchanges HDLC-framed packets in both directions. You can list multiple.
