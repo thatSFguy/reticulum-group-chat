@@ -40,6 +40,11 @@ import (
 // below uses 0 = unlimited.
 const replyContentBudget = lxmf.MaxOpportunisticPayload - 16
 
+// dedupMaxEntries caps how many recent inbound message_ids the dedup cache
+// holds. Group-chat inbound volume is low, so an hour of ids is far smaller
+// than this; the cap is only a memory backstop against a pathological flood.
+const dedupMaxEntries = 50000
+
 type Service struct {
 	cfg        *config.Config
 	identity   *rns.Identity
@@ -56,6 +61,17 @@ type Service struct {
 	// per recipient at fan-out time. Nil if cfg.Service.IDCacheTTL == 0
 	// (the legacy "reactions don't bind" behavior).
 	idmap *idmap.Cache
+
+	// dedup drops inbound LXMF messages whose message_id was seen within
+	// cfg.Service.DedupWindow, so a message Reticulum delivers more than
+	// once isn't fanned out to the roster more than once. Nil when the
+	// window is 0 (dedup disabled).
+	dedup *dedupCache
+
+	// instanceUnlock releases the single-instance lock taken in New (nil if
+	// the platform doesn't enforce it or the lock was unavailable). Called
+	// on shutdown; the OS also drops the flock on process exit regardless.
+	instanceUnlock func()
 
 	logger *log.Logger
 	now    func() time.Time
@@ -85,6 +101,26 @@ func New(cfg *config.Config) (*Service, error) {
 		return nil, fmt.Errorf("open log: %w", err)
 	}
 	logger := log.New(logWriter, "fwdsvc ", log.LstdFlags|log.Lmicroseconds)
+
+	// Single-instance guard. Two fwdsvc processes on the same state both
+	// answer to the same destination hash and both fan out every message,
+	// so members get duplicates. Refuse to start if another instance
+	// already holds the lock for this state_path — this catches the most
+	// common cause of duplicate delivery: an orphaned process left running
+	// by a restart that didn't kill the old one. flock is released on exit
+	// (even a crash), so a clean restart hands off automatically.
+	if err := os.MkdirAll(filepath.Dir(cfg.Service.StatePath), 0o700); err != nil {
+		return nil, fmt.Errorf("create state dir: %w", err)
+	}
+	instanceUnlock, lockErr := acquireInstanceLock(cfg.Service.StatePath + ".lock")
+	if lockErr != nil {
+		if errors.Is(lockErr, errInstanceHeld) {
+			return nil, fmt.Errorf("another fwdsvc is already running with state_path %q — "+
+				"refusing to start to avoid duplicate message delivery; stop the other instance first "+
+				"(check with: pgrep -af fwdsvc)", cfg.Service.StatePath)
+		}
+		logger.Printf("single-instance lock unavailable (%v); continuing without it", lockErr)
+	}
 
 	id, err := loadOrCreateIdentity(cfg.Service.IdentityB64, cfg.Service.IdentityPath, logger)
 	if err != nil {
@@ -130,17 +166,24 @@ func New(cfg *config.Config) (*Service, error) {
 		outbound.SetIDMap(idCache)
 	}
 
+	var dedup *dedupCache
+	if w := cfg.Service.DedupWindow.Std(); w > 0 {
+		dedup = newDedupCache(w, dedupMaxEntries)
+	}
+
 	svc := &Service{
-		cfg:       cfg,
-		identity:  id,
-		transport: transport,
-		delivery:  delivery,
-		roster:    r,
-		history:   hist,
-		outbound:  outbound,
-		idmap:     idCache,
-		logger:    logger,
-		now:       time.Now,
+		cfg:            cfg,
+		identity:       id,
+		transport:      transport,
+		delivery:       delivery,
+		roster:         r,
+		history:        hist,
+		outbound:       outbound,
+		idmap:          idCache,
+		dedup:          dedup,
+		instanceUnlock: instanceUnlock,
+		logger:         logger,
+		now:            time.Now,
 	}
 	svc.dispatcher = &commands.Dispatcher{
 		Cfg:                 cfg,
@@ -192,6 +235,13 @@ func New(cfg *config.Config) (*Service, error) {
 // dispatcher, periodic announce, and prune ticker. Blocks until ctx is
 // cancelled.
 func (s *Service) Run(ctx context.Context) error {
+	// Release the single-instance lock on shutdown. The OS also drops the
+	// flock when the process exits, so this is just prompt cleanup for a
+	// graceful stop (lets a supervised restart re-acquire without waiting).
+	if s.instanceUnlock != nil {
+		defer s.instanceUnlock()
+	}
+
 	for _, iface := range s.cfg.Interfaces {
 		if err := s.dialInterface(iface); err != nil {
 			s.logger.Printf("interface %s %s: %v", iface.Type, iface.Addr, err)

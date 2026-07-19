@@ -81,6 +81,16 @@ type ServiceConfig struct {
 	// both count toward the limit. 0 = unlimited (default).
 	MaxMembers int `toml:"max_members"`
 
+	// DedupWindow is how long an inbound LXMF message_id is remembered so a
+	// message delivered more than once — via multiple interfaces, a
+	// retransmit, or a propagation-node replay — is forwarded to the roster
+	// only once. Reticulum can and does redeliver the same message, and
+	// neither the transport nor the LXMF layer dedups, so without this every
+	// duplicate is fanned out again (a prime source of duplicate/echoed
+	// group messages). message_id includes the sender's timestamp, so two
+	// genuinely distinct sends are never collapsed. 0 disables. Default 1h.
+	DedupWindow Duration `toml:"dedup_window"`
+
 	// ForwardAttachments controls whether non-text LXMF fields
 	// (FIELD_IMAGE = 6, FIELD_FILE_ATTACHMENTS = 5, FIELD_AUDIO = 7, …)
 	// are passed through to roster recipients alongside the text body.
@@ -211,6 +221,7 @@ func defaults() *Config {
 			PruneInterval:    Duration(1 * time.Hour),
 			AnnounceInterval:   Duration(10 * time.Minute),
 			MaxInboundChars:    500,
+			DedupWindow:        Duration(1 * time.Hour),
 			ForwardAttachments: true,
 			MaxAttachmentBytes: 1000 * 1024,
 			ForwardedFields:    []int{6, 48, 49, 64, 65, 66},
@@ -258,6 +269,9 @@ func (c *Config) normalize() error {
 	}
 	if c.Service.MaxMembers < 0 {
 		return fmt.Errorf("service.max_members must be >= 0")
+	}
+	if c.Service.DedupWindow.Std() < 0 {
+		return fmt.Errorf("service.dedup_window must be >= 0 (0 disables)")
 	}
 	if c.Service.MaxAttachmentBytes < 0 {
 		return fmt.Errorf("service.max_attachment_bytes must be >= 0")
