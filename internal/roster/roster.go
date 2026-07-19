@@ -39,6 +39,16 @@ type User struct {
 	// paying for every photo. Toggled via /textonly and /showall.
 	TextOnly bool `json:"text_only,omitempty"`
 
+	// Invited marks a member who was added by an admin/mod via /adduser
+	// but has not yet been heard from directly (no inbound message,
+	// command, or announce since being added). Such a member is exempt
+	// from pruning — a locked-group invitee who takes weeks to come online
+	// must not be swept before they ever connect. The flag is cleared the
+	// first time we hear from them (Touch, MarkMessage, or a fresh
+	// UpdateLastAnnounce), after which normal prune rules apply. Empty
+	// (false) for everyone who joined the ordinary way.
+	Invited bool `json:"invited,omitempty"`
+
 	// Role is the runtime-granted privilege level: "" (regular user),
 	// "mod", or "admin". Set via /usermode and persisted here. It is a
 	// floor-raiser, not the source of truth: the effective role is the
@@ -142,6 +152,31 @@ func (r *Roster) AddOrUpdate(hashBytes []byte, now time.Time) (bool, error) {
 	return !exists, r.persistLocked()
 }
 
+// AddInvited adds a member who was placed in the roster by an admin/mod
+// via /adduser, rather than by joining themselves. It stamps JoinedAt
+// (so LastSeen has a sane floor) but deliberately does NOT set
+// LastMessageAt — the invitee has not spoken — and marks them Invited so
+// Prune skips them until they're first heard from. Returns true if this
+// call introduced a new member; if the hash is already in the roster it
+// is left untouched and returns false.
+func (r *Roster) AddInvited(hashBytes []byte, now time.Time) (bool, error) {
+	h, err := normalizeHash(hashBytes)
+	if err != nil {
+		return false, err
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if _, exists := r.users[h]; exists {
+		return false, nil
+	}
+	r.users[h] = &User{
+		Hash:     h,
+		JoinedAt: now,
+		Invited:  true,
+	}
+	return true, r.persistLocked()
+}
+
 // Touch refreshes last_command_at for an existing member so the idle-prune
 // sweep (LastSeen) counts them as present. Unlike AddOrUpdate it never
 // creates a user — it's a no-op for non-members (returns false). Used for
@@ -164,6 +199,7 @@ func (r *Roster) Touch(hashBytes []byte, now time.Time) (bool, error) {
 		return false, nil
 	}
 	u.LastCommandAt = now
+	u.Invited = false // heard from them — they're a full member now
 	return true, r.persistLocked()
 }
 
@@ -185,6 +221,7 @@ func (r *Roster) MarkMessage(hashBytes []byte, now time.Time) (bool, error) {
 		return false, nil
 	}
 	u.LastMessageAt = now
+	u.Invited = false // heard from them — they're a full member now
 	return true, r.persistLocked()
 }
 
@@ -216,6 +253,7 @@ func (r *Roster) UpdateLastAnnounce(hashBytes []byte, at time.Time) error {
 		return nil
 	}
 	u.LastAnnounceAt = at
+	u.Invited = false // a fresh announce is real presence — full member now
 	return r.persistLocked()
 }
 
@@ -243,6 +281,12 @@ func (r *Roster) Prune(now time.Time, idleCutoff, silentCutoff time.Duration) ([
 	silentThreshold := now.Add(-silentCutoff)
 	var pruned []string
 	for h, u := range r.users {
+		// An admin-added invitee we've never heard from is exempt: they
+		// must not be swept before they've had the chance to come online.
+		// The flag clears on first contact, after which they prune normally.
+		if u.Invited {
+			continue
+		}
 		idle := u.LastSeen().Before(idleThreshold)
 		silent := silentCutoff > 0 && u.LastSpoke().Before(silentThreshold)
 		if idle || silent {

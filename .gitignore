@@ -24,3 +24,6 @@ agent.md
 .aider*
 CLAUDE.md
 dist/
+
+# Local, unpushed feature planning docs
+/docs/locked-group-feature-plan.md

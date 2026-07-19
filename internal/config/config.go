@@ -81,6 +81,16 @@ type ServiceConfig struct {
 	// both count toward the limit. 0 = unlimited (default).
 	MaxMembers int `toml:"max_members"`
 
+	// Locked makes the chat invite-only. When true, /join from a regular
+	// (non config-admin/mod) user is refused with a "closed group" reply
+	// that echoes the user their own destination hash, and the ONLY way
+	// into the roster is an admin/mod running /adduser <hash>. The added
+	// user is proactively welcomed and replayed exactly as if they had
+	// joined themselves. Config admins/mods always bypass the gate so an
+	// operator can never lock themselves out. Default false (open chat:
+	// anyone with the destination hash can /join).
+	Locked bool `toml:"locked"`
+
 	// ForwardAttachments controls whether non-text LXMF fields
 	// (FIELD_IMAGE = 6, FIELD_FILE_ATTACHMENTS = 5, FIELD_AUDIO = 7, …)
 	// are passed through to roster recipients alongside the text body.

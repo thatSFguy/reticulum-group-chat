@@ -148,6 +148,7 @@ func New(cfg *config.Config) (*Service, error) {
 		Announce:            svc.announceNow,
 		PathLookup:          svc.pathLookup,
 		OnJoin:              svc.onJoin,
+		OnAdminAdd:          svc.onAdminAdd,
 		LookupAnnouncedName: svc.lookupAnnouncedName,
 		// MaxReplyContentBytes intentionally left at 0 (unlimited) — see
 		// replyContentBudget docstring. Delivery.Send routes oversize
@@ -265,6 +266,26 @@ func (s *Service) onJoin(senderHex string) {
 	if err != nil || len(bytes) != 16 {
 		return
 	}
+	if s.cfg.Replay.Count > 0 {
+		go s.replayHistoryTo(bytes, s.now())
+	}
+}
+
+// onAdminAdd is the /adduser post-action hook. The added user is not the
+// command sender, so unlike /join we can't rely on the dispatcher's reply
+// to reach them — we enqueue a welcome directly to their hash and fire
+// replay-on-join. The welcome is enqueued first (the outbound queue is
+// sequential) so it lands ahead of the replay backlog. If we have no path
+// for them yet, the outbound queue path-requests and delivers when they
+// next surface.
+func (s *Service) onAdminAdd(addedHex string) {
+	bytes, err := hex.DecodeString(addedHex)
+	if err != nil || len(bytes) != 16 {
+		return
+	}
+	welcome := fmt.Sprintf("You've been added to %s. Send /? for help, /leave to exit.",
+		s.cfg.Service.DisplayName)
+	s.outbound.Enqueue(bytes, []byte(welcome))
 	if s.cfg.Replay.Count > 0 {
 		go s.replayHistoryTo(bytes, s.now())
 	}
