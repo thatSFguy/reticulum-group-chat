@@ -563,6 +563,12 @@ rule:
 > one, the leftovers keep forwarding and you get echoes. Let a supervisor
 > (systemd) own the single process instead.
 
+**Full worked example:** [`configs/multi-group/`](configs/multi-group/)
+has four ready-to-run configs — two public and two private (locked) groups —
+plus a [README](configs/multi-group/README.md) with the systemd and
+by-hand launch commands. The rest of this section walks through the same
+pattern inline.
+
 Give each group a config with distinct paths — e.g.
 `/etc/fwdsvc/groupA.toml`:
 
