@@ -1,0 +1,39 @@
+# Group C — PRIVATE (invite-only).
+#
+# Two things make a group private:
+#   1. locked = true  (under [service], below)
+#   2. an admins list so someone can run /adduser to invite people
+#
+# admins / mods MUST be at the TOP of the file, before any [section] header
+# — TOML scopes top-level keys to whichever table is currently active, so a
+# list placed after [service] would bind to the wrong table. Put each admin's
+# LXMF *delivery* destination hash (32 hex chars) here. The simplest way to
+# learn it: have them message the service once and copy the
+# "new sender contact: full dest_hash = ..." line from the log.
+#
+# Config admins/mods are auto-enrolled as members at startup (so the operator
+# actually receives messages) and always bypass the lock, so you can't lock
+# yourself out. On startup the log prints "locked (invite-only): true" —
+# check it to confirm the setting took effect.
+
+admins = [
+  # "00112233445566778899aabbccddeeff",
+]
+mods = [
+]
+
+[service]
+display_name  = "Group C (private)"
+locked        = true
+identity_path = "/var/lib/fwdsvc/group-c/identity"
+state_path    = "/var/lib/fwdsvc/group-c/state.json"
+history_path  = "/var/lib/fwdsvc/group-c/history.json"
+
+[[interfaces]]
+type    = "tcp_client"
+addr    = "rns.michmesh.net:7822"
+timeout = "10s"
+
+[replay]
+count   = 100
+max_age = "7d"

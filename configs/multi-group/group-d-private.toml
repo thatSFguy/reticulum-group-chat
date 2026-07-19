@@ -1,0 +1,27 @@
+# Group D — PRIVATE (invite-only). A second locked group, independent of
+# Group C: its own admins list, its own identity/state/history. An admin of
+# Group C is NOT an admin of Group D unless listed here too (each group is a
+# separate service with a separate roster). See group-c-private.toml for the
+# admins-placement rule and how private mode works.
+
+admins = [
+  # "00112233445566778899aabbccddeeff",
+]
+mods = [
+]
+
+[service]
+display_name  = "Group D (private)"
+locked        = true
+identity_path = "/var/lib/fwdsvc/group-d/identity"
+state_path    = "/var/lib/fwdsvc/group-d/state.json"
+history_path  = "/var/lib/fwdsvc/group-d/history.json"
+
+[[interfaces]]
+type    = "tcp_client"
+addr    = "rns.michmesh.net:7822"
+timeout = "10s"
+
+[replay]
+count   = 100
+max_age = "7d"

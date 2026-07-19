@@ -1,0 +1,19 @@
+# Group B — PUBLIC. A second open group on the same machine as Group A.
+# Note the distinct display_name and its OWN identity/state/history paths —
+# that separation is what makes it an independent group rather than a
+# duplicate of Group A. See group-a-public.toml for the full explanation.
+
+[service]
+display_name  = "Group B"
+identity_path = "/var/lib/fwdsvc/group-b/identity"
+state_path    = "/var/lib/fwdsvc/group-b/state.json"
+history_path  = "/var/lib/fwdsvc/group-b/history.json"
+
+[[interfaces]]
+type    = "tcp_client"
+addr    = "rns.michmesh.net:7822"
+timeout = "10s"
+
+[replay]
+count   = 100
+max_age = "7d"

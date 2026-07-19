@@ -1,0 +1,30 @@
+# Group A — PUBLIC.
+#
+# One fwdsvc instance = one group = one config file = one process. To run
+# several groups on one machine, run one instance per config. The ONLY hard
+# rule: every instance needs its own identity_path / state_path /
+# history_path. Two processes sharing state both fan out every message and
+# members get duplicates (fwdsvc now refuses the second start via a lock on
+# state_path, so a mistake fails loudly instead of echoing).
+#
+# See ../fwdsvc.example.toml for every option, and the "Running multiple
+# groups in parallel" section of the README for the fwdsvc@.service systemd
+# template that supervises one process per group.
+
+[service]
+display_name  = "Group A"
+identity_path = "/var/lib/fwdsvc/group-a/identity"
+state_path    = "/var/lib/fwdsvc/group-a/state.json"
+history_path  = "/var/lib/fwdsvc/group-a/history.json"
+# locked defaults to false — anyone with the destination hash can /join.
+
+[[interfaces]]
+type = "tcp_client"
+# Replace with your Reticulum peer: a community node, or a local rnsd
+# (e.g. "127.0.0.1:4242"). All four groups can share the same peer.
+addr    = "rns.michmesh.net:7822"
+timeout = "10s"
+
+[replay]
+count   = 100
+max_age = "7d"
