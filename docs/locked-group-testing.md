@@ -38,6 +38,17 @@ Test plan for the invite-only ("locked") group feature on the
 3. Restart the daemon. The log should show it running with your
    identity / destination hash.
 
+## Admins/mods are auto-enrolled
+
+Config `admins`/`mods` are added to the roster automatically at startup, so
+they **receive** group messages — being an admin grants command powers, and
+enrollment makes them a participant too. The startup log shows
+`auto-enrolled N config admin/mod(s) as members`. It's idempotent (existing
+members keep their nickname/pause state). To moderate **without** receiving
+the message firehose, an admin uses `/pause` (stays a member, keeps powers,
+receives nothing). An admin who `/leave`s is re-enrolled on the next restart
+— remove them from the config for a permanent opt-out.
+
 ## Test checklist
 
 | # | Action | Expected result |

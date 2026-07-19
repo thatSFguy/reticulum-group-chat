@@ -86,6 +86,24 @@ func New(cfg *config.Config) (*Service, error) {
 	}
 	logger := log.New(logWriter, "fwdsvc ", log.LstdFlags|log.Lmicroseconds)
 
+	// Auto-enroll config admins/mods as roster members. Being listed in
+	// admins/mods grants command powers but NOT message delivery — the
+	// forwarder only fans out to roster members. Without this, an operator
+	// who locks a group and lists themselves as admin silently receives
+	// nothing until they remember to /join, which is a footgun. Enrolling
+	// here makes "you administer this chat" imply "you're in it."
+	//
+	// Idempotent: only hashes not already present are added, so existing
+	// members keep their nickname/pause/role state. Added as invited so a
+	// config admin who is offline isn't pruned before first contact. To
+	// moderate without the message firehose, an admin uses /pause (stays a
+	// member, keeps powers, receives nothing). An admin who /leaves is
+	// re-enrolled on the next restart — remove them from the config for a
+	// permanent opt-out.
+	if n := enrollConfigRoles(r, cfg, time.Now()); n > 0 {
+		logger.Printf("auto-enrolled %d config admin/mod(s) as members", n)
+	}
+
 	id, err := loadOrCreateIdentity(cfg.Service.IdentityB64, cfg.Service.IdentityPath, logger)
 	if err != nil {
 		return nil, err
@@ -270,6 +288,33 @@ func (s *Service) onJoin(senderHex string) {
 	if s.cfg.Replay.Count > 0 {
 		go s.replayHistoryTo(bytes, s.now())
 	}
+}
+
+// enrollConfigRoles adds every config admin/mod not already in the roster
+// as an invited member, returning how many were newly enrolled. Being an
+// admin/mod grants command powers but not message delivery (the forwarder
+// only fans out to roster members), so without this an operator who locks
+// a group and lists themselves as admin would silently receive nothing.
+// Idempotent — hashes already in the roster are left untouched. Config
+// hashes are already validated as 16-byte hex by config.Load, so the
+// decode/length guards here are purely defensive. Extracted from New for
+// testability.
+func enrollConfigRoles(r *roster.Roster, cfg *config.Config, now time.Time) int {
+	enrolled := 0
+	for _, h := range append(append([]string(nil), cfg.Admins...), cfg.Mods...) {
+		hb, err := hex.DecodeString(h)
+		if err != nil || len(hb) != 16 {
+			continue
+		}
+		if r.Has(hb) {
+			continue
+		}
+		if _, err := r.AddInvited(hb, now); err != nil {
+			continue
+		}
+		enrolled++
+	}
+	return enrolled
 }
 
 // onAdminAdd is the /adduser post-action hook. The added user is not the

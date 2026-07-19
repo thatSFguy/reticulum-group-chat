@@ -39,9 +39,10 @@ type User struct {
 	// paying for every photo. Toggled via /textonly and /showall.
 	TextOnly bool `json:"text_only,omitempty"`
 
-	// Invited marks a member who was added by an admin/mod via /adduser
-	// but has not yet been heard from directly (no inbound message,
-	// command, or announce since being added). Such a member is exempt
+	// Invited marks a member who was added administratively — via
+	// /adduser, or auto-enrolled at startup as a config admin/mod — rather
+	// than by joining themselves, and has not yet been heard from directly
+	// (no inbound message, command, or announce since being added). Exempt
 	// from pruning — a locked-group invitee who takes weeks to come online
 	// must not be swept before they ever connect. The flag is cleared the
 	// first time we hear from them (Touch, MarkMessage, or a fresh
