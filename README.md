@@ -145,6 +145,18 @@ messages addressed to a destination hash, deliverable opportunistically
   get `/kick`, `/ban`, `/unban`, `/announce`, `/path`, and the
   cross-user form of `/nick`. Admins can also grant/clear roles at
   runtime with `/usermode` — no config edit or restart.
+- **Invite-only (locked) groups.** Set `locked = true` and `/join` is
+  refused for everyone except config admins/mods; the only way in is a
+  mod/admin running `/adduser <hash>`, which adds the user and sends them
+  a welcome + replay. `/removeuser` takes them back out. Config admins/mods
+  are auto-enrolled as members at startup so the operator actually receives
+  messages. See [Private (invite-only) groups](#private-invite-only-groups).
+- **Duplicate suppression.** Inbound messages are de-duplicated by LXMF
+  `message_id` within `dedup_window` (default 1h), so a message Reticulum
+  delivers more than once (multi-path, retransmit, propagation-node replay)
+  is fanned out only once. A single-instance lock also refuses to start a
+  second daemon on the same `state_path` — the other classic cause of
+  echoed messages.
 - **Bind-once identity.** Embed your identity in `config.toml` via
   `identity_b64` and the config file is the single source of truth —
   reinstall on any machine, same destination hash, same chat for
@@ -270,7 +282,7 @@ everything.
 | `/users`                  | anyone      | List roster (paused members marked `[paused]`) |
 | `/mods`                   | anyone      | List configured mods |
 | `/admin`                  | anyone      | List configured admins |
-| `/join`                   | non-members | Opt in: receive forwarded messages, your messages get forwarded |
+| `/join`                   | non-members | Opt in: receive forwarded messages, your messages get forwarded. In a `locked` group this is refused with your own address echoed back to hand to an admin. |
 | `/leave`                  | members     | Leave the chat (you can `/join` again later) |
 | `/pause`                  | members     | Stop receiving forwards (and stop forwarding yours) |
 | `/resume`                 | members     | Reverse `/pause` |
@@ -286,6 +298,8 @@ everything.
 | `/kick <user>`            | mods, admins | Remove from roster (user can `/join` again) |
 | `/ban <user>`             | mods, admins | Add to banlist; future `/join`s and messages refused |
 | `/unban <user>`           | mods, admins | Remove from banlist |
+| `/adduser <hash>`         | mods, admins | Add a user by their 32-hex destination hash — the invite path for a `locked` group. Adds them to the roster and sends a welcome + replay. |
+| `/removeuser <user>`      | mods, admins | Remove a member. In a `locked` group they can't return until re-added (unlike `/kick`, which lets them `/join` again in an open group). Not punitive like `/ban`. |
 | `/announce`               | mods, admins | Broadcast a fresh Reticulum announce immediately |
 | `/path <user>`            | mods, admins | Show what the transport knows about reaching `<user>`: cached announce age, hop count, next-hop transport_id, whether an Active Link is open. Mostly for troubleshooting delivery problems. |
 | `/usermode <admin\|mod\|user> <user>` | admins | Grant or clear a runtime role for a roster member — no config edit or restart needed. `admin`/`mod` promote; `user` clears the runtime grant. |
@@ -329,6 +343,32 @@ Users (3):
 (message fans out to Bob and the unnicked user with prefix `[Alice] Hi everyone!`)
 ```
 
+### Private (invite-only) groups
+
+By default anyone with the destination hash can `/join`. Set
+`locked = true` under `[service]` to run a closed group:
+
+- `/join` from a regular user is **refused** with a "closed group" reply
+  that echoes them their own destination hash to hand to an admin.
+- A mod/admin adds them with **`/adduser <hash>`** — the user is placed on
+  the roster and sent a welcome plus replay, exactly as if they had
+  joined. **`/removeuser <user>`** takes them back out; while locked they
+  can't return until re-added.
+- **Config admins/mods are auto-enrolled** as members at startup, so the
+  operator receives messages without a separate `/join` — being an admin
+  grants command powers, not delivery, and this closes that gap. An admin
+  who wants to moderate silently uses `/pause`; one who `/leave`s is
+  re-enrolled on the next restart (remove them from the config to opt out
+  for good).
+- Config admins/mods always **bypass** the lock, so you can't lock
+  yourself out.
+
+> **TOML gotcha:** `locked` must sit **under** the `[service]` header. A
+> `locked = true` placed above the first `[section]` is a top-level key
+> that TOML silently ignores — the group stays open and `/join` still
+> works. The startup log prints `locked (invite-only): true`; check it to
+> confirm the setting took effect.
+
 ---
 
 ## Configuration reference
@@ -362,6 +402,8 @@ Both lists MUST be declared at the top of the file, before any
 | `announce_interval`  | duration | `"10m"`                     | How often we re-announce ourselves. |
 | `max_inbound_chars`  | int      | `500`                       | Reject non-command messages longer than this many UTF-8 chars. `0` disables. |
 | `max_members`        | int      | `0`                         | Cap on roster size. `/join` past the cap is refused. `0` = unlimited. |
+| `locked`             | bool     | `false`                     | Invite-only mode. `/join` is refused for non-admins/mods; membership is managed with `/adduser` / `/removeuser`, and config admins/mods are auto-enrolled. See [Private (invite-only) groups](#private-invite-only-groups). Must be placed **under** `[service]`. |
+| `dedup_window`       | duration | `"1h"`                      | Remember each inbound `message_id` for this long and drop redeliveries (multi-path / retransmit / propagation replay) before forwarding. `0` disables. |
 | `forward_attachments`| bool     | `true`                      | Pass LXMF non-text fields (images, etc.) through forwarding. `false` drops all attachments silently. |
 | `max_attachment_bytes`| int     | `32768`                     | Per-field msgpack size cap. Oversize attachments are dropped with an inline `[image not forwarded: …]` note; text body still delivers. `0` disables the cap. |
 | `forwarded_fields`   | int list | `[6, 48, 49, 64, 65, 66]`   | Allowlist of LXMF field keys to forward when `forward_attachments=true`. Default covers `FIELD_IMAGE` (6) plus the upstream LXMF 1.0.0 message-meta fields: reply-to (`FIELD_REPLY_TO 0x30`=48 message-id, `FIELD_REPLY_QUOTE 0x31`=49 quoted text), tap-back reactions (`FIELD_REACTION 0x40`=64), comments (`FIELD_COMMENT 0x41`=65), and continuations (`FIELD_CONTINUATION 0x42`=66). Add `5` for files, `7` for audio once your senders/receivers handle them. |
