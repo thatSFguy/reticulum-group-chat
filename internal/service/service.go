@@ -116,9 +116,14 @@ func New(cfg *config.Config) (*Service, error) {
 	instanceUnlock, lockErr := acquireInstanceLock(cfg.Service.StatePath + ".lock")
 	if lockErr != nil {
 		if errors.Is(lockErr, errInstanceHeld) {
-			return nil, fmt.Errorf("another fwdsvc is already running with state_path %q — "+
+			// lockErr carries "by PID N" when the holder's PID could be
+			// read from the lockfile. The pgrep hint uses -x (exact
+			// process-name match): -f also matches any wrapper shell whose
+			// command line mentions fwdsvc, and killing the wrapper
+			// orphans the daemon instead of stopping it.
+			return nil, fmt.Errorf("another fwdsvc is already running with state_path %q (%v) — "+
 				"refusing to start to avoid duplicate message delivery; stop the other instance first "+
-				"(check with: pgrep -af fwdsvc)", cfg.Service.StatePath)
+				"(check with: pgrep -x fwdsvc)", cfg.Service.StatePath, lockErr)
 		}
 		logger.Printf("single-instance lock unavailable (%v); continuing without it", lockErr)
 	}
