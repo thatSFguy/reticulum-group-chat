@@ -275,6 +275,12 @@ func (rr *ResourceReceiver) Run(ctx context.Context) error {
 			rr.logger.Printf("resource receiver: timed out link=%x resource=%s — %d/%d parts received",
 				rr.link.ID[:4], ResourceHashShortHex(rr.resourceHash), rr.receivedCount, len(rr.parts))
 			rr.state.Store(int32(ResourceStateFailed))
+			// RCL so the sender stops retransmitting instead of burning
+			// its watchdog retries — upstream ≥1.3.9 RCLs on any
+			// receiver-side abort while the link is live (SPEC §10.9).
+			if cancelErr := rr.transport.broadcastResourceCancel(rr.link, rr.resourceHash, false); cancelErr != nil {
+				rr.logger.Printf("resource receiver: RCL on timeout: %v", cancelErr)
+			}
 			return ctx.Err()
 
 		case <-rr.cancelCh:
@@ -324,6 +330,18 @@ func (rr *ResourceReceiver) Run(ctx context.Context) error {
 		case hmu := <-rr.hmuCh:
 			if err := rr.applyHmu(hmu); err != nil {
 				rr.logger.Printf("resource receiver: apply HMU: %v", err)
+				if errors.Is(err, ErrResourceEmptyHmu) {
+					// Terminal per upstream ≥1.3.9 (SPEC §10.7): an empty
+					// hashmap continuation means the sender can never
+					// satisfy the remaining parts. RCL and fail rather
+					// than re-sending the same exhausted REQ until the
+					// transfer timeout.
+					rr.state.Store(int32(ResourceStateFailed))
+					if cancelErr := rr.transport.broadcastResourceCancel(rr.link, rr.resourceHash, false); cancelErr != nil {
+						rr.logger.Printf("resource receiver: RCL on empty HMU: %v", cancelErr)
+					}
+					return err
+				}
 				continue
 			}
 			// HMU extended our hashmap; immediately request the new
@@ -451,8 +469,13 @@ func (rr *ResourceReceiver) windowComplete() bool {
 // copied into hashmap[segment*HashmapMaxLen*MAPHASH_LEN ... ].
 //
 // Rejects HMU with the wrong segment_index (sequencing error) by
-// returning an error; the caller will RCL and abandon. Mirrors
-// upstream Resource.py:1043-1046.
+// returning an error; the caller ignores it and keeps waiting,
+// matching upstream's ≥1.3.9 out-of-turn-HMU gate (SPEC §10.7).
+//
+// An HMU whose segment decodes to zero map-hashes returns
+// ErrResourceEmptyHmu — a terminal error. Upstream ≥1.3.9 cancels the
+// transfer on an empty HMU; tolerating it here would loop forever,
+// re-sending the same exhausted REQ until the transfer timeout.
 func (rr *ResourceReceiver) applyHmu(h *ResourceHmu) error {
 	if !bytesEqual(h.ResourceHash, rr.resourceHash) {
 		return fmt.Errorf("HMU resource_hash mismatch")
@@ -462,6 +485,9 @@ func (rr *ResourceReceiver) applyHmu(h *ResourceHmu) error {
 	expectedSegment := rr.hashmapKnownPrefix / HashmapMaxLen
 	if h.SegmentIndex != expectedSegment {
 		return fmt.Errorf("HMU segment_index=%d, expected %d (sequencing error)", h.SegmentIndex, expectedSegment)
+	}
+	if len(h.HashmapBytes) < ResourceMapHashLen {
+		return fmt.Errorf("%w: segment_index=%d", ErrResourceEmptyHmu, h.SegmentIndex)
 	}
 	wantBytes := HashmapMaxLen * ResourceMapHashLen
 	// The last segment may legitimately be shorter than HashmapMaxLen

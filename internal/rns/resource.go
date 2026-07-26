@@ -234,4 +234,5 @@ var (
 	ErrResourceCollisionGuard  = errors.New("resource: hashmap collision could not be resolved after retries")
 	ErrResourceLinkClosed      = errors.New("resource: link closed before transfer completed")
 	ErrResourceUnknownHash     = errors.New("resource: control packet references unknown resource_hash")
+	ErrResourceEmptyHmu        = errors.New("resource: HMU carried an empty hashmap segment")
 )

@@ -257,3 +257,32 @@ func TestParseRejectsTruncated(t *testing.T) {
 		t.Error("expected error on truncated packet")
 	}
 }
+
+// SPEC §2.4: valid wire hops are 0–127; since RNS 1.3.8 receivers drop
+// hops >= 128 (PATHFINDER_M) as malformed.
+func TestParseRejectsHopsOutOfBound(t *testing.T) {
+	p := &Packet{
+		HeaderType:      HeaderType1,
+		TransportType:   BroadcastTransport,
+		DestinationType: DestinationSingle,
+		PacketType:      PacketData,
+		Hops:            127,
+		DestHash:        newDummyHash(0xAB),
+		Context:         ContextNone,
+		Data:            []byte("x"),
+	}
+	wire, err := p.Pack()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := ParsePacket(wire); err != nil {
+		t.Errorf("hops=127 should parse, got %v", err)
+	}
+
+	for _, hops := range []byte{128, 200, 255} {
+		wire[1] = hops
+		if _, err := ParsePacket(wire); err == nil {
+			t.Errorf("hops=%d should be rejected as malformed", hops)
+		}
+	}
+}
