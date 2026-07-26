@@ -61,6 +61,12 @@ const (
 
 	header1MinLen = 1 + 1 + addressHashLen + 1            // 19
 	header2MinLen = 1 + 1 + addressHashLen*2 + 1          // 35
+
+	// maxWireHops mirrors upstream Transport.PATHFINDER_M (= 128, the
+	// maximum path length). Since RNS 1.3.8, Packet.unpack raises on
+	// hops >= 128, so such a packet is dropped as malformed before any
+	// further processing (SPEC §2.4). Valid wire values are 0–127.
+	maxWireHops = 128
 )
 
 // errIFACUnsupported is returned by ParsePacket when the inbound packet's
@@ -131,6 +137,9 @@ func ParsePacket(raw []byte) (*Packet, error) {
 	ifacFlag, headerType, contextFlag, transportType, destType, packetType := unpackFlags(flags)
 	if ifacFlag {
 		return nil, errIFACUnsupported
+	}
+	if raw[1] >= maxWireHops {
+		return nil, fmt.Errorf("hops %d >= %d, malformed (SPEC §2.4)", raw[1], maxWireHops)
 	}
 
 	p := &Packet{

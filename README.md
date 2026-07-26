@@ -301,7 +301,7 @@ everything.
 | `/adduser <hash>`         | mods, admins | Add a user by their 32-hex destination hash — the invite path for a `locked` group. Adds them to the roster and sends a welcome + replay. |
 | `/removeuser <user>`      | mods, admins | Remove a member. In a `locked` group they can't return until re-added (unlike `/kick`, which lets them `/join` again in an open group). Not punitive like `/ban`. |
 | `/announce`               | mods, admins | Broadcast a fresh Reticulum announce immediately |
-| `/path <user>`            | mods, admins | Show what the transport knows about reaching `<user>`: cached announce age, hop count, next-hop transport_id, whether an Active Link is open. Mostly for troubleshooting delivery problems. |
+| `/path <user>`            | mods, admins | Show what the transport knows about reaching `<user>`: cached announce age, hop count, next-hop transport_id, whether an Active Link is open. Mostly for troubleshooting delivery problems. The hop count is approximate: peers running RNS ≥ 1.3.7 with the `local_hops_delta` privacy option inflate it by a constant 2–7 (SPEC §2.4). |
 | `/usermode <admin\|mod\|user> <user>` | admins | Grant or clear a runtime role for a roster member — no config edit or restart needed. `admin`/`mod` promote; `user` clears the runtime grant. |
 
 `<user>` accepts a **nickname** (case-insensitive) or a
