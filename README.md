@@ -482,8 +482,42 @@ Disabled by default; existing deployments are unaffected.
 |---|---|---|---|
 | `enabled` | bool   | `false`      | Turn propagation-node submission on. |
 | `mode`    | string | `"fallback"` | `"fallback"`: direct delivery first, re-route via the propagation node only after the direct retry budget (5 attempts) is exhausted. `"always"`: every outbound message goes to the propagation node only — nothing is dropped for being offline, at the cost of sync latency. |
-| `node`    | hex    | unset        | Pin a specific propagation node by its `lxmf.propagation` destination hash (32 hex chars). Unset = auto-select the most recently heard node currently announcing itself as accepting messages. |
+| `node`    | hex    | unset        | Pin a specific propagation node by its `lxmf.propagation` destination hash (32 hex chars). **Recommended where you know a node to use** — see [Choosing a propagation node](#choosing-a-propagation-node). Unset = auto-select: among nodes that are accepting and whose announced parameters we can satisfy, the one known longest and heard from recently. |
 | `direct_attempts` | int | `3` | **Shortens the direct retry budget, but only while a propagation node is available to fall back to** — failing over after 3 attempts (~75 s) instead of the standard 5 (~3.5 min) gets an offline member's mail onto the node sooner. Whenever no node is known, the full 5-attempt budget still applies before a message is dropped. Both numbers are printed at startup. Set to `5` to disable the shortening. Fallback mode only. |
+
+### Choosing a propagation node
+
+**Pin one if you can.** The decisive reason is not security, it is
+whether the message actually arrives: store-and-forward only completes
+when the recipient *fetches* it. If this service uploads to node A and
+your members poll node B, delivery depends on A and B peering and
+syncing with each other — which is best-effort, can be slow, and may
+not happen at all. Pinning the node your members already sync from
+makes the round trip deterministic.
+
+Pinning also settles two lesser points. An attacker cannot take the
+role by announcing, and you choose which operator sees your traffic
+metadata (see the trust note below).
+
+**The cost of pinning is failover.** A pinned node is used
+unconditionally — if it goes offline or stops accepting, store-and-forward
+stops until it returns or you change the setting. Direct delivery to
+online members is unaffected either way, so the failure is bounded: you
+lose the safety net, not the service.
+
+**Auto-discovery is reasonable if you don't know a node**, and is no
+longer trivially hijackable — selection prefers the node known longest
+among those currently accepting and satisfiable, rather than the most
+recently heard. But it still means handing your traffic to a stranger
+chosen by heuristic, and it does not solve the fetch-side mismatch
+above.
+
+**Trust note.** A propagation node cannot read your messages — bodies
+are encrypted to the recipient. It *can* see each recipient's
+destination hash (so over time, your roster), this service's identity,
+and the timing and size of everything sent. It can also silently
+discard what it is given. Submitted data cannot be recalled. In
+`mode = "always"` this covers every group message.
 
 Notes:
 

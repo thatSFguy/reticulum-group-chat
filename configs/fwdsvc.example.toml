@@ -150,8 +150,24 @@ mode = "fallback"
 direct_attempts = 3
 
 # Optional: pin a specific propagation node by its lxmf.propagation
-# destination hash (32 hex chars). Leave empty to auto-select the most
-# recently heard node that announces itself as accepting messages.
+# destination hash (32 hex chars).
+#
+# RECOMMENDED if you know a node to use — ideally the same one your
+# members sync from. Store-and-forward only completes when the
+# recipient FETCHES the message, so if we upload to node A and your
+# members poll node B, delivery depends on those two nodes peering and
+# syncing, which is best-effort and can be slow or simply not happen.
+# Pinning also removes any chance of an attacker taking over the role
+# by announcing (see the trust notes in the README).
+#
+# Trade-off: a pinned node is used unconditionally, with no automatic
+# failover. If it goes down, store-and-forward stops until it returns
+# or you change this value; direct delivery is unaffected.
+#
+# Leave empty to auto-select: among nodes that are accepting and whose
+# announced parameters we can satisfy, the one we have known longest
+# and heard from recently wins. That resists a newcomer flooding
+# announces to seize the role, but it still means trusting a stranger.
 #node = "00112233445566778899aabbccddeeff"
 
 # (admins / mods are now at the top of the file — see the comment block
