@@ -27,31 +27,48 @@ func (s *Service) onLXMFReceived(msg *lxmf.Message) {
 	// any message whose message_id we've already seen inside DedupWindow.
 	// Done before anything else so a duplicate command (e.g. /join) can't
 	// re-fire its side effects either. No-op when dedup is disabled.
-	if id := msg.MessageID(); len(id) > 0 {
-		msgIDHex := hex.EncodeToString(id)
-		if s.dedup.seenBefore(msgIDHex, now) {
-			s.logger.Printf("duplicate inbound dropped: from=%s msgid=%s", senderHex[:8], msgIDHex[:8])
+	// Keyed on DedupKey, NOT message_id: the spec's stamp tolerance
+	// makes message_id malleable, so keying on it let a captured signed
+	// body be replayed unboundedly with a fresh id each time — every
+	// replay fanned out to the whole roster and re-fired command side
+	// effects. DedupKey is stable under that mutation.
+	if id := msg.DedupKey(); len(id) > 0 {
+		keyHex := hex.EncodeToString(id)
+		if s.dedup.seenBefore(keyHex, now) {
+			s.logger.Printf("duplicate inbound dropped: from=%s key=%s", senderHex[:8], keyHex[:8])
 			return
 		}
+	}
+
+	// Banlist check FIRST: a banned sender must not be able to drive any
+	// further work, least of all the field-key diagnostic below.
+	if s.roster.IsBanned(senderBytes) {
+		s.logger.Printf("dropping banned sender %s", senderHex[:8])
+		return
 	}
 
 	// Diagnostic: dump the inbound shape (sender prefix, content length,
 	// raw fields-map key list with concrete Go types). Lets us see exactly
 	// what the wire is delivering when reactions / replies vanish before
-	// the rewrite stage. Will be tightened once cross-client reaction
-	// interop is stable.
+	// the rewrite stage.
+	//
+	// The key list is TRUNCATED because its width is attacker-controlled:
+	// the fields map has no key-count or key-length limit, so a large
+	// link-delivered body can carry ~10^5 keys and turn one message into
+	// a multi-megabyte log line — with no log rotation anywhere, that is
+	// remote-driven disk fill.
 	if len(msg.Fields) > 0 || len(msg.Content) == 0 {
-		fieldKeys := make([]string, 0, len(msg.Fields))
+		const maxLoggedFieldKeys = 16
+		fieldKeys := make([]string, 0, maxLoggedFieldKeys)
 		for k := range msg.Fields {
+			if len(fieldKeys) == maxLoggedFieldKeys {
+				fieldKeys = append(fieldKeys, fmt.Sprintf("…+%d more", len(msg.Fields)-maxLoggedFieldKeys))
+				break
+			}
 			fieldKeys = append(fieldKeys, fmt.Sprintf("%v(%T)", k, k))
 		}
-		s.logger.Printf("inbound LXMF: from=%s content_len=%d field_keys=%v",
-			senderHex[:8], len(msg.Content), fieldKeys)
-	}
-
-	if s.roster.IsBanned(senderBytes) {
-		s.logger.Printf("dropping banned sender %s", senderHex[:8])
-		return
+		s.logger.Printf("inbound LXMF: from=%s content_len=%d field_count=%d field_keys=%v",
+			senderHex[:8], len(msg.Content), len(msg.Fields), fieldKeys)
 	}
 
 	// Log the full sender hash on first contact so operators can find it

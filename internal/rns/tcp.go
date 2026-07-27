@@ -24,16 +24,34 @@ import (
 // down and gets the reconnect treatment.
 const tcpWriteTimeout = 5 * time.Second
 
+// tcpFrameAssemblyTimeout bounds how long a single partial frame may sit
+// incomplete before the connection is torn down. Applies only while a
+// frame is mid-assembly (see readLoop) — an idle connection with no
+// bytes in flight is never subject to it. Generous: one frame is at
+// most a few hundred bytes, so any peer taking more than 30s to finish
+// one is stalled or hostile.
+const tcpFrameAssemblyTimeout = 30 * time.Second
+
 type TCPClient struct {
-	conn   net.Conn
-	mu     sync.Mutex // guards Write
-	inbox  chan []byte
-	done   chan struct{}
-	err    atomic.Value // last receive-side error, set once
-	closed atomic.Bool
+	conn  net.Conn
+	mu    sync.Mutex // guards Write
+	inbox chan []byte
+	done  chan struct{}
+	// closing is closed by Close(). readLoop selects on it when handing
+	// a frame to inbox: `done` cannot serve that role because it is
+	// closed only by readLoop's own defer, so a reader blocked on a full
+	// inbox could never observe it and Close() could not reclaim the
+	// goroutine (closing the conn does not unblock a channel send).
+	closing chan struct{}
+	err     atomic.Value // last receive-side error, set once
+	closed  atomic.Bool
 
 	// writeTimeout defaults to tcpWriteTimeout; overridable in tests.
 	writeTimeout time.Duration
+
+	// frameTimeout bounds how long a PARTIAL frame may remain
+	// incomplete. Defaults to tcpFrameAssemblyTimeout; see readLoop.
+	frameTimeout time.Duration
 }
 
 // DialTCP opens a TCP connection to addr (e.g. "amsterdam.connect.reticulum.network:4965")
@@ -55,7 +73,9 @@ func NewTCPClient(conn net.Conn) *TCPClient {
 		conn:         conn,
 		inbox:        make(chan []byte, 64),
 		done:         make(chan struct{}),
+		closing:      make(chan struct{}),
 		writeTimeout: tcpWriteTimeout,
+		frameTimeout: tcpFrameAssemblyTimeout,
 	}
 	go t.readLoop()
 	return t
@@ -114,6 +134,7 @@ func (t *TCPClient) Close() error {
 	if t.closed.Swap(true) {
 		return nil
 	}
+	close(t.closing)
 	return t.conn.Close()
 }
 
@@ -121,6 +142,19 @@ func (t *TCPClient) readLoop() {
 	defer close(t.inbox)
 	defer close(t.done)
 	dec := NewHDLCDecoder(t.conn)
+	// Bound frame ASSEMBLY, not connection idleness: the deadline is
+	// armed once a frame's first byte has arrived and cleared as soon
+	// as the frame completes. A connection-wide read deadline would
+	// tear down legitimately idle links (Reticulum peers are quiet for
+	// minutes at a time); without any deadline, a peer that opens a
+	// frame and then stalls mid-frame pins the buffer and this
+	// goroutine indefinitely.
+	dec.onFrameStart = func() error {
+		return t.conn.SetReadDeadline(time.Now().Add(t.frameTimeout))
+	}
+	dec.onFrameEnd = func() {
+		_ = t.conn.SetReadDeadline(time.Time{})
+	}
 	for {
 		frame, err := dec.NextFrame()
 		if err != nil {
@@ -135,7 +169,7 @@ func (t *TCPClient) readLoop() {
 		}
 		select {
 		case t.inbox <- frame:
-		case <-t.done:
+		case <-t.closing:
 			return
 		}
 	}

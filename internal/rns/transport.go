@@ -18,11 +18,11 @@ import (
 // validated).
 //
 // The minimal-viable scope here matches what a leaf forwarder needs:
-// - Receive announces, verify them, remember the announcer's identity so
-//   we can encrypt Token replies to them later.
-// - Receive DATA packets addressed to one of our local destinations and
-//   hand them to the registered callback.
-// - Broadcast our outbound packets on every connected interface.
+//   - Receive announces, verify them, remember the announcer's identity so
+//     we can encrypt Token replies to them later.
+//   - Receive DATA packets addressed to one of our local destinations and
+//     hand them to the registered callback.
+//   - Broadcast our outbound packets on every connected interface.
 //
 // Out of scope (deferred): transit relaying (HEADER_1<->HEADER_2 conversion,
 // path-table-driven next-hop selection, hop-count incrementing). A leaf
@@ -37,6 +37,16 @@ type Transport struct {
 
 	pathRequestsSent     map[string]time.Time // key: hex dest_hash, dedup window for outbound
 	pathResponseTagsSeen map[string]time.Time // key: hex tag, dedup for inbound path? we've already responded to
+
+	// retransmitSlots caps concurrent retransmit goroutines spawned by
+	// broadcastWithRetransmits (one per inbound LINKREQUEST / path
+	// request / link DATA).
+	retransmitSlots slotLimiter
+
+	// rlog wraps logger for inbound-driven error paths; see
+	// logratelimit.go. Malformed-packet floods must not turn into
+	// synchronous disk writes on the dispatcher goroutine.
+	rlog *rateLimitedLogger
 
 	// packetProofWaiters tracks outbound DATA packets awaiting their
 	// SPEC §6.5 delivery proof (the PacketReceipt concept from upstream
@@ -84,6 +94,13 @@ const AnnounceLogReturnThreshold = 6 * time.Hour
 // re-broadcasts. Matches SPEC §7.2.5 PR_TAG_WINDOW.
 const PathResponseTagDedupWindow = 30 * time.Second
 
+// MaxPathResponseTags bounds the path-response dedup map. The expiry
+// sweep only removes entries older than the window, so without a hard
+// cap a sustained flood of requests aimed at us keeps the map (and
+// therefore every sweep) at attacker-chosen size. Far above the handful
+// of tags a real relay mesh produces in a 30-second window.
+const MaxPathResponseTags = 4096
+
 // KnownIdentityCapacity caps the number of cached known identities to
 // prevent a memory-DoS where an attacker on a public mesh broadcasts
 // announces from many fresh identities. When at capacity, the entry with
@@ -126,6 +143,12 @@ type KnownIdentity struct {
 	LastSeen   time.Time `json:"last_seen"`
 	LastRandom []byte    `json:"last_random"` // last seen random_hash, for cheap replay-defence dedup
 	Hops       byte      `json:"hops"`
+
+	// EmittedAt is the announce's own SIGNED emission time (decoded
+	// from random_hash). Routing state (Hops/TransportID) is only
+	// updated when an announce is at least as recent as this, so a
+	// replayed older announce cannot re-route us. See handleAnnounce.
+	EmittedAt time.Time `json:"emitted_at,omitempty"`
 
 	// TransportID is the next-hop transport node's identity hash for
 	// multi-hop sends, captured from the announce's outer packet header
@@ -187,12 +210,13 @@ func NewTransport(logger Logger) *Transport {
 		logger = noopLogger{}
 	}
 	return &Transport{
-		known:            map[string]*KnownIdentity{},
-		locals:           map[string]*LocalDestination{},
+		known:                map[string]*KnownIdentity{},
+		locals:               map[string]*LocalDestination{},
 		pathRequestsSent:     map[string]time.Time{},
 		pathResponseTagsSeen: map[string]time.Time{},
-		linkManager:      NewLinkManager(),
-		logger:           logger,
+		linkManager:          NewLinkManager(),
+		logger:               logger,
+		rlog:                 newRateLimitedLogger(logger),
 	}
 }
 
@@ -289,6 +313,23 @@ func (t *Transport) Restore(k *KnownIdentity) {
 		len(k.PublicKey) != PublicKeyLen {
 		return
 	}
+	// Re-derive the destination hash from the public key, exactly as
+	// Announce.Verify does for live announces. The restore path feeds
+	// the same cache that authorization keys off (source_hash -> admin
+	// role), so accepting a stored pairing on trust would let anyone
+	// who can write announces.json bind a victim's destination to an
+	// attacker key — and first-announcer-wins would then PROTECT the
+	// poisoned entry against the victim's real announce. The file is
+	// 0600 and local, so this is defense in depth, but the data needed
+	// to check is already in hand.
+	if len(k.NameHash) == NameHashLen {
+		idHash := sha256.Sum256(k.PublicKey)
+		if !bytesEqual(DestinationHash(k.NameHash, idHash[:IdentityHashLen]), k.DestHash) {
+			t.logger.Printf("announce cache: refusing entry %x — dest_hash does not derive from its public key",
+				k.DestHash[:4])
+			return
+		}
+	}
 	cp := &KnownIdentity{
 		DestHash:   append([]byte(nil), k.DestHash...),
 		PublicKey:  append([]byte(nil), k.PublicKey...),
@@ -297,6 +338,7 @@ func (t *Transport) Restore(k *KnownIdentity) {
 		LastSeen:   k.LastSeen,
 		LastRandom: append([]byte(nil), k.LastRandom...),
 		Hops:       k.Hops,
+		EmittedAt:  k.EmittedAt,
 	}
 	if k.TransportID != nil {
 		cp.TransportID = append([]byte(nil), k.TransportID...)
@@ -413,7 +455,7 @@ func (t *Transport) Run(ctx context.Context) {
 func (t *Transport) dispatch(raw []byte) {
 	p, err := ParsePacket(raw)
 	if err != nil {
-		t.logger.Printf("parse packet: %v", err)
+		t.rlog.Limited("packet-parse", "parse packet: %v", err)
 		return
 	}
 	switch p.PacketType {
@@ -528,19 +570,19 @@ func (t *Transport) handlePacketProof(p *Packet) {
 		sig = p.Data
 	case ProofBodyExplicitLen:
 		if !bytesEqual(p.Data[:sha256.Size], w.fullHash) {
-			t.logger.Printf("packet proof for %x: explicit hash mismatch", p.DestHash[:4])
+			t.rlog.Limited("proof-mismatch", "packet proof for %x: explicit hash mismatch", p.DestHash[:4])
 			return
 		}
 		sig = p.Data[sha256.Size:]
 	default:
-		t.logger.Printf("packet proof for %x: bad body length %d", p.DestHash[:4], len(p.Data))
+		t.rlog.Limited("proof-badlen", "packet proof for %x: bad body length %d", p.DestHash[:4], len(p.Data))
 		return
 	}
 	if !Validate(w.edPub, w.fullHash, sig) {
 		// Log-and-ignore rather than failing the waiter: an invalid
 		// proof from a third party must not mask a valid one the real
 		// recipient may still send.
-		t.logger.Printf("packet proof for %x: invalid signature", p.DestHash[:4])
+		t.rlog.Limited("proof-badsig", "packet proof for %x: invalid signature", p.DestHash[:4])
 		return
 	}
 	select {
@@ -552,11 +594,11 @@ func (t *Transport) handlePacketProof(p *Packet) {
 func (t *Transport) handleAnnounce(p *Packet) {
 	a, err := ParseAnnounce(p)
 	if err != nil {
-		t.logger.Printf("announce parse: %v", err)
+		t.rlog.Limited("announce-parse", "announce parse: %v", err)
 		return
 	}
 	if err := a.Verify(); err != nil {
-		t.logger.Printf("announce verify: %v", err)
+		t.rlog.Limited("announce-verify", "announce verify: %v", err)
 		return
 	}
 
@@ -608,17 +650,50 @@ func (t *Transport) handleAnnounce(p *Packet) {
 		prev = &KnownIdentity{}
 		t.known[key] = prev
 	}
-	prev.DestHash = a.DestHash
-	prev.PublicKey = a.PublicKey
-	prev.NameHash = a.NameHash
-	prev.AppData = a.AppData
+	// Deep-copy every retained field. These slices alias the inbound
+	// frame's backing array, so storing them directly pins the WHOLE
+	// frame for the lifetime of the cache entry — KnownIdentityCapacity
+	// bounds the entry count but nothing bounds the retained bytes. An
+	// attacker signs their own announces, so oversized app_data sails
+	// through verification. (TransportID below was already copied; the
+	// inconsistency is what flagged this.)
+	prev.DestHash = append([]byte(nil), a.DestHash...)
+	prev.PublicKey = append([]byte(nil), a.PublicKey...)
+	prev.NameHash = append([]byte(nil), a.NameHash...)
+	prev.AppData = append([]byte(nil), a.AppData...)
 	prev.LastSeen = now
-	prev.LastRandom = a.RandomHash
-	prev.Hops = a.Hops
-	if a.TransportID != nil {
-		prev.TransportID = append([]byte(nil), a.TransportID...)
-	} else {
-		prev.TransportID = nil
+	prev.LastRandom = append([]byte(nil), a.RandomHash...)
+
+	// ROUTING STATE IS UNSIGNED. hops and transport_id come from the
+	// outer packet header and are NOT covered by the announce
+	// signature, yet they decide the next hop for everything we send to
+	// this destination. The only replay guard above compares against
+	// the IMMEDIATELY PREVIOUS random_hash, so an older captured
+	// announce (different random_hash, validly signed) is accepted and
+	// can install an attacker as the next hop — selective blackholing
+	// and traffic-analysis positioning.
+	//
+	// Mitigation: only let routing state move FORWARD in signed time.
+	// EmittedAt lives inside signed_data and cannot be forged, so a
+	// replayed older announce keeps its right to refresh liveness but
+	// loses the right to re-route us. Announces without a decodable
+	// timestamp keep the previous behavior.
+	acceptRouting := true
+	if emitted, err := a.EmittedAt(); err == nil && !prev.EmittedAt.IsZero() {
+		acceptRouting = !emitted.Before(prev.EmittedAt)
+		if acceptRouting {
+			prev.EmittedAt = emitted
+		}
+	} else if err == nil {
+		prev.EmittedAt = emitted
+	}
+	if acceptRouting {
+		prev.Hops = a.Hops
+		if a.TransportID != nil {
+			prev.TransportID = append([]byte(nil), a.TransportID...)
+		} else {
+			prev.TransportID = nil
+		}
 	}
 	handlers := append([]AnnounceHandler(nil), t.announceHandlers...)
 	t.mu.Unlock()
@@ -674,7 +749,7 @@ func (t *Transport) handleLinkRequest(p *Packet) {
 		return // LINKREQUEST not for us
 	}
 	if dest.Identity == nil {
-		t.logger.Printf("LINKREQUEST for local %x but no identity registered (cannot sign LRPROOF)", p.DestHash[:4])
+		t.rlog.Limited("linkreq-noidentity", "LINKREQUEST for local %x but no identity registered (cannot sign LRPROOF)", p.DestHash[:4])
 		return
 	}
 
@@ -734,9 +809,25 @@ func (t *Transport) handlePathRequest(p *Packet) {
 	tag := p.Data[len(p.Data)-IdentityHashLen:]
 	tagKey := hex.EncodeToString(tag)
 
+	// RELEVANCE FIRST. On a shared public hub the overwhelming majority
+	// of path requests target other people, and the dedup bookkeeping
+	// below is only meaningful for requests we would actually answer.
+	// Doing it before this check meant every path request on the wire
+	// cost a full map scan under the transport-wide write lock — the
+	// lock that Recall, Broadcast and handleData all contend on — so a
+	// flood of requests for unrelated destinations degraded the whole
+	// transport. It also let an attacker grow the map at will.
+	t.mu.RLock()
+	local, isOurs := t.locals[hex.EncodeToString(target)]
+	t.mu.RUnlock()
+	if !isOurs {
+		return
+	}
+
 	t.mu.Lock()
-	// Sweep expired tags so the map can't grow unbounded under a flood.
 	now := time.Now()
+	// Sweep expired tags. Now bounded twice over: it only runs for
+	// requests aimed at us, and the map is additionally capped below.
 	for k, ts := range t.pathResponseTagsSeen {
 		if now.Sub(ts) > PathResponseTagDedupWindow {
 			delete(t.pathResponseTagsSeen, k)
@@ -746,9 +837,21 @@ func (t *Transport) handlePathRequest(p *Packet) {
 		t.mu.Unlock()
 		return // already responded recently
 	}
+	// Hard cap as a backstop: the sweep only removes EXPIRED entries, so
+	// under a sustained flood the map still stabilises at
+	// rate x window. Past the cap, drop the oldest entry rather than
+	// letting an attacker size the map (and the sweep) at will.
+	if len(t.pathResponseTagsSeen) >= MaxPathResponseTags {
+		var oldestKey string
+		var oldestAt time.Time
+		for k, ts := range t.pathResponseTagsSeen {
+			if oldestKey == "" || ts.Before(oldestAt) {
+				oldestKey, oldestAt = k, ts
+			}
+		}
+		delete(t.pathResponseTagsSeen, oldestKey)
+	}
 	t.pathResponseTagsSeen[tagKey] = now
-
-	local, isOurs := t.locals[hex.EncodeToString(target)]
 	t.mu.Unlock()
 	if !isOurs {
 		// Not for us. A transit-mode node would forward; we're a leaf,
@@ -775,7 +878,7 @@ func (t *Transport) handlePathRequest(p *Packet) {
 func (t *Transport) handleLRProof(p *Packet) {
 	parsed, err := ParseLRProof(p)
 	if err != nil {
-		t.logger.Printf("LRPROOF parse: %v", err)
+		t.rlog.Limited("lrproof-parse", "LRPROOF parse: %v", err)
 		return
 	}
 	// We don't know the responder dest_hash from the LRPROOF outer header
@@ -783,7 +886,7 @@ func (t *Transport) handleLRProof(p *Packet) {
 	// pending link to find which peer this proof is for.
 	link := t.linkManager.Get(parsed.LinkID)
 	if link == nil {
-		t.logger.Printf("LRPROOF for unknown link_id %x", parsed.LinkID[:4])
+		t.rlog.Limited("lrproof-unknown", "LRPROOF for unknown link_id %x", parsed.LinkID[:4])
 		return
 	}
 	link.mu.Lock()
@@ -902,7 +1005,16 @@ func (t *Transport) handleLinkData(p *Packet) {
 			return
 		}
 		l.mu.Lock()
-		l.LastActivity = time.Now()
+		// KEEPALIVE bodies are unencrypted by design (upstream parity),
+		// so anyone who observes a link_id can send one. Refreshing the
+		// idle timer on an UNAUTHENTICATED link would let an attacker
+		// keep links alive indefinitely — defeating the 15-minute sweep
+		// that is the only thing reclaiming entries from the link table.
+		// A link that has carried at least one authenticated DATA packet
+		// is a real peer, and its keepalives are honoured as before.
+		if l.authenticated {
+			l.LastActivity = time.Now()
+		}
 		isResponder := l.responderIdentity != nil
 		l.mu.Unlock()
 		// The link responder answers every inbound ping (0xFF) with a
@@ -1017,7 +1129,24 @@ func (t *Transport) broadcastWithRetransmits(pkt *Packet, label string) {
 		t.logger.Printf("broadcast %s: %v", label, err)
 		return
 	}
+	// Bound the retransmit fleet. This fires once per inbound
+	// LINKREQUEST, path request and link DATA, so without a ceiling a
+	// packet flood spawns goroutines without limit — each also emitting
+	// 3 outbound packets for 1 inbound, i.e. a reflection amplifier
+	// pointed at the shared hub. Worse, every one of them contends on
+	// the connection write mutex where a write can hold for up to
+	// tcpWriteTimeout, so against a slow peer they accumulate far faster
+	// than they drain.
+	//
+	// Past the ceiling we simply skip the retransmits: they are a
+	// best-effort delivery aid (SPEC §6.5 tolerates loss — the peer
+	// retries), so shedding them under load is strictly better than
+	// unbounded goroutine growth.
+	if !t.retransmitSlots.acquire() {
+		return
+	}
 	go func() {
+		defer t.retransmitSlots.release()
 		time.Sleep(250 * time.Millisecond)
 		if err := t.Broadcast(pkt); err != nil {
 			t.logger.Printf("retransmit %s (1/2): %v", label, err)
@@ -1029,14 +1158,47 @@ func (t *Transport) broadcastWithRetransmits(pkt *Packet, label string) {
 	}()
 }
 
+// MaxConcurrentRetransmits caps in-flight retransmit goroutines. Each
+// lives ~1s, so this also caps the retransmit rate at roughly
+// MaxConcurrentRetransmits per second.
+const MaxConcurrentRetransmits = 64
+
+// slotLimiter is a non-blocking counting semaphore.
+type slotLimiter struct {
+	mu    sync.Mutex
+	inUse int
+	max   int
+}
+
+func (s *slotLimiter) acquire() bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.max <= 0 {
+		s.max = MaxConcurrentRetransmits
+	}
+	if s.inUse >= s.max {
+		return false
+	}
+	s.inUse++
+	return true
+}
+
+func (s *slotLimiter) release() {
+	s.mu.Lock()
+	if s.inUse > 0 {
+		s.inUse--
+	}
+	s.mu.Unlock()
+}
+
 // Sentinel errors returned by SendOverLink so callers can branch on
 // failure mode (timeout vs. peer-unknown vs. handshake failure) without
 // string-matching.
 var (
-	ErrLinkPeerUnknown    = errors.New("link send: peer has not announced; cannot open link")
+	ErrLinkPeerUnknown      = errors.New("link send: peer has not announced; cannot open link")
 	ErrLinkHandshakeTimeout = errors.New("link send: LRPROOF did not arrive before timeout")
-	ErrLinkProofTimeout   = errors.New("link send: link DATA proof did not arrive before timeout")
-	ErrLinkSendFailed     = errors.New("link send: broadcast failed")
+	ErrLinkProofTimeout     = errors.New("link send: link DATA proof did not arrive before timeout")
+	ErrLinkSendFailed       = errors.New("link send: broadcast failed")
 )
 
 // DefaultLinkSendTimeout is the per-call ceiling for the entire
@@ -1240,7 +1402,7 @@ func (t *Transport) acquireLinkTo(responderDestHash []byte, deadline time.Time) 
 func (t *Transport) handleLinkProof(p *Packet) {
 	link := t.linkManager.Get(p.DestHash)
 	if link == nil {
-		t.logger.Printf("link DATA proof for unknown link_id %x", p.DestHash[:4])
+		t.rlog.Limited("linkproof-unknown", "link DATA proof for unknown link_id %x", p.DestHash[:4])
 		return
 	}
 	link.mu.Lock()
@@ -1255,7 +1417,7 @@ func (t *Transport) handleLinkProof(p *Packet) {
 
 	packetHash, err := ValidateLinkProof(p, peerPub)
 	if err != nil {
-		t.logger.Printf("link DATA proof reject: %v", err)
+		t.rlog.Limited("linkproof-reject", "link DATA proof reject: %v", err)
 		return
 	}
 	link.mu.Lock()

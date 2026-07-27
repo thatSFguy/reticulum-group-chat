@@ -2,6 +2,7 @@ package lxmf
 
 import (
 	"bytes"
+	"encoding/hex"
 	"errors"
 	"testing"
 	"time"
@@ -65,7 +66,7 @@ func TestParseDecodesNestedIntKeyedReactionFields(t *testing.T) {
 	target := bytes.Repeat([]byte{0xAB}, 32)
 	fields := map[any]any{
 		0x40: map[any]any{ // FIELD_REACTION
-			0x00: target,        // REACTION_TO (raw 32B)
+			0x00: target,      // REACTION_TO (raw 32B)
 			0x01: []byte("👍"), // REACTION_CONTENT
 		},
 	}
@@ -297,4 +298,228 @@ func mustDecodeArray(t *testing.T, raw []byte) []any {
 		t.Fatalf("decode array: %v", err)
 	}
 	return arr
+}
+
+// TestParseRejectsMsgpackBombPreVerification is the end-to-end
+// regression for the remote unauthenticated OOM.
+//
+// The attack needs no relationship with the service: anyone can
+// Token-encrypt to our announced public key, and the payload is
+// msgpack-decoded here BEFORE the LXMF signature is checked (Verify is
+// the caller's next step). With the pinned msgpack library's broken
+// allocation limit, the 5-byte array32 header below requests ~103 GB —
+// an unrecoverable Go runtime OOM that no recover() can catch.
+func TestParseRejectsMsgpackBombPreVerification(t *testing.T) {
+	bomb := []byte{0xdd, 0xff, 0xff, 0xff, 0xff} // array32, 2^32-1 elements
+
+	body := make([]byte, 0, rns.IdentityHashLen+signatureLen+len(bomb))
+	body = append(body, bytes.Repeat([]byte{0x11}, rns.IdentityHashLen)...) // source
+	body = append(body, bytes.Repeat([]byte{0x22}, signatureLen)...)        // junk sig
+	body = append(body, bomb...)
+
+	destHash := bytes.Repeat([]byte{0x33}, rns.IdentityHashLen)
+	if _, err := ParseOpportunisticBody(body, destHash); err == nil {
+		t.Fatal("msgpack bomb accepted by the opportunistic parse path")
+	}
+
+	// Same body over the link (direct) form.
+	direct := append(append([]byte{}, destHash...), body...)
+	if _, err := ParseDirectBody(direct); err == nil {
+		t.Fatal("msgpack bomb accepted by the direct parse path")
+	}
+}
+
+// TestParseRejectsNestedFieldBomb covers the untyped decode path: a
+// well-formed payload whose FIELDS map carries a bogus array header.
+func TestParseRejectsNestedFieldBomb(t *testing.T) {
+	// [ts, title, content, {6: array32(2^32-1)}] hand-assembled so the
+	// bomb survives into the fields element.
+	payload := []byte{0x94, 0xcb} // fixarray(4), float64 marker
+	payload = append(payload, make([]byte, 8)...)
+	payload = append(payload, 0xc4, 0x00) // bin8 len 0 (title)
+	payload = append(payload, 0xc4, 0x00) // bin8 len 0 (content)
+	payload = append(payload, 0x81, 0x06) // fixmap(1), key 6
+	payload = append(payload, 0xdd, 0xff, 0xff, 0xff, 0xff)
+
+	body := append(bytes.Repeat([]byte{0x11}, rns.IdentityHashLen),
+		bytes.Repeat([]byte{0x22}, signatureLen)...)
+	body = append(body, payload...)
+
+	if _, err := ParseOpportunisticBody(body, bytes.Repeat([]byte{0x33}, rns.IdentityHashLen)); err == nil {
+		t.Fatal("nested field bomb accepted")
+	}
+}
+
+// TestDedupKeyIsStampInvariant is the regression for the replay bypass:
+// SPEC §5.6 lets a stamp be added/changed without invalidating the
+// signature, so message_id (computed over the stamp-inclusive payload)
+// differs for every stamp value. Keying dedup on it let one captured
+// signed body be replayed unboundedly, each copy looking new.
+func TestDedupKeyIsStampInvariant(t *testing.T) {
+	sender, _ := rns.NewIdentity()
+	senderDest := sender.DestinationHashFor(FullName())
+	destHash := bytes.Repeat([]byte{0x33}, rns.IdentityHashLen)
+
+	body, _, err := SignAndPackOpportunistic(sender, senderDest, destHash,
+		nil, []byte("replay me"), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	base, err := ParseOpportunisticBody(body, destHash)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := base.Verify(sender.PublicKey()[32:]); err != nil {
+		t.Fatal(err)
+	}
+
+	// Re-encode the payload with an added 5th element (a stamp), the
+	// mutation the spec explicitly tolerates.
+	var elems []msgpack.RawMessage
+	if err := msgpack.Unmarshal(base.rawPayload, &elems); err != nil {
+		t.Fatal(err)
+	}
+	seenIDs := map[string]bool{}
+	seenKeys := map[string]bool{}
+	for _, stamp := range [][]byte{
+		bytes.Repeat([]byte{0x00}, StampSize),
+		bytes.Repeat([]byte{0x01}, StampSize),
+		bytes.Repeat([]byte{0x02}, StampSize),
+	} {
+		parts := make([]any, 0, 5)
+		for _, e := range elems[:4] {
+			var v any
+			if err := msgpack.Unmarshal(e, &v); err != nil {
+				t.Fatal(err)
+			}
+			parts = append(parts, v)
+		}
+		parts = append(parts, stamp)
+		payload, err := msgpack.Marshal(parts)
+		if err != nil {
+			t.Fatal(err)
+		}
+		mutated := append(append([]byte{}, body[:rns.IdentityHashLen+signatureLen]...), payload...)
+
+		m, err := ParseOpportunisticBody(mutated, destHash)
+		if err != nil {
+			t.Fatalf("stamped variant did not parse: %v", err)
+		}
+		// Premise: the signature still verifies under the spec's
+		// stamp-stripping tolerance. That is what makes this a replay.
+		if err := m.Verify(sender.PublicKey()[32:]); err != nil {
+			t.Fatalf("premise broken — stamped variant should verify: %v", err)
+		}
+		seenIDs[hex.EncodeToString(m.MessageID())] = true
+		seenKeys[hex.EncodeToString(m.DedupKey())] = true
+	}
+
+	if len(seenIDs) == 1 {
+		t.Error("premise broken — message_id should differ per stamp")
+	}
+	if len(seenKeys) != 1 {
+		t.Errorf("DedupKey produced %d distinct values across stamp variants; want 1", len(seenKeys))
+	}
+	// And it must match the unstamped original, so the first replay is caught.
+	if hex.EncodeToString(base.DedupKey()) != firstKey(seenKeys) {
+		t.Error("DedupKey of stamped variants differs from the unstamped original")
+	}
+}
+
+func firstKey(m map[string]bool) string {
+	for k := range m {
+		return k
+	}
+	return ""
+}
+
+func TestDedupKeyDiffersAcrossSenders(t *testing.T) {
+	// Distinct senders must never collide, even with identical content.
+	a, _ := rns.NewIdentity()
+	b, _ := rns.NewIdentity()
+	dest := bytes.Repeat([]byte{0x33}, rns.IdentityHashLen)
+
+	keyFor := func(id *rns.Identity) string {
+		body, _, err := SignAndPackOpportunistic(id, id.DestinationHashFor(FullName()),
+			dest, nil, []byte("same text"), nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		m, err := ParseOpportunisticBody(body, dest)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return hex.EncodeToString(m.DedupKey())
+	}
+	if keyFor(a) == keyFor(b) {
+		t.Error("different senders produced the same DedupKey")
+	}
+}
+
+// TestVerifyStampedMessageWithIntKeyedFields is the regression for the
+// variant-2 interop bug: a stamped message carrying the integer-keyed
+// field maps real clients send (reply-to, reaction, image) must still
+// verify. Previously reencodeFirstFour decoded with the default map
+// decoder, which chokes on integer keys, so every such message was
+// dropped — stamp-using senders lost all reactions, replies and images.
+func TestVerifyStampedMessageWithIntKeyedFields(t *testing.T) {
+	sender, _ := rns.NewIdentity()
+	senderDest := sender.DestinationHashFor(FullName())
+	destHash := bytes.Repeat([]byte{0x33}, rns.IdentityHashLen)
+
+	cases := map[string]map[any]any{
+		"reply-to": {0x30: bytes.Repeat([]byte{0xAB}, 32)},
+		"reaction": {0x40: map[any]any{
+			0x00: bytes.Repeat([]byte{0x01}, 32),
+			0x01: []byte("👍"),
+		}},
+		"image": {0x06: []any{[]byte("png"), bytes.Repeat([]byte{0x89}, 64)}},
+		"multi-key": {
+			0x30: bytes.Repeat([]byte{0xCD}, 32),
+			0x31: []byte("quoted text"),
+			0x40: map[any]any{0x00: bytes.Repeat([]byte{0x02}, 32), 0x01: []byte("🎉")},
+		},
+	}
+
+	for name, fields := range cases {
+		body, _, err := SignAndPackOpportunistic(sender, senderDest, destHash,
+			nil, []byte("hello"), fields)
+		if err != nil {
+			t.Fatalf("%s: pack: %v", name, err)
+		}
+
+		// Append a stamp as the 5th element — the mutation SPEC §5.6
+		// tolerates, and what a stamp-using client actually sends.
+		parsed, err := ParseOpportunisticBody(body, destHash)
+		if err != nil {
+			t.Fatalf("%s: parse: %v", name, err)
+		}
+		var elems []msgpack.RawMessage
+		if err := msgpack.Unmarshal(parsed.rawPayload, &elems); err != nil {
+			t.Fatalf("%s: split payload: %v", name, err)
+		}
+		stamped := []byte{0x95} // fixarray, 5 elements
+		for _, e := range elems[:4] {
+			stamped = append(stamped, e...)
+		}
+		stampBytes, _ := msgpack.Marshal(bytes.Repeat([]byte{0x7F}, StampSize))
+		stamped = append(stamped, stampBytes...)
+
+		wire := append(append([]byte{}, body[:rns.IdentityHashLen+signatureLen]...), stamped...)
+		m, err := ParseOpportunisticBody(wire, destHash)
+		if err != nil {
+			t.Fatalf("%s: parse stamped: %v", name, err)
+		}
+		if m.Stamp == nil {
+			t.Fatalf("%s: stamp not parsed — test setup wrong", name)
+		}
+		if err := m.Verify(sender.PublicKey()[32:]); err != nil {
+			t.Errorf("%s: stamped message with int-keyed fields failed verification: %v", name, err)
+		}
+		// The fields must survive intact for forwarding.
+		if len(m.Fields) != len(fields) {
+			t.Errorf("%s: decoded %d fields, want %d", name, len(m.Fields), len(fields))
+		}
+	}
 }

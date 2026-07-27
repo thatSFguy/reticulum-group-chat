@@ -9,6 +9,7 @@ import (
 
 	"github.com/vmihailenco/msgpack/v5"
 
+	"github.com/thatSFguy/reticulum-group-chat/internal/lxmf"
 	"github.com/thatSFguy/reticulum-group-chat/internal/rns"
 )
 
@@ -28,6 +29,18 @@ func pnAnnounce(t *testing.T, destByte byte, enabled bool) *rns.Announce {
 	}
 }
 
+func pnAppData(t *testing.T, enabled bool, transferLimitKB, stampCost int) []byte {
+	t.Helper()
+	data, err := msgpack.Marshal([]any{
+		false, time.Now().Unix(), enabled, transferLimitKB, transferLimitKB,
+		[]any{stampCost, 0, 0}, map[any]any{},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return data
+}
+
 func newTestTracker(pinned []byte) *propagationTracker {
 	return newPropagationTracker(log.New(io.Discard, "", 0), pinned)
 }
@@ -42,7 +55,10 @@ func TestTrackerAspectMatch(t *testing.T) {
 	}
 }
 
-func TestTrackerSelectsMostRecentEnabledNode(t *testing.T) {
+func TestTrackerPrefersLongestKnownNode(t *testing.T) {
+	// Selection must NOT be "most recently heard": announces are free
+	// and unauthenticated, so that policy let an attacker announcing
+	// rapidly seize the role from established nodes. Longest-known wins.
 	tr := newTestTracker(nil)
 	if tr.Current() != nil {
 		t.Fatal("empty tracker should have no current node")
@@ -52,16 +68,82 @@ func TestTrackerSelectsMostRecentEnabledNode(t *testing.T) {
 	clock := base
 	tr.now = func() time.Time { return clock }
 
-	tr.OnAnnounce(pnAnnounce(t, 0xaa, true))
+	tr.OnAnnounce(pnAnnounce(t, 0xaa, true)) // established node
 	clock = base.Add(time.Minute)
-	tr.OnAnnounce(pnAnnounce(t, 0xbb, true))
+	tr.OnAnnounce(pnAnnounce(t, 0xbb, true)) // newcomer
+
+	// Newcomer announces again, most recently — must NOT win.
 	clock = base.Add(2 * time.Minute)
-	tr.OnAnnounce(pnAnnounce(t, 0xcc, false)) // most recent but not accepting
+	tr.OnAnnounce(pnAnnounce(t, 0xbb, true))
+	// Established node re-announces to stay fresh.
+	tr.OnAnnounce(pnAnnounce(t, 0xaa, true))
 
 	got := tr.Current()
-	want := bytes.Repeat([]byte{0xbb}, 16)
+	want := bytes.Repeat([]byte{0xaa}, 16)
 	if !bytes.Equal(got, want) {
-		t.Errorf("Current() = %x, want most recent ENABLED node %x", got, want)
+		t.Errorf("Current() = %x, want longest-known node %x", got, want)
+	}
+}
+
+func TestTrackerDropsStaleNodes(t *testing.T) {
+	tr := newTestTracker(nil)
+	base := time.Unix(1700000000, 0)
+	clock := base
+	tr.now = func() time.Time { return clock }
+
+	tr.OnAnnounce(pnAnnounce(t, 0xaa, true))
+	if tr.Current() == nil {
+		t.Fatal("fresh node should be selectable")
+	}
+	// Past the staleness window with no re-announce.
+	clock = base.Add(nodeStaleAfter + time.Minute)
+	if got := tr.Current(); got != nil {
+		t.Errorf("Current() = %x, want nil for a stale node", got)
+	}
+}
+
+func TestTrackerRejectsHostileParameters(t *testing.T) {
+	// A node announcing parameters we cannot satisfy must be filtered
+	// at SELECTION time. Discovering this at send time instead made the
+	// error terminal for the MESSAGE (it is neither errNoPropagationNode
+	// nor transient), so one hostile announce destroyed all fallback mail.
+	for name, appData := range map[string][]byte{
+		"stamp cost above local limit": pnAppData(t, true, 256, lxmf.MaxPropagationStampCost+1),
+		"absurd stamp cost":            pnAppData(t, true, 256, 200),
+		"implausible transfer limit":   pnAppData(t, true, 1, 0),
+	} {
+		tr := newTestTracker(nil)
+		tr.OnAnnounce(&rns.Announce{
+			DestHash: bytes.Repeat([]byte{0xee}, 16),
+			NameHash: lxmfPropagationNameHash,
+			AppData:  appData,
+		})
+		if got := tr.Current(); got != nil {
+			t.Errorf("%s: node selected (%x); want rejected", name, got)
+		}
+	}
+}
+
+func TestTrackerNodeMapIsBounded(t *testing.T) {
+	tr := newTestTracker(nil)
+	base := time.Unix(1700000000, 0)
+	clock := base
+	tr.now = func() time.Time { return clock }
+
+	// More distinct announcers than the cap, all fresh.
+	for i := 0; i < maxTrackedNodes+100; i++ {
+		clock = base.Add(time.Duration(i) * time.Second)
+		tr.OnAnnounce(&rns.Announce{
+			DestHash: bytes.Repeat([]byte{byte(i % 256), byte(i / 256)}, 8),
+			NameHash: lxmfPropagationNameHash,
+			AppData:  pnAppData(t, true, 256, 0),
+		})
+	}
+	tr.mu.Lock()
+	n := len(tr.nodes)
+	tr.mu.Unlock()
+	if n > maxTrackedNodes {
+		t.Errorf("tracker holds %d nodes, want <= %d", n, maxTrackedNodes)
 	}
 }
 

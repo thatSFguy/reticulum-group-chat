@@ -32,6 +32,11 @@ type PropagationNodeInfo struct {
 	PeeringCost        int   // [5][2] PoW cost for node-to-node peering keys
 }
 
+// maxAnnouncedLimitKB clamps announced transfer/sync limits (1 GiB).
+// Larger values are meaningless for LXMF bundles and only serve to
+// overflow the byte-comparison arithmetic.
+const maxAnnouncedLimitKB = 1 << 20
+
 // ErrPropagationAppData is wrapped by every ParsePropagationNodeAppData
 // failure so callers can errors.Is a malformed announce without matching
 // message text.
@@ -69,6 +74,18 @@ func ParsePropagationNodeAppData(appData []byte) (*PropagationNodeInfo, error) {
 	}
 	if err := decodeOptionalInt(elems[4], &info.PerSyncLimitKB); err != nil {
 		return nil, fmt.Errorf("%w: per_sync_limit: %v", ErrPropagationAppData, err)
+	}
+	// Clamp announced limits to a sane range. These are attacker-chosen
+	// int64s: SendPropagated computes `limit * 1000` to compare against
+	// the bundle size, which OVERFLOWS near MaxInt64 and can wrap
+	// negative — making the comparison always true and rejecting every
+	// bundle, i.e. a blackhole by arithmetic. (The float path can also
+	// yield an unspecified value from NaN/Inf.)
+	if info.PerTransferLimitKB < 0 || info.PerTransferLimitKB > maxAnnouncedLimitKB {
+		info.PerTransferLimitKB = maxAnnouncedLimitKB
+	}
+	if info.PerSyncLimitKB < 0 || info.PerSyncLimitKB > maxAnnouncedLimitKB {
+		info.PerSyncLimitKB = maxAnnouncedLimitKB
 	}
 
 	var costs []msgpack.RawMessage

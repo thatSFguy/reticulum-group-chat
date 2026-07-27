@@ -77,6 +77,10 @@ type Service struct {
 	// dispatcher goroutine; its run loop is started in Run.
 	announcePersist *announcePersistTap
 
+	// replayLimit throttles history replay per destination so a
+	// /leave + /join cycle cannot re-trigger the fan-out repeatedly.
+	replayLimit *replayLimiter
+
 	logger *log.Logger
 	now    func() time.Time
 }
@@ -190,7 +194,12 @@ func New(cfg *config.Config) (*Service, error) {
 
 	outboundStore := newOutboundStore(outboundStorePath(cfg.Service.StatePath))
 	outbound := newOutboundQueue(
-		&deliverySender{delivery: delivery, transport: transport, nodes: propNodes},
+		&deliverySender{
+			delivery:  delivery,
+			transport: transport,
+			nodes:     propNodes,
+			propSlots: make(chan struct{}, maxConcurrentPropagationSends),
+		},
 		outboundStore,
 		logger,
 	)
@@ -227,6 +236,7 @@ func New(cfg *config.Config) (*Service, error) {
 		idmap:          idCache,
 		dedup:          dedup,
 		instanceUnlock: instanceUnlock,
+		replayLimit:    newReplayLimiter(),
 		logger:         logger,
 		now:            time.Now,
 	}
@@ -321,6 +331,9 @@ func (s *Service) Run(ctx context.Context) error {
 	// Announce-cache persistence runs off the dispatcher: OnAnnounce only
 	// kicks this loop, which debounces bursts into one snapshot write.
 	go s.announcePersist.run(tCtx)
+	// Roster announce-timestamp updates are likewise deferred off the
+	// dispatcher (roster.deferPersistLocked) and flushed here.
+	go s.runRosterFlusher(tCtx)
 	// RunLinkSweeper closes idle outbound links and emits KEEPALIVE on
 	// active ones so the responder doesn't tear them down for inactivity.
 	go s.transport.RunLinkSweeper(tCtx)
@@ -688,3 +701,30 @@ var _ rns.AnnounceHandler = (*announceTap)(nil)
 // errSenderUnknown is surfaced from inbound when the LXMF source hasn't
 // announced yet. We can't reply to them either, so the message is dropped.
 var errSenderUnknown = errors.New("sender hasn't announced yet")
+
+// rosterFlushInterval is how often deferred roster changes (announce
+// timestamps, written from the packet dispatcher) reach disk. Announce
+// traffic on a busy hub is continuous, so a full whole-roster marshal
+// per announce was blocking inbound packet processing; batching them
+// costs nothing because the data only drives multi-week prune windows.
+const rosterFlushInterval = 30 * time.Second
+
+// runRosterFlusher writes deferred roster state on a timer and once
+// more at shutdown, so a graceful stop never loses announce timestamps.
+func (s *Service) runRosterFlusher(ctx context.Context) {
+	ticker := time.NewTicker(rosterFlushInterval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			if err := s.roster.Flush(); err != nil {
+				s.logger.Printf("roster flush on shutdown: %v", err)
+			}
+			return
+		case <-ticker.C:
+			if err := s.roster.Flush(); err != nil {
+				s.logger.Printf("roster flush: %v", err)
+			}
+		}
+	}
+}

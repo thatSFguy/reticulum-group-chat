@@ -42,6 +42,12 @@ func (t *Transport) handleResourceControl(p *Packet) {
 		t.logger.Printf("resource control decrypt: %v", err)
 		return
 	}
+	// Successful link-layer decrypt proves the peer holds the session
+	// keys — same authentication signal as an inbound link DATA packet.
+	// Resource transfers never touch HandleLinkData, so without this a
+	// link used only for Resource traffic would look unauthenticated
+	// and its keepalives would be ignored (see Link.authenticated).
+	link.MarkAuthenticated()
 
 	switch p.Context {
 	case ContextResourceADV:

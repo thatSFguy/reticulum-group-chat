@@ -76,6 +76,19 @@ const (
 	PropagationModeAlways   = "always"
 )
 
+// Reserved LXMF field keys the relay stamps itself (see
+// internal/service/rewrite.go). They must never be forwarded from
+// inbound messages.
+const (
+	fieldOriginatorIdentity = 251 // 0xFB
+	fieldOriginatorHash     = 252 // 0xFC
+)
+
+// DefaultMaxMembers bounds the roster by default. Chosen to be far
+// above any realistic group-chat membership while still denying an
+// attacker unbounded growth of state, fan-out cost, and reply size.
+const DefaultMaxMembers = 512
+
 // DefaultPropagationDirectAttempts is the direct-delivery budget used
 // while a propagation fallback node is available. Applied by normalize
 // when direct_attempts is unset (0).
@@ -142,7 +155,15 @@ type ServiceConfig struct {
 	// MaxMembers caps the size of the roster. /join attempts past this
 	// limit are refused with a polite "the chat is full" reply; the
 	// would-be joiner is not added. Existing members and paused members
-	// both count toward the limit. 0 = unlimited (default).
+	// both count toward the limit.
+	//
+	// Defaults to DefaultMaxMembers rather than unlimited: in an open
+	// (unlocked) group anyone can mint identities and /join, and roster
+	// size multiplies every fan-out — each new member adds an outbound
+	// queue entry per message, a replay burst on join, and a line in
+	// every /users reply. Prune runs hourly against multi-week windows,
+	// so it is no defense against a burst. Set to 0 for genuinely
+	// unlimited (not recommended on an open group).
 	MaxMembers int `toml:"max_members"`
 
 	// DedupWindow is how long an inbound LXMF message_id is remembered so a
@@ -295,6 +316,7 @@ func defaults() *Config {
 			PruneInterval:    Duration(1 * time.Hour),
 			AnnounceInterval:   Duration(10 * time.Minute),
 			MaxInboundChars:    500,
+			MaxMembers:         DefaultMaxMembers,
 			DedupWindow:        Duration(1 * time.Hour),
 			ForwardAttachments: true,
 			MaxAttachmentBytes: 1000 * 1024,
@@ -364,6 +386,15 @@ func (c *Config) normalize() error {
 	for i, k := range c.Service.ForwardedFields {
 		if k < 0 {
 			return fmt.Errorf("service.forwarded_fields[%d]: field key must be >= 0", i)
+		}
+		// 251/252 are the relay's own attribution fields (originator
+		// identity + verified source hash), stamped by rewrite.go on
+		// outbound reactions. Forwarding attacker-supplied values would
+		// let a non-reaction message carry a forged attribution that
+		// cooperating clients render as someone else — so they are
+		// refused in config rather than silently dropped at runtime.
+		if k == fieldOriginatorIdentity || k == fieldOriginatorHash {
+			return fmt.Errorf("service.forwarded_fields[%d]: field %d is reserved for relay attribution and must not be forwarded", i, k)
 		}
 	}
 	if s := strings.TrimSpace(c.Service.IdentityB64); s != "" {

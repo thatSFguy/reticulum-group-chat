@@ -3,6 +3,7 @@ package service
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
 	"errors"
 	"io"
 	"io/fs"
@@ -20,10 +21,17 @@ import (
 // validated fields in Transport.Restore; everything else is opaque
 // bytes the store treats as data.
 func makeKnownIdentity(seed byte, lastSeen time.Time) *rns.KnownIdentity {
+	// DestHash must genuinely derive from PublicKey + NameHash:
+	// Transport.Restore re-checks that binding (a stored pairing is
+	// otherwise a way to bind a victim's destination to an attacker
+	// key), so a synthetic mismatched fixture would be rejected.
+	pub := bytes.Repeat([]byte{seed ^ 0x80}, rns.PublicKeyLen)
+	nameHash := bytes.Repeat([]byte{seed ^ 0x40}, 10)
+	idHash := sha256.Sum256(pub)
 	return &rns.KnownIdentity{
-		DestHash:    bytes.Repeat([]byte{seed}, rns.IdentityHashLen),
-		PublicKey:   bytes.Repeat([]byte{seed ^ 0x80}, rns.PublicKeyLen),
-		NameHash:    bytes.Repeat([]byte{seed ^ 0x40}, 10),
+		DestHash:    rns.DestinationHash(nameHash, idHash[:rns.IdentityHashLen]),
+		PublicKey:   pub,
+		NameHash:    nameHash,
 		AppData:     []byte{seed, 'a', 'p', 'p'},
 		LastSeen:    lastSeen,
 		LastRandom:  bytes.Repeat([]byte{seed ^ 0x20}, 10),

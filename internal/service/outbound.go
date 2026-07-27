@@ -48,6 +48,44 @@ const (
 	// fallback bounded (~3 min) while cutting how often a persistently
 	// offline recipient re-occupies a worker.
 	maxRetryBackoff = 60 * time.Second
+
+	// maxPendingMessages bounds the queue. Without it, queue depth is
+	// driven by remote input with no ceiling: fan-out enqueues one
+	// entry per roster member per message, and entries for unreachable
+	// recipients linger through the whole retry budget. Both memory and
+	// the on-disk outbound.json grow unbounded. 10k entries is far above
+	// any legitimate backlog (a 500-member roster with 20 messages in
+	// flight) while capping the file in the low tens of MB.
+	maxPendingMessages = 10000
+
+	// persistFlushInterval coalesces queue writes. Every state change
+	// (enqueue, success, retry, deferral) used to rewrite the ENTIRE
+	// queue file synchronously while holding the queue mutex, so a
+	// single inbound message cost N full rewrites of an O(N) file —
+	// quadratic disk I/O per message, serialized across all workers.
+	// Writes are now marked dirty and flushed by one goroutine at most
+	// this often, with a final flush on shutdown.
+	//
+	// TRADE-OFF: a hard kill (SIGKILL/power loss) within this window
+	// can lose the most recent state change — an enqueue not yet
+	// written is lost, and a completed send not yet recorded is retried
+	// (the recipient may see it twice). A graceful stop flushes, so the
+	// exposure is limited to hard kills. 250ms bounds that to a
+	// fraction of a second's worth of traffic.
+	persistFlushInterval = 250 * time.Millisecond
+
+	// maxQueueAge is a terminal ceiling on how long a message may sit
+	// queued, regardless of why.
+	//
+	// The attempt budget alone does NOT bound residency: the
+	// "no propagation node available" path deliberately decrements the
+	// attempt counter so waiting for a node costs no budget, which means
+	// a message can defer indefinitely — forever if no node ever appears,
+	// or if the operator disables propagation while propagated messages
+	// are queued (they reload with the flag set, find no tracker, and
+	// re-defer every retry interval across every subsequent restart).
+	// EnqueuedAt was recorded but never read; this is what reads it.
+	maxQueueAge = 24 * time.Hour
 )
 
 // outboundMessage is one queued LXMF message awaiting delivery. The drain
@@ -62,14 +100,14 @@ const (
 // Keeps the on-disk format JSON-friendly without a custom marshaller for
 // the msgpack-typed values inside Fields.
 type outboundMessage struct {
-	ID          string         `json:"id"`
-	Recipient   []byte         `json:"recipient"`    // 16-byte lxmf.delivery dest_hash
-	Body        []byte         `json:"body"`         // pre-formatted UTF-8 chat body or command reply
-	Fields      map[any]any    `json:"-"`            // LXMF fields (FIELD_IMAGE, etc.); not persisted
-	Bubble      *idmap.Bubble  `json:"-"`            // optional; when set, the queue registers the recipient view in the cache on send success
-	Attempts    int            `json:"attempts"`     // 0..maxDeliveryAttempts
-	NextAttempt time.Time      `json:"next_attempt"` // zero = ready now
-	EnqueuedAt  time.Time      `json:"enqueued_at"`
+	ID          string        `json:"id"`
+	Recipient   []byte        `json:"recipient"`    // 16-byte lxmf.delivery dest_hash
+	Body        []byte        `json:"body"`         // pre-formatted UTF-8 chat body or command reply
+	Fields      map[any]any   `json:"-"`            // LXMF fields (FIELD_IMAGE, etc.); not persisted
+	Bubble      *idmap.Bubble `json:"-"`            // optional; when set, the queue registers the recipient view in the cache on send success
+	Attempts    int           `json:"attempts"`     // 0..maxDeliveryAttempts
+	NextAttempt time.Time     `json:"next_attempt"` // zero = ready now
+	EnqueuedAt  time.Time     `json:"enqueued_at"`
 
 	// Propagated routes this message via a propagation node (SPEC §5.8
 	// store-and-forward) instead of direct delivery. Set at enqueue when
@@ -129,6 +167,16 @@ type OutboundQueue struct {
 	pending  []*outboundMessage
 	inFlight map[string]bool // message ID → currently being sent
 
+	// dirty marks unwritten state changes; persistKick wakes the flush
+	// loop (buffered(1), so kicks coalesce). See persistFlushInterval.
+	dirty       bool
+	persistKick chan struct{}
+	flushEvery  time.Duration
+
+	// dropped counts messages refused because the queue was at
+	// maxPendingMessages, for the startup/telemetry log.
+	dropped int
+
 	// Tunables exposed for tests; production uses the package constants.
 	interval        time.Duration
 	retryWait       time.Duration
@@ -160,6 +208,8 @@ func newOutboundQueue(sender outboundSender, store *outboundStore, logger *log.L
 		store:           store,
 		logger:          logger,
 		inFlight:        map[string]bool{},
+		persistKick:     make(chan struct{}, 1),
+		flushEvery:      persistFlushInterval,
 		interval:        processingInterval,
 		retryWait:       deliveryRetryWait,
 		pathRequestWait: pathRequestWait,
@@ -212,9 +262,46 @@ func (q *OutboundQueue) Load() error {
 		return err
 	}
 	q.mu.Lock()
-	q.pending = msgs
+	propagationOn := q.propagationFallback || q.propagationAlways
+	kept := msgs[:0]
+	var demoted, dropped int
+	for _, m := range msgs {
+		// Reject structurally invalid entries rather than letting them
+		// reach the drain loop, where every log line indexes
+		// Recipient[:4] and a truncated value panics the worker.
+		if len(m.Recipient) != rns.IdentityHashLen {
+			dropped++
+			continue
+		}
+		// Demote propagated messages when propagation is no longer
+		// configured. Without this the flag is sticky and persisted:
+		// the message finds no tracker, defers forever, and survives
+		// every restart — an ordinary config change stranded mail.
+		if m.Propagated && !propagationOn {
+			m.Propagated = false
+			demoted++
+		}
+		kept = append(kept, m)
+	}
+	q.pending = kept
 	q.mu.Unlock()
+	if dropped > 0 {
+		q.logger.Printf("outbound: dropped %d malformed queue entries on load", dropped)
+	}
+	if demoted > 0 {
+		q.logger.Printf("outbound: propagation disabled — %d queued message(s) reverted to direct delivery", demoted)
+	}
 	return nil
+}
+
+// safePrefix renders the first 4 bytes of a recipient hash for logs
+// without assuming a length. Queue entries are validated on load, but a
+// log helper must never be the thing that panics.
+func safePrefix(b []byte) []byte {
+	if len(b) > 4 {
+		return b[:4]
+	}
+	return b
 }
 
 // Enqueue appends a message to the queue and persists immediately, so a
@@ -247,6 +334,20 @@ func (q *OutboundQueue) EnqueueBubble(recipient, body []byte, fields map[any]any
 		EnqueuedAt: q.now(),
 	}
 	q.mu.Lock()
+	// Refuse past the cap rather than growing without bound. Dropping
+	// the NEWEST message is deliberate: the backlog ahead of it is
+	// older, already persisted, and closer to delivery, so shedding at
+	// the tail preserves the most work. A full queue means delivery is
+	// badly backed up, and the sender is better served by an error in
+	// the log than by unbounded memory growth.
+	if len(q.pending) >= maxPendingMessages {
+		q.dropped++
+		dropped := q.dropped
+		q.mu.Unlock()
+		q.logger.Printf("outbound: queue full (%d) — dropping message to %x (%d dropped total)",
+			maxPendingMessages, recipient[:4], dropped)
+		return ""
+	}
 	msg.Propagated = q.propagationAlways
 	q.pending = append(q.pending, msg)
 	q.persistLocked()
@@ -261,6 +362,13 @@ func (q *OutboundQueue) EnqueueBubble(recipient, body []byte, fields map[any]any
 // interval (4s default).
 func (q *OutboundQueue) Run(ctx context.Context) {
 	var wg sync.WaitGroup
+	// Coalesced persistence runs alongside the workers; it flushes any
+	// outstanding state on ctx cancel before Run returns.
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		q.runPersistLoop(ctx)
+	}()
 	for i := 0; i < q.workers; i++ {
 		wg.Add(1)
 		go func() {
@@ -330,6 +438,26 @@ func (q *OutboundQueue) pickDue() *outboundMessage {
 	now := q.now()
 	q.mu.Lock()
 	defer q.mu.Unlock()
+
+	// Reap messages past maxQueueAge first, so a permanently-deferring
+	// entry cannot occupy the queue (and its disk footprint) forever.
+	var expired []*outboundMessage
+	for _, m := range q.pending {
+		if q.inFlight[m.ID] {
+			continue
+		}
+		if !m.EnqueuedAt.IsZero() && now.Sub(m.EnqueuedAt) > maxQueueAge {
+			expired = append(expired, m)
+		}
+	}
+	for _, m := range expired {
+		q.removeLocked(m)
+		q.logger.Printf("outbound: expiring message id=%s to %x after %s queued (propagated=%v)",
+			m.ID, safePrefix(m.Recipient), now.Sub(m.EnqueuedAt).Round(time.Minute), m.Propagated)
+	}
+	if len(expired) > 0 {
+		q.persistLocked()
+	}
 
 	var best *outboundMessage
 	var bestSeen time.Time
@@ -410,7 +538,7 @@ func (q *OutboundQueue) attempt(msg *outboundMessage) {
 		msg.Attempts--
 		msg.NextAttempt = q.now().Add(q.retryWait)
 		q.persistLocked()
-		q.logger.Printf("outbound: propagated message to %x deferred: %v", msg.Recipient[:4], err)
+		q.logger.Printf("outbound: propagated message to %x deferred: %v", safePrefix(msg.Recipient), err)
 		return
 	}
 	// Fallback re-route (mirrors LXMRouter's try_propagation_on_fail): a
@@ -428,7 +556,7 @@ func (q *OutboundQueue) attempt(msg *outboundMessage) {
 		msg.NextAttempt = q.now().Add(q.retryWait)
 		q.persistLocked()
 		q.logger.Printf("outbound: direct delivery to %x failed after %d attempts (%v) — re-routing via propagation node",
-			msg.Recipient[:4], attempts, err)
+			safePrefix(msg.Recipient), attempts, err)
 		return
 	}
 	if attempts >= q.maxAttempts {
@@ -442,7 +570,7 @@ func (q *OutboundQueue) attempt(msg *outboundMessage) {
 	// and Delivery.Send already short-circuits if Recall is empty.
 	if isRecipientUnknown(err) && attempts > q.pathlessTries {
 		if rerr := q.sender.RequestPath(msg.Recipient); rerr != nil {
-			q.logger.Printf("outbound: path? for %x: %v", msg.Recipient[:4], rerr)
+			q.logger.Printf("outbound: path? for %x: %v", safePrefix(msg.Recipient), rerr)
 		}
 		msg.NextAttempt = q.now().Add(q.pathRequestWait)
 	} else {
@@ -450,7 +578,7 @@ func (q *OutboundQueue) attempt(msg *outboundMessage) {
 	}
 	q.persistLocked()
 	q.logger.Printf("outbound: attempt %d/%d to %x failed: %v",
-		attempts, q.maxAttempts, msg.Recipient[:4], err)
+		attempts, q.maxAttempts, safePrefix(msg.Recipient), err)
 }
 
 // backoffWait returns the delay before the next attempt: retryWait
@@ -488,15 +616,77 @@ func (q *OutboundQueue) failLocked(msg *outboundMessage, err error) {
 	q.removeLocked(msg)
 	q.persistLocked()
 	q.logger.Printf("outbound: failing message id=%s to %x after %d attempts: %v",
-		msg.ID, msg.Recipient[:4], q.maxAttempts, err)
+		msg.ID, safePrefix(msg.Recipient), q.maxAttempts, err)
 }
 
+// persistLocked marks the queue dirty and wakes the flush loop. It does
+// NOT write — see persistFlushInterval for why the write is coalesced.
+// Callers must hold q.mu. Kept under the original name so every
+// existing call site keeps its meaning ("this state change must reach
+// disk").
 func (q *OutboundQueue) persistLocked() {
 	if q.store == nil {
 		return
 	}
-	if err := q.store.save(q.pending); err != nil {
+	q.dirty = true
+	select {
+	case q.persistKick <- struct{}{}:
+	default: // a flush is already pending; it will cover this change
+	}
+}
+
+// runPersistLoop coalesces queue writes until ctx is cancelled, then
+// performs a final flush so a graceful shutdown never loses state.
+func (q *OutboundQueue) runPersistLoop(ctx context.Context) {
+	if q.store == nil {
+		return
+	}
+	for {
+		select {
+		case <-ctx.Done():
+			q.Flush()
+			return
+		case <-q.persistKick:
+			select {
+			case <-time.After(q.flushEvery):
+			case <-ctx.Done():
+				q.Flush()
+				return
+			}
+			q.Flush()
+		}
+	}
+}
+
+// Flush writes the queue to disk if anything changed since the last
+// write. Safe to call concurrently; the snapshot is taken under the
+// queue mutex and the disk write happens outside it, so a slow disk
+// never blocks enqueues or workers.
+func (q *OutboundQueue) Flush() {
+	if q.store == nil {
+		return
+	}
+	q.mu.Lock()
+	if !q.dirty {
+		q.mu.Unlock()
+		return
+	}
+	q.dirty = false
+	// Copy the messages by value: workers mutate Attempts/NextAttempt/
+	// Propagated on the live pointers, and marshalling those concurrently
+	// would be a data race.
+	snapshot := make([]*outboundMessage, len(q.pending))
+	for i, m := range q.pending {
+		cp := *m
+		snapshot[i] = &cp
+	}
+	q.mu.Unlock()
+
+	if err := q.store.save(snapshot); err != nil {
 		q.logger.Printf("outbound: persist failed: %v", err)
+		q.mu.Lock()
+		q.dirty = true // retry on the next tick
+		q.mu.Unlock()
 	}
 }
 
@@ -531,7 +721,19 @@ type deliverySender struct {
 	delivery  *lxmf.Delivery
 	transport *rns.Transport
 	nodes     *propagationTracker
+
+	// propSlots caps how many workers may be inside a propagation
+	// upload at once. Every propagated message targets the SAME selected
+	// node, so without this a slow or hostile node occupies the entire
+	// pool and direct delivery to online members stops with it.
+	// Buffered channel used as a semaphore; nil means unlimited (tests).
+	propSlots chan struct{}
 }
+
+// maxConcurrentPropagationSends reserves worker capacity for direct
+// delivery: at most this many of outboundWorkers may be uploading to a
+// propagation node simultaneously.
+const maxConcurrentPropagationSends = 3
 
 func (d *deliverySender) SendLXMF(recipient, body []byte, fields map[any]any) ([]byte, error) {
 	return d.delivery.SendWithID(recipient, nil, body, fields)
@@ -544,6 +746,17 @@ func (d *deliverySender) SendLXMFPropagated(recipient, body []byte, fields map[a
 	node := d.nodes.Current()
 	if node == nil {
 		return nil, errNoPropagationNode
+	}
+	if d.propSlots != nil {
+		select {
+		case d.propSlots <- struct{}{}:
+			defer func() { <-d.propSlots }()
+		default:
+			// All propagation slots busy. Defer rather than queue behind
+			// them: errNoPropagationNode is the queue's "try again
+			// shortly" signal and does not consume the attempt budget.
+			return nil, errNoPropagationNode
+		}
 	}
 	msgID, err := d.delivery.SendPropagated(node, recipient, nil, body, fields)
 	// A pinned node we've never heard from can't be linked to — ask the

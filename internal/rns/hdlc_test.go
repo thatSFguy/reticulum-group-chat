@@ -2,6 +2,7 @@ package rns
 
 import (
 	"bytes"
+	"errors"
 	"io"
 	"testing"
 )
@@ -87,5 +88,48 @@ func TestHDLCTruncatedEscape(t *testing.T) {
 	dec := NewHDLCDecoder(bytes.NewReader(stream))
 	if _, err := dec.NextFrame(); err != ErrTruncatedEscape {
 		t.Errorf("got %v, want ErrTruncatedEscape", err)
+	}
+}
+
+// TestNextFrameRejectsOversizeFrame covers the pre-auth OOM: a peer that
+// streams non-FLAG bytes forever previously grew the frame buffer until
+// the process died. The cap must fire instead.
+func TestNextFrameRejectsOversizeFrame(t *testing.T) {
+	// A stream with a leading non-FLAG byte and no closing FLAG, longer
+	// than the cap.
+	junk := bytes.Repeat([]byte{0x41}, MaxHDLCFrameLen*2)
+	dec := NewHDLCDecoder(bytes.NewReader(junk))
+
+	_, err := dec.NextFrame()
+	if !errors.Is(err, ErrFrameTooLarge) {
+		t.Fatalf("err = %v, want ErrFrameTooLarge", err)
+	}
+}
+
+func TestNextFrameAcceptsFrameAtLimit(t *testing.T) {
+	// A frame exactly at the cap must still decode — the bound must not
+	// clip legitimate traffic (real packets are <= ReticulumMTU = 500,
+	// so this is far beyond anything valid, but the boundary matters).
+	payload := bytes.Repeat([]byte{0x42}, MaxHDLCFrameLen)
+	dec := NewHDLCDecoder(bytes.NewReader(EncodeHDLC(payload)))
+
+	got, err := dec.NextFrame()
+	if err != nil {
+		t.Fatalf("frame at the limit rejected: %v", err)
+	}
+	if len(got) != MaxHDLCFrameLen {
+		t.Errorf("decoded %d bytes, want %d", len(got), MaxHDLCFrameLen)
+	}
+}
+
+func TestNextFrameCapCountsUnescapedBytes(t *testing.T) {
+	// Escaped bytes decode 2 wire bytes -> 1 output byte. The cap must
+	// apply to the output length, so an all-escape stream is still
+	// bounded (and cannot be used to smuggle 2x past the limit).
+	esc := bytes.Repeat([]byte{hdlcEsc, hdlcFlag ^ hdlcEscMask}, MaxHDLCFrameLen*2)
+	dec := NewHDLCDecoder(bytes.NewReader(esc))
+
+	if _, err := dec.NextFrame(); !errors.Is(err, ErrFrameTooLarge) {
+		t.Fatalf("err = %v, want ErrFrameTooLarge", err)
 	}
 }
