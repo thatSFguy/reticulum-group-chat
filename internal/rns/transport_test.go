@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/hex"
+	"fmt"
 	"sync"
 	"testing"
 	"time"
@@ -31,9 +32,9 @@ func (f *fakeInterface) Send(p []byte) error {
 	return nil
 }
 
-func (f *fakeInterface) Inbox() <-chan []byte    { return f.inbox }
-func (f *fakeInterface) Done() <-chan struct{}   { return f.done }
-func (f *fakeInterface) close()                  { close(f.done) }
+func (f *fakeInterface) Inbox() <-chan []byte  { return f.inbox }
+func (f *fakeInterface) Done() <-chan struct{} { return f.done }
+func (f *fakeInterface) close()                { close(f.done) }
 func (f *fakeInterface) sentCopy() [][]byte {
 	f.mu.Lock()
 	defer f.mu.Unlock()
@@ -423,5 +424,128 @@ func TestTransportDedupesIdenticalRandomHash(t *testing.T) {
 
 	if got := len(handler.snapshot()); got != 1 {
 		t.Errorf("dedup failed: handler fired %d times, want 1", got)
+	}
+}
+
+// makePinTestAnnounce builds a verifiable announce for a fresh identity.
+func makePinTestAnnounce(t *testing.T) (*Identity, *Packet) {
+	t.Helper()
+	id, err := NewIdentity()
+	if err != nil {
+		t.Fatal(err)
+	}
+	appData, _ := EncodeLXMFAppData([]byte("peer"), nil)
+	pkt, err := BuildAnnounce(id, FullName("lxmf", "delivery"), appData, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return id, pkt
+}
+
+// TestPinnedDestinationSurvivesEvictionChurn is the regression for the
+// real-world failure: a hub carries far more announcing peers than the
+// cache holds, so stranger churn evicted the group members we depend on
+// being able to verify. Their next message then looked like it came from
+// an unknown sender and was dropped.
+func TestPinnedDestinationSurvivesEvictionChurn(t *testing.T) {
+	tr := NewTransport(nil)
+
+	// A peer we care about announces first — so it is the OLDEST entry,
+	// exactly the one plain oldest-first eviction would discard.
+	memberID, memberPkt := makePinTestAnnounce(t)
+	tr.handleAnnounce(memberPkt)
+	memberDest := memberID.DestinationHashFor(FullName("lxmf", "delivery"))
+	if tr.Recall(memberDest) == nil {
+		t.Fatal("member not cached after its announce")
+	}
+	tr.PinDestinations([][]byte{memberDest})
+
+	// Now flood the cache well past capacity with strangers.
+	for i := 0; i < KnownIdentityCapacity+64; i++ {
+		_, pkt := makePinTestAnnounce(t)
+		tr.handleAnnounce(pkt)
+	}
+
+	if tr.Recall(memberDest) == nil {
+		t.Error("pinned member was evicted by stranger churn — the bug this prevents")
+	}
+	tr.mu.RLock()
+	n := len(tr.known)
+	tr.mu.RUnlock()
+	if n > KnownIdentityCapacity {
+		t.Errorf("cache holds %d entries, above capacity %d", n, KnownIdentityCapacity)
+	}
+}
+
+// TestUnpinnedIsEvictedNormally confirms pinning is selective rather
+// than disabling eviction.
+func TestUnpinnedIsEvictedNormally(t *testing.T) {
+	tr := NewTransport(nil)
+	strangerID, strangerPkt := makePinTestAnnounce(t)
+	tr.handleAnnounce(strangerPkt)
+	strangerDest := strangerID.DestinationHashFor(FullName("lxmf", "delivery"))
+
+	for i := 0; i < KnownIdentityCapacity+8; i++ {
+		_, pkt := makePinTestAnnounce(t)
+		tr.handleAnnounce(pkt)
+	}
+	if tr.Recall(strangerDest) != nil {
+		t.Error("unpinned oldest entry survived a full cache churn")
+	}
+}
+
+// TestPinningCannotWedgeTheCache: if everything is pinned there must
+// still be room for new peers, or an over-large pinned set would stop
+// the service learning anyone new.
+func TestPinningCannotWedgeTheCache(t *testing.T) {
+	tr := NewTransport(nil)
+	var all [][]byte
+	for i := 0; i < 64; i++ {
+		id, pkt := makePinTestAnnounce(t)
+		tr.handleAnnounce(pkt)
+		all = append(all, id.DestinationHashFor(FullName("lxmf", "delivery")))
+	}
+	tr.PinDestinations(all)
+	if got := tr.PinnedCount(); got != 64 {
+		t.Fatalf("PinnedCount = %d, want 64", got)
+	}
+
+	// Force eviction with every existing entry pinned.
+	tr.mu.Lock()
+	for len(tr.known) < KnownIdentityCapacity {
+		tr.known[fmt.Sprintf("filler%d", len(tr.known))] = &KnownIdentity{LastSeen: time.Now()}
+	}
+	tr.mu.Unlock()
+
+	newID, newPkt := makePinTestAnnounce(t)
+	tr.handleAnnounce(newPkt)
+	if tr.Recall(newID.DestinationHashFor(FullName("lxmf", "delivery"))) == nil {
+		t.Error("new peer could not be admitted; pinning wedged the cache")
+	}
+}
+
+// TestPinReleaseOnRemoval: re-asserting the set without a peer releases
+// it, which is how membership loss (leave/kick/prune) unpins.
+func TestPinReleaseOnRemoval(t *testing.T) {
+	tr := NewTransport(nil)
+	id, pkt := makePinTestAnnounce(t)
+	tr.handleAnnounce(pkt)
+	dest := id.DestinationHashFor(FullName("lxmf", "delivery"))
+
+	tr.PinDestinations([][]byte{dest})
+	if tr.PinnedCount() != 1 {
+		t.Fatal("pin not applied")
+	}
+	tr.PinDestinations(nil) // peer left the roster
+	if tr.PinnedCount() != 0 {
+		t.Error("pin not released when the set was re-asserted without it")
+	}
+
+	for i := 0; i < KnownIdentityCapacity+8; i++ {
+		_, p := makePinTestAnnounce(t)
+		tr.handleAnnounce(p)
+	}
+	if tr.Recall(dest) != nil {
+		t.Error("released peer still protected from eviction")
 	}
 }

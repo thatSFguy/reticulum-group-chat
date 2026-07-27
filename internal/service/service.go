@@ -714,6 +714,7 @@ const rosterFlushInterval = 30 * time.Second
 func (s *Service) runRosterFlusher(ctx context.Context) {
 	ticker := time.NewTicker(rosterFlushInterval)
 	defer ticker.Stop()
+	s.pinRosterDestinations()
 	for {
 		select {
 		case <-ctx.Done():
@@ -725,6 +726,37 @@ func (s *Service) runRosterFlusher(ctx context.Context) {
 			if err := s.roster.Flush(); err != nil {
 				s.logger.Printf("roster flush: %v", err)
 			}
+			s.pinRosterDestinations()
 		}
 	}
+}
+
+// pinRosterDestinations protects roster members from announce-cache
+// eviction.
+//
+// The cache evicts the oldest entry when full, which on a busy hub
+// means strangers' announce churn can evict a member we actually serve
+// — 7,606 announcing peers were observed against 4,096 slots. A member
+// whose key we have dropped cannot be signature-verified, so their next
+// message is discarded while their client shows a delivery proof and
+// no reply.
+//
+// The pin lasts exactly as long as membership: the FULL set is
+// re-asserted on each pass, so anyone removed by /leave, /kick or the
+// prune sweep is released on the next tick without needing every
+// mutation site to remember to unpin. Bounded by the roster, which
+// max_members bounds in turn; if it ever exceeded the cache the
+// transport falls back to plain oldest-first eviction rather than
+// wedging.
+func (s *Service) pinRosterDestinations() {
+	hashes := s.roster.Hashes()
+	pins := make([][]byte, 0, len(hashes))
+	for _, h := range hashes {
+		raw, err := hex.DecodeString(h)
+		if err != nil || len(raw) != 16 {
+			continue
+		}
+		pins = append(pins, raw)
+	}
+	s.transport.PinDestinations(pins)
 }

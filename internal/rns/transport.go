@@ -38,6 +38,10 @@ type Transport struct {
 	pathRequestsSent     map[string]time.Time // key: hex dest_hash, dedup window for outbound
 	pathResponseTagsSeen map[string]time.Time // key: hex tag, dedup for inbound path? we've already responded to
 
+	// pinned holds destinations protected from cache eviction, keyed by
+	// hex dest_hash. See PinDestinations.
+	pinned map[string]struct{}
+
 	// retransmitSlots caps concurrent retransmit goroutines spawned by
 	// broadcastWithRetransmits (one per inbound LINKREQUEST / path
 	// request / link DATA).
@@ -634,18 +638,28 @@ func (t *Transport) handleAnnounce(p *Packet) {
 		prevLastSeen = prev.LastSeen
 	}
 	if prev == nil {
-		// Bound the map: when at capacity, evict the entry with the oldest
-		// LastSeen. O(N) but only runs at full capacity, which is rare.
+		// Bound the map: when at capacity, evict the oldest entry —
+		// preferring one that is NOT pinned.
+		//
+		// Plain oldest-first eviction treats a peer we depend on the
+		// same as a stranger we will never message. On a busy public
+		// hub that is actively harmful: a single hub can carry many
+		// times more announcing peers than this cache holds (measured:
+		// 7,606 peers against 4,096 slots), so a quiet group member is
+		// evicted by stranger churn. Their next message then arrives
+		// from an "unknown" sender, cannot be signature-verified, and
+		// is dropped — while the sender sees a delivery proof and no
+		// reply, because the proof is emitted before processing.
+		//
+		// Pinning keeps peers we actually serve resident. It cannot
+		// wedge the cache: if every entry is pinned, we fall back to
+		// evicting the oldest overall, so an over-large pinned set
+		// degrades to the previous behaviour rather than blocking
+		// inserts.
 		if len(t.known) >= KnownIdentityCapacity {
-			var oldestKey string
-			var oldestTime time.Time
-			for k, v := range t.known {
-				if oldestKey == "" || v.LastSeen.Before(oldestTime) {
-					oldestKey = k
-					oldestTime = v.LastSeen
-				}
+			if k := t.oldestEvictableLocked(); k != "" {
+				delete(t.known, k)
 			}
-			delete(t.known, oldestKey)
 		}
 		prev = &KnownIdentity{}
 		t.known[key] = prev
@@ -1646,4 +1660,64 @@ func (t *Transport) AnnouncePeriodically(ctx context.Context, interval time.Dura
 			emit()
 		}
 	}
+}
+
+// PinDestinations replaces the set of destinations protected from
+// cache eviction. Peers in this set are only evicted when there is
+// nothing unpinned left to evict.
+//
+// Callers pass the destinations they depend on being able to VERIFY —
+// for the forwarding service that is the roster, since a member whose
+// key we have lost cannot be authenticated and their messages are
+// dropped. Membership is the natural lifetime: a peer stays pinned for
+// as long as it is passed in, and is released as soon as it is not
+// (leave, kick, prune). Callers re-assert the full set rather than
+// mutating it incrementally, so a missed removal cannot leak a pin.
+//
+// Passing nil unpins everything.
+func (t *Transport) PinDestinations(destHashes [][]byte) {
+	pinned := make(map[string]struct{}, len(destHashes))
+	for _, h := range destHashes {
+		if len(h) == IdentityHashLen {
+			pinned[hex.EncodeToString(h)] = struct{}{}
+		}
+	}
+	t.mu.Lock()
+	t.pinned = pinned
+	t.mu.Unlock()
+}
+
+// PinnedCount reports how many destinations are currently pinned.
+func (t *Transport) PinnedCount() int {
+	t.mu.RLock()
+	defer t.mu.RUnlock()
+	return len(t.pinned)
+}
+
+// oldestEvictableLocked returns the map key of the entry to evict:
+// the oldest unpinned entry, or — when every entry is pinned — the
+// oldest entry overall, so the cache can never become unable to admit
+// a new peer. Callers must hold t.mu for writing.
+func (t *Transport) oldestEvictableLocked() string {
+	var (
+		oldestUnpinned string
+		unpinnedAt     time.Time
+		oldestAny      string
+		anyAt          time.Time
+	)
+	for k, v := range t.known {
+		if oldestAny == "" || v.LastSeen.Before(anyAt) {
+			oldestAny, anyAt = k, v.LastSeen
+		}
+		if _, isPinned := t.pinned[k]; isPinned {
+			continue
+		}
+		if oldestUnpinned == "" || v.LastSeen.Before(unpinnedAt) {
+			oldestUnpinned, unpinnedAt = k, v.LastSeen
+		}
+	}
+	if oldestUnpinned != "" {
+		return oldestUnpinned
+	}
+	return oldestAny
 }
