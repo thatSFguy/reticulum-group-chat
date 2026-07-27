@@ -199,6 +199,26 @@ On Linux/macOS, `chmod +x fwdsvc-…` after download.
 
 Or [build from source](#build-from-source).
 
+#### Third-party packages
+
+`fwdsvc` is also packaged for Nix / NixOS in
+[nixpkgs](https://github.com/NixOS/nixpkgs) (contributed by
+[@drupol](https://github.com/drupol) — thank you).
+
+Third-party packages are **maintained independently of this project**.
+We don't control when they update, so a packaged build can sit several
+releases behind — which matters here, because releases have included
+security fixes and fixes for messages being silently dropped. If you
+install from a package manager, check that
+
+```
+fwdsvc --version
+```
+
+matches the [latest release](https://github.com/thatSFguy/reticulum-group-chat/releases/latest).
+If it doesn't, prefer the release binary above or a source build until
+the package catches up.
+
 ### 2. Make a config
 
 ```sh
