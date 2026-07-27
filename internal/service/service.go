@@ -198,6 +198,7 @@ func New(cfg *config.Config) (*Service, error) {
 		outbound.SetPropagation(
 			cfg.Propagation.Mode == config.PropagationModeFallback,
 			cfg.Propagation.Mode == config.PropagationModeAlways,
+			cfg.Propagation.DirectAttempts,
 		)
 	}
 	if err := outbound.Load(); err != nil {
@@ -303,6 +304,13 @@ func (s *Service) Run(ctx context.Context) error {
 			node = s.cfg.Propagation.Node
 		}
 		s.logger.Printf("propagation         : mode=%s node=%s", s.cfg.Propagation.Mode, node)
+		if s.cfg.Propagation.Mode == config.PropagationModeFallback {
+			// Make the split budget auditable from the log: the shorter
+			// direct budget applies only while a node is available; with
+			// none known, the full budget protects the message.
+			s.logger.Printf("propagation         : direct_attempts=%d while a node is available (else %d)",
+				s.cfg.Propagation.DirectAttempts, maxDeliveryAttempts)
+		}
 	}
 
 	tCtx, tCancel := context.WithCancel(ctx)

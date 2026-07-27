@@ -337,3 +337,37 @@ func TestPropagationRejectsBadNode(t *testing.T) {
 		}
 	}
 }
+
+func TestPropagationDirectAttempts(t *testing.T) {
+	if got := defaults().Propagation.DirectAttempts; got != 3 {
+		t.Errorf("DirectAttempts default = %d, want 3", got)
+	}
+	dir := t.TempDir()
+	path := filepath.Join(dir, "c.toml")
+	toml := "[service]\ndisplay_name = \"x\"\n[propagation]\ndirect_attempts = 4\n"
+	if err := os.WriteFile(path, []byte(toml), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	c, err := Load(path)
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if c.Propagation.DirectAttempts != 4 {
+		t.Errorf("direct_attempts = %d did not bind", c.Propagation.DirectAttempts)
+	}
+
+	// Unset (0) is filled with the default; negative is rejected.
+	cfg := &Config{Service: validServiceConfig()}
+	if err := cfg.normalize(); err != nil {
+		t.Fatalf("normalize with unset direct_attempts: %v", err)
+	}
+	if cfg.Propagation.DirectAttempts != DefaultPropagationDirectAttempts {
+		t.Errorf("unset direct_attempts normalized to %d, want %d",
+			cfg.Propagation.DirectAttempts, DefaultPropagationDirectAttempts)
+	}
+	cfg = &Config{Service: validServiceConfig()}
+	cfg.Propagation.DirectAttempts = -1
+	if err := cfg.normalize(); err == nil {
+		t.Fatal("expected normalize to reject negative direct_attempts")
+	}
+}
