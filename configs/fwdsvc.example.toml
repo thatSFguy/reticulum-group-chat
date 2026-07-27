@@ -152,22 +152,37 @@ direct_attempts = 3
 # Optional: pin a specific propagation node by its lxmf.propagation
 # destination hash (32 hex chars).
 #
-# RECOMMENDED if you know a node to use — ideally the same one your
-# members sync from. Store-and-forward only completes when the
-# recipient FETCHES the message, so if we upload to node A and your
-# members poll node B, delivery depends on those two nodes peering and
-# syncing, which is best-effort and can be slow or simply not happen.
-# Pinning also removes any chance of an attacker taking over the role
-# by announcing (see the trust notes in the README).
+# MOST OPERATORS SHOULD LEAVE THIS UNSET. Pin it only when you know
+# the node your members actually sync from — your own, or one the
+# group agreed on and whose hash you were handed directly.
 #
-# Trade-off: a pinned node is used unconditionally, with no automatic
-# failover. If it goes down, store-and-forward stops until it returns
-# or you change this value; direct delivery is unaffected.
+# Why: store-and-forward only completes when the recipient FETCHES the
+# message. Pinning makes that deterministic ONLY if everyone shares the
+# node. One instance's log over five weeks saw 632 distinct nodes
+# accepting messages, so pinning a node your members don't poll fixes
+# nothing — it just picks which stranger stores the mail.
+#
+# Worse, 215 of those 632 flapped between accepting and refusing
+# messages. A pinned node is used unconditionally with NO failover, so
+# pinning a flapper makes store-and-forward silently intermittent.
+# Auto-selection re-checks the accepting flag every time it picks.
+#
+# Note you cannot identify a node from its announce: SPEC §5.8.5 puts
+# the 7-element parameter array in app_data, not a name, so propagation
+# announces are anonymous (all 2200 observed had an empty display
+# name). The hash has to come from the operator.
 #
 # Leave empty to auto-select: among nodes that are accepting and whose
-# announced parameters we can satisfy, the one we have known longest
+# announced parameters we can satisfy, the one we have known LONGEST
 # and heard from recently wins. That resists a newcomer flooding
-# announces to seize the role, but it still means trusting a stranger.
+# announces to seize the role, and favors uptime — the only useful
+# property left once you can't tell which node your members use.
+#
+# Either way, with a mixed membership treat store-and-forward as
+# best-effort: past the upload, delivery depends on nodes syncing with
+# each other, which no setting here controls. In fallback mode that is
+# still strictly better than nothing. See the README for the trust
+# notes and the full reasoning.
 #node = "00112233445566778899aabbccddeeff"
 
 # (admins / mods are now at the top of the file — see the comment block

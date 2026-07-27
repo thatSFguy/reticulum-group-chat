@@ -482,22 +482,61 @@ Disabled by default; existing deployments are unaffected.
 |---|---|---|---|
 | `enabled` | bool   | `false`      | Turn propagation-node submission on. |
 | `mode`    | string | `"fallback"` | `"fallback"`: direct delivery first, re-route via the propagation node only after the direct retry budget (5 attempts) is exhausted. `"always"`: every outbound message goes to the propagation node only — nothing is dropped for being offline, at the cost of sync latency. |
-| `node`    | hex    | unset        | Pin a specific propagation node by its `lxmf.propagation` destination hash (32 hex chars). **Recommended where you know a node to use** — see [Choosing a propagation node](#choosing-a-propagation-node). Unset = auto-select: among nodes that are accepting and whose announced parameters we can satisfy, the one known longest and heard from recently. |
+| `node`    | hex    | unset        | Pin a specific propagation node by its `lxmf.propagation` destination hash (32 hex chars). **Most operators should leave this unset** — see [Choosing a propagation node](#choosing-a-propagation-node). Unset = auto-select: among nodes that are accepting and whose announced parameters we can satisfy, the one known longest and heard from recently. |
 | `direct_attempts` | int | `3` | **Shortens the direct retry budget, but only while a propagation node is available to fall back to** — failing over after 3 attempts (~75 s) instead of the standard 5 (~3.5 min) gets an offline member's mail onto the node sooner. Whenever no node is known, the full 5-attempt budget still applies before a message is dropped. Both numbers are printed at startup. Set to `5` to disable the shortening. Fallback mode only. |
 
 ### Choosing a propagation node
 
-**Pin one if you can.** The decisive reason is not security, it is
-whether the message actually arrives: store-and-forward only completes
-when the recipient *fetches* it. If this service uploads to node A and
-your members poll node B, delivery depends on A and B peering and
-syncing with each other — which is best-effort, can be slow, and may
-not happen at all. Pinning the node your members already sync from
-makes the round trip deterministic.
+**Leave `node` unset and let auto-discovery pick, unless you know that
+your members all sync from one particular node.** That caveat is doing
+the work — read on for why it usually doesn't apply.
 
-Pinning also settles two lesser points. An attacker cannot take the
-role by announcing, and you choose which operator sees your traffic
-metadata (see the trust note below).
+The thing that decides whether store-and-forward works is not security,
+it is the *fetch* side: a message is only delivered once the recipient
+pulls it down. If this service uploads to node A and a member polls
+node B, delivery depends on A and B peering and syncing — best-effort,
+possibly slow, possibly never. Pinning is only a fix for that when
+everyone involved shares the same node.
+
+**Why auto is the right default.** From one instance's log over five
+weeks (2026-06-20 → 2026-07-27, single hub, single vantage point —
+your view will differ):
+
+| Observation | Count |
+|---|---|
+| Distinct nodes seen **accepting** messages | 632 |
+| Distinct nodes seen **refusing** messages | 236 |
+| Nodes that **flapped** between accepting and refusing | 215 |
+| Propagation announces carrying a display name | 0 of 2200 |
+
+Each row argues against pinning blind:
+
+- **632 candidates.** If members choose their own node independently,
+  pinning one gives you a negligible chance of matching any given
+  member. The determinism argument evaporates unless the group has
+  genuinely agreed on a node.
+- **215 of them flapped.** A third of the population goes in and out of
+  accepting messages. Pin one of those and store-and-forward silently
+  goes intermittent, with no failover. Auto-selection re-checks the
+  `accepting` flag at selection time, so it routes around a node that
+  has stopped taking mail.
+- **No node advertises a name.** Per SPEC §5.8.5 the `lxmf.propagation`
+  announce app_data carries the 7-element parameter array, not a display
+  string — every one of those 2200 announces had an empty name. There is
+  no way to recognise "the community's node" from announces alone;
+  someone has to hand you the hash out of band.
+
+Auto-selection prefers the node known **longest** among those currently
+accepting and satisfiable, rather than the most recently heard. That
+resists a newcomer flooding announces to seize the role, and it selects
+for uptime — the one useful property you can still select for once
+locality is unknowable.
+
+**Pin a node when you actually know one**: your own propagation node,
+or one the group has agreed on and whose hash you were given directly.
+In that case pinning is clearly better — it makes the round trip
+deterministic, prevents anyone claiming the role by announcing, and
+lets you choose which operator sees your traffic metadata.
 
 **The cost of pinning is failover.** A pinned node is used
 unconditionally — if it goes offline or stops accepting, store-and-forward
@@ -505,12 +544,14 @@ stops until it returns or you change the setting. Direct delivery to
 online members is unaffected either way, so the failure is bounded: you
 lose the safety net, not the service.
 
-**Auto-discovery is reasonable if you don't know a node**, and is no
-longer trivially hijackable — selection prefers the node known longest
-among those currently accepting and satisfiable, rather than the most
-recently heard. But it still means handing your traffic to a stranger
-chosen by heuristic, and it does not solve the fetch-side mismatch
-above.
+**Set expectations either way.** With a membership that uses assorted
+nodes, store-and-forward is a best-effort improvement rather than a
+guarantee — beyond the upload, delivery rests on inter-node syncing that
+no setting here influences. In `mode = "fallback"` that is still purely
+a win: the members it misses are the ones who would have received
+nothing at all. If you need it to be reliable, the fix is not a config
+value — run a propagation node for your community and have members
+point their clients at it.
 
 **Trust note.** A propagation node cannot read your messages — bodies
 are encrypted to the recipient. It *can* see each recipient's
