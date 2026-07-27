@@ -23,11 +23,57 @@ const identityHashLen = 16
 const identityPrivateKeyLen = 64
 
 type Config struct {
-	Service    ServiceConfig     `toml:"service"`
-	Interfaces []InterfaceConfig `toml:"interfaces"`
-	Replay     ReplayConfig      `toml:"replay"`
-	Admins     []string          `toml:"admins"`
-	Mods       []string          `toml:"mods"`
+	Service     ServiceConfig     `toml:"service"`
+	Interfaces  []InterfaceConfig `toml:"interfaces"`
+	Replay      ReplayConfig      `toml:"replay"`
+	Propagation PropagationConfig `toml:"propagation"`
+	Admins      []string          `toml:"admins"`
+	Mods        []string          `toml:"mods"`
+}
+
+// PropagationConfig controls store-and-forward delivery via LXMF
+// propagation nodes (SPEC §5.8). When enabled, messages the service
+// can't deliver directly (recipient offline / unreachable) are handed
+// to a propagation node, where the recipient's own client (Sideband
+// etc.) fetches them on its next sync — instead of being dropped after
+// the direct-retry budget is exhausted.
+type PropagationConfig struct {
+	// Enabled turns propagation-node submission on. Default false —
+	// existing deployments keep the direct-only behavior.
+	Enabled bool `toml:"enabled"`
+
+	// Node optionally pins one propagation node by destination hash
+	// (32 hex chars, the lxmf.propagation destination). When empty, the
+	// service auto-selects the most recently heard node that announces
+	// itself as accepting messages.
+	Node string `toml:"node"`
+
+	// Mode selects when propagation is used:
+	//   "fallback" (default) — try direct delivery first; when the
+	//     direct retry budget is exhausted, re-route the message via the
+	//     propagation node instead of dropping it.
+	//   "always" — every outbound message goes to the propagation node
+	//     only; recipients get everything on their next sync.
+	Mode string `toml:"mode"`
+}
+
+// Propagation mode values accepted in PropagationConfig.Mode.
+const (
+	PropagationModeFallback = "fallback"
+	PropagationModeAlways   = "always"
+)
+
+// NodeBytes returns the pinned propagation node's destination hash, or
+// nil when no node is pinned. Only valid after Load/normalize.
+func (p *PropagationConfig) NodeBytes() []byte {
+	if p.Node == "" {
+		return nil
+	}
+	raw, err := hex.DecodeString(p.Node)
+	if err != nil || len(raw) != identityHashLen {
+		return nil
+	}
+	return raw
 }
 
 type ServiceConfig struct {
@@ -242,6 +288,10 @@ func defaults() *Config {
 			Count:  100,
 			MaxAge: Duration(7 * 24 * time.Hour),
 		},
+		Propagation: PropagationConfig{
+			Enabled: false,
+			Mode:    PropagationModeFallback,
+		},
 	}
 }
 
@@ -321,6 +371,26 @@ func (c *Config) normalize() error {
 	}
 	if c.Replay.MaxAge.Std() < 0 {
 		return fmt.Errorf("replay.max_age must be >= 0")
+	}
+
+	c.Propagation.Mode = strings.ToLower(strings.TrimSpace(c.Propagation.Mode))
+	if c.Propagation.Mode == "" {
+		c.Propagation.Mode = PropagationModeFallback
+	}
+	if c.Propagation.Mode != PropagationModeFallback && c.Propagation.Mode != PropagationModeAlways {
+		return fmt.Errorf("propagation.mode must be %q or %q, got %q",
+			PropagationModeFallback, PropagationModeAlways, c.Propagation.Mode)
+	}
+	c.Propagation.Node = strings.ToLower(strings.TrimSpace(c.Propagation.Node))
+	if c.Propagation.Node != "" {
+		raw, err := hex.DecodeString(c.Propagation.Node)
+		if err != nil {
+			return fmt.Errorf("propagation.node: %q is not valid hex: %w", c.Propagation.Node, err)
+		}
+		if len(raw) != identityHashLen {
+			return fmt.Errorf("propagation.node: %q must decode to %d bytes (got %d)",
+				c.Propagation.Node, identityHashLen, len(raw))
+		}
 	}
 
 	c.Admins = normalizeHashList(c.Admins)

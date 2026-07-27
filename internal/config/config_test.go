@@ -279,3 +279,61 @@ func TestExpandPath(t *testing.T) {
 		t.Errorf("ExpandPath(\"\") = %q, want \"\"", out)
 	}
 }
+
+func TestPropagationDefaults(t *testing.T) {
+	d := defaults().Propagation
+	if d.Enabled {
+		t.Error("Propagation.Enabled default should be false")
+	}
+	if d.Mode != PropagationModeFallback {
+		t.Errorf("Propagation.Mode default = %q, want %q", d.Mode, PropagationModeFallback)
+	}
+	if d.NodeBytes() != nil {
+		t.Error("NodeBytes with no pinned node should be nil")
+	}
+}
+
+func TestPropagationTOMLBinding(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "c.toml")
+	toml := "[service]\ndisplay_name = \"x\"\n" +
+		"[propagation]\nenabled = true\nmode = \"Always\"\nnode = \"AABBCCDDEEFF00112233445566778899\"\n"
+	if err := os.WriteFile(path, []byte(toml), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	c, err := Load(path)
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if !c.Propagation.Enabled {
+		t.Error("enabled = true did not bind")
+	}
+	// Mode and node are case-normalized.
+	if c.Propagation.Mode != PropagationModeAlways {
+		t.Errorf("mode = %q, want %q", c.Propagation.Mode, PropagationModeAlways)
+	}
+	if c.Propagation.Node != "aabbccddeeff00112233445566778899" {
+		t.Errorf("node = %q not lowercased", c.Propagation.Node)
+	}
+	if got := c.Propagation.NodeBytes(); len(got) != 16 || got[0] != 0xaa {
+		t.Errorf("NodeBytes = %x, want 16 bytes starting 0xaa", got)
+	}
+}
+
+func TestPropagationRejectsBadMode(t *testing.T) {
+	cfg := &Config{Service: validServiceConfig()}
+	cfg.Propagation.Mode = "sometimes"
+	if err := cfg.normalize(); err == nil {
+		t.Fatal("expected normalize to reject unknown propagation.mode")
+	}
+}
+
+func TestPropagationRejectsBadNode(t *testing.T) {
+	for _, node := range []string{"zzzz", "aabb"} {
+		cfg := &Config{Service: validServiceConfig()}
+		cfg.Propagation.Node = node
+		if err := cfg.normalize(); err == nil {
+			t.Fatalf("expected normalize to reject propagation.node %q", node)
+		}
+	}
+}

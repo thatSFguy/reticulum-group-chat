@@ -1,7 +1,9 @@
 // Package lxmf is a minimal-viable LXMF implementation built on top of the
 // pure-Go rns package. It implements opportunistic single-packet delivery
-// (SPEC §5.1) — direct (Link) delivery, propagation nodes, stamps, and
-// tickets are intentionally out of scope.
+// (SPEC §5.1), direct (Link) delivery (SPEC §5.2), and sender-side
+// propagation-node submission (SPEC §5.8) including outbound propagation
+// stamps (SPEC §5.7). Tickets and the propagation-node *server* role are
+// intentionally out of scope.
 package lxmf
 
 import (
@@ -55,12 +57,17 @@ var ErrPayloadTooLarge = errors.New("LXMF opportunistic payload exceeds size lim
 // AppName + AspectDelivery yield the dotted full name "lxmf.delivery"
 // (SPEC §1.2 / §4.4).
 const (
-	AppName         = "lxmf"
-	AspectDelivery  = "delivery"
+	AppName           = "lxmf"
+	AspectDelivery    = "delivery"
+	AspectPropagation = "propagation"
 )
 
 // FullName returns "lxmf.delivery" — the well-known LXMF delivery aspect.
 func FullName() string { return rns.FullName(AppName, AspectDelivery) }
+
+// PropagationFullName returns "lxmf.propagation" — the well-known
+// propagation-node aspect (SPEC §5.8.1, name_hash e03a09b77ac21b22258e).
+func PropagationFullName() string { return rns.FullName(AppName, AspectPropagation) }
 
 // Message is a parsed LXMF message. On the send side, fill in the
 // addressing + content fields and call SignAndPackOpportunistic. On the
@@ -118,29 +125,10 @@ func SignAndPackDirect(senderID *rns.Identity, senderDestHash, destHash []byte, 
 }
 
 func signAndPackDirectAt(senderID *rns.Identity, senderDestHash, destHash []byte, title, content []byte, fields map[any]any, ts time.Time) (wire, msgID []byte, err error) {
-	if senderID == nil {
-		return nil, nil, errors.New("nil sender identity")
-	}
-	if len(senderDestHash) != rns.IdentityHashLen || len(destHash) != rns.IdentityHashLen {
-		return nil, nil, errors.New("dest_hash and source_hash must each be 16 bytes")
-	}
-	if title == nil {
-		title = []byte{}
-	}
-	if content == nil {
-		content = []byte{}
-	}
-	if fields == nil {
-		fields = map[any]any{}
-	}
-
-	tsSeconds := float64(ts.UnixMicro()) / 1_000_000.0
-	payload, err := msgpack.Marshal([]any{tsSeconds, title, content, fields})
+	payload, sig, id, err := buildSignedPayload(senderID, senderDestHash, destHash, title, content, fields, ts)
 	if err != nil {
-		return nil, nil, fmt.Errorf("marshal payload: %w", err)
+		return nil, nil, err
 	}
-	signedData, id := buildSignedDataWithID(destHash, senderDestHash, payload)
-	sig := senderID.Sign(signedData)
 
 	out := make([]byte, 0, 2*rns.IdentityHashLen+len(sig)+len(payload))
 	out = append(out, destHash...)
@@ -156,11 +144,33 @@ func signAndPackDirectAt(senderID *rns.Identity, senderDestHash, destHash []byte
 // msgID is the recipient-view LXMF message_id (independent of signature
 // — it's just H(dest||source||payload)).
 func signAndPackOpportunisticAt(senderID *rns.Identity, senderDestHash, destHash []byte, title, content []byte, fields map[any]any, ts time.Time) (wire, msgID []byte, err error) {
+	payload, sig, id, err := buildSignedPayload(senderID, senderDestHash, destHash, title, content, fields, ts)
+	if err != nil {
+		return nil, nil, err
+	}
+	if len(payload) > MaxOpportunisticPayload {
+		return nil, nil, fmt.Errorf("%w: msgpack payload is %d bytes, limit is %d (link-based delivery for larger messages is not implemented)",
+			ErrPayloadTooLarge, len(payload), MaxOpportunisticPayload)
+	}
+
+	out := make([]byte, 0, len(senderDestHash)+len(sig)+len(payload))
+	out = append(out, senderDestHash...)
+	out = append(out, sig...)
+	out = append(out, payload...)
+	return out, id, nil
+}
+
+// buildSignedPayload is the shared core of every outbound pack variant:
+// marshal the 4-element msgpack payload at the injected timestamp, then
+// sign per SPEC §5.4. Size policy (the opportunistic 295-byte cap) is the
+// caller's concern — propagated and direct forms have no single-packet
+// limit.
+func buildSignedPayload(senderID *rns.Identity, senderDestHash, destHash []byte, title, content []byte, fields map[any]any, ts time.Time) (payload, sig, msgID []byte, err error) {
 	if senderID == nil {
-		return nil, nil, errors.New("nil sender identity")
+		return nil, nil, nil, errors.New("nil sender identity")
 	}
 	if len(senderDestHash) != rns.IdentityHashLen || len(destHash) != rns.IdentityHashLen {
-		return nil, nil, errors.New("dest_hash and source_hash must each be 16 bytes")
+		return nil, nil, nil, errors.New("dest_hash and source_hash must each be 16 bytes")
 	}
 	if title == nil {
 		title = []byte{}
@@ -173,23 +183,12 @@ func signAndPackOpportunisticAt(senderID *rns.Identity, senderDestHash, destHash
 	}
 
 	tsSeconds := float64(ts.UnixMicro()) / 1_000_000.0
-	payload, err := msgpack.Marshal([]any{tsSeconds, title, content, fields})
+	payload, err = msgpack.Marshal([]any{tsSeconds, title, content, fields})
 	if err != nil {
-		return nil, nil, fmt.Errorf("marshal payload: %w", err)
+		return nil, nil, nil, fmt.Errorf("marshal payload: %w", err)
 	}
-	if len(payload) > MaxOpportunisticPayload {
-		return nil, nil, fmt.Errorf("%w: msgpack payload is %d bytes, limit is %d (link-based delivery for larger messages is not implemented)",
-			ErrPayloadTooLarge, len(payload), MaxOpportunisticPayload)
-	}
-
 	signedData, id := buildSignedDataWithID(destHash, senderDestHash, payload)
-	sig := senderID.Sign(signedData)
-
-	out := make([]byte, 0, len(senderDestHash)+len(sig)+len(payload))
-	out = append(out, senderDestHash...)
-	out = append(out, sig...)
-	out = append(out, payload...)
-	return out, id, nil
+	return payload, senderID.Sign(signedData), id, nil
 }
 
 // ParseDirectBody decodes the link-form LXMF body (SPEC §5.2):
