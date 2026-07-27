@@ -206,9 +206,22 @@ func TestPersistTapWritesAsyncAndCoalesces(t *testing.T) {
 	tap := newAnnouncePersistTap(transport, store, log.New(io.Discard, "", 0))
 	tap.debounce = 20 * time.Millisecond
 
+	// Stop the run loop and WAIT for it to exit before the test
+	// returns. run performs a final flush on ctx.Done, so without the
+	// wait that write races t.TempDir()'s cleanup — the directory gets
+	// a file back after removal starts and cleanup fails with
+	// "directory not empty". Registered after t.TempDir() so it runs
+	// BEFORE the tempdir cleanup (t.Cleanup is LIFO).
 	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-	go tap.run(ctx)
+	runDone := make(chan struct{})
+	t.Cleanup(func() {
+		cancel()
+		<-runDone
+	})
+	go func() {
+		defer close(runDone)
+		tap.run(ctx)
+	}()
 
 	// A burst of announces.
 	for i := 0; i < 10; i++ {
