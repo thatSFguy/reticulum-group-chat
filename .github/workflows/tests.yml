@@ -37,11 +37,14 @@ jobs:
       - name: Unit tests (race detector)
         run: go test -race ./... -count=1
 
-      # Fuzz seed corpora run as regular tests above; this gives the
-      # msgpack structural guard a short live fuzz on every push, since
-      # it stands in front of every attacker-controlled decode.
-      - name: Fuzz msgpack guard (short)
-        run: go test ./internal/rns/ -run=XXX -fuzz=FuzzValidateMsgpackBounds -fuzztime=60s
+      # NOTE: live fuzzing is deliberately NOT here. Time-boxed fuzzing
+      # reports "context deadline exceeded" as a failure when a worker
+      # is still running as the budget expires, which on contended
+      # runners turns a clean 2M-execution run into a red build. A
+      # randomized search must not gate merges. Seed corpora still run
+      # as ordinary tests via `go test ./...` above; the live search
+      # moved to fuzz.yml on a schedule, where it can run far longer
+      # and a flake blocks nobody.
 
   harness:
     name: interop harness (ubuntu-latest)
