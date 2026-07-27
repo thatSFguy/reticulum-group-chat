@@ -2,6 +2,12 @@ package service
 
 import (
 	"bytes"
+	"context"
+	"errors"
+	"io"
+	"io/fs"
+	"log"
+	"os"
 	"path/filepath"
 	"testing"
 	"time"
@@ -177,5 +183,72 @@ func TestTransportKnownSnapshotIsDeepCopy(t *testing.T) {
 	got := transport.Recall(snap[0].DestHash)
 	if got != nil && got.PublicKey[0] == 0xFF {
 		t.Errorf("KnownSnapshot did not deep-copy PublicKey")
+	}
+}
+
+func TestPersistTapWritesAsyncAndCoalesces(t *testing.T) {
+	// OnAnnounce must never write from the caller's (dispatcher's)
+	// goroutine — it only kicks the run loop, which debounces a burst
+	// of announces into one snapshot.
+	dir := t.TempDir()
+	store := newAnnounceStore(filepath.Join(dir, "announces.json"))
+	transport := rns.NewTransport(nil)
+	transport.Restore(makeKnownIdentity(0x01, time.Now()))
+
+	tap := newAnnouncePersistTap(transport, store, log.New(io.Discard, "", 0))
+	tap.debounce = 20 * time.Millisecond
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go tap.run(ctx)
+
+	// A burst of announces.
+	for i := 0; i < 10; i++ {
+		tap.OnAnnounce(nil)
+	}
+
+	// Nothing on disk yet (still inside the debounce window) — proves
+	// OnAnnounce itself didn't write synchronously.
+	if _, err := os.Stat(store.path); !errors.Is(err, fs.ErrNotExist) {
+		t.Fatalf("store written before debounce elapsed (err=%v)", err)
+	}
+
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		if entries, _, err := store.load(time.Now()); err == nil && len(entries) == 1 {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("debounced save never landed")
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+}
+
+func TestPersistTapFinalSaveOnShutdown(t *testing.T) {
+	dir := t.TempDir()
+	store := newAnnounceStore(filepath.Join(dir, "announces.json"))
+	transport := rns.NewTransport(nil)
+	transport.Restore(makeKnownIdentity(0x02, time.Now()))
+
+	tap := newAnnouncePersistTap(transport, store, log.New(io.Discard, "", 0))
+	tap.debounce = time.Hour // never fires on its own
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() {
+		tap.run(ctx)
+		close(done)
+	}()
+	tap.OnAnnounce(nil)
+	cancel()
+	<-done
+
+	entries, _, err := store.load(time.Now())
+	if err != nil {
+		t.Fatalf("load after shutdown: %v", err)
+	}
+	if len(entries) != 1 {
+		t.Fatalf("final save wrote %d entries, want 1", len(entries))
 	}
 }

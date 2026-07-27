@@ -34,6 +34,41 @@ type fakeSender struct {
 	// byte of the recipient hash (a tiny hack — every test recipient
 	// in this file uses bytes.Repeat so byte 0 is unique per recipient).
 	recency map[byte]time.Time
+
+	// Propagation knobs. hasPropNode gates the fallback re-route;
+	// propErrs/propCalls mirror sendErrs/sendCalls for the propagated
+	// path so tests can distinguish which method each attempt used.
+	hasPropNode    bool
+	propErrs       []error
+	propCalls      [][]byte
+	propRecipients [][]byte
+}
+
+func (f *fakeSender) SendLXMFPropagated(recipient, body []byte, fields map[any]any) ([]byte, error) {
+	f.mu.Lock()
+	f.propCalls = append(f.propCalls, append([]byte(nil), body...))
+	f.propRecipients = append(f.propRecipients, append([]byte(nil), recipient...))
+	var err error
+	if len(f.propErrs) > 0 {
+		err = f.propErrs[0]
+		f.propErrs = f.propErrs[1:]
+	}
+	msgID := make([]byte, 32)
+	if len(recipient) > 0 {
+		msgID[0] = recipient[0]
+	}
+	msgID[1] = byte(len(f.propCalls))
+	f.mu.Unlock()
+	if err != nil {
+		return nil, err
+	}
+	return msgID, nil
+}
+
+func (f *fakeSender) HasPropagationNode() bool {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.hasPropNode
 }
 
 func (f *fakeSender) SendLXMF(recipient, body []byte, fields map[any]any) ([]byte, error) {
@@ -419,5 +454,156 @@ func TestEnqueuePersistsImmediately(t *testing.T) {
 	}
 	if string(loaded[0].Body) != "durable" {
 		t.Errorf("loaded body = %q, want %q", loaded[0].Body, "durable")
+	}
+}
+
+func TestFallbackReroutesViaPropagationNode(t *testing.T) {
+	// Direct budget exhausts → message converts to propagated with a
+	// fresh attempt budget instead of dropping, then delivers.
+	sender := &fakeSender{
+		hasPropNode: true,
+		sendErrs:    []error{errors.New("x"), errors.New("x"), errors.New("x")},
+	}
+	q := newTestQueue(t, sender, nil)
+	q.SetPropagation(true /* fallback */, false)
+	q.maxAttempts = 3
+	q.retryWait = 0
+
+	q.Enqueue(make([]byte, 16), []byte("stubborn"))
+	q.processOnce(context.Background())
+
+	if got := sender.sendCount(); got != 3 {
+		t.Errorf("direct sendCount = %d, want 3 (full direct budget)", got)
+	}
+	sender.mu.Lock()
+	propCalls := len(sender.propCalls)
+	sender.mu.Unlock()
+	if propCalls != 1 {
+		t.Errorf("propagated sendCount = %d, want 1", propCalls)
+	}
+	if got := q.pendingCount(); got != 0 {
+		t.Errorf("pendingCount = %d, want 0 (delivered via propagation)", got)
+	}
+}
+
+func TestFallbackWithoutNodeFailsTerminally(t *testing.T) {
+	// No propagation node known → the fallback must not convert; the
+	// message drops after the direct budget like before.
+	sender := &fakeSender{
+		hasPropNode: false,
+		sendErrs:    []error{errors.New("x"), errors.New("x"), errors.New("x")},
+	}
+	q := newTestQueue(t, sender, nil)
+	q.SetPropagation(true, false)
+	q.maxAttempts = 3
+	q.retryWait = 0
+
+	q.Enqueue(make([]byte, 16), []byte("doomed"))
+	q.processOnce(context.Background())
+
+	sender.mu.Lock()
+	propCalls := len(sender.propCalls)
+	sender.mu.Unlock()
+	if propCalls != 0 {
+		t.Errorf("propagated sendCount = %d, want 0", propCalls)
+	}
+	if got := q.pendingCount(); got != 0 {
+		t.Errorf("pendingCount = %d, want 0 (terminal drop)", got)
+	}
+}
+
+func TestAlwaysModeSendsPropagatedOnly(t *testing.T) {
+	sender := &fakeSender{hasPropNode: true}
+	q := newTestQueue(t, sender, nil)
+	q.SetPropagation(false, true /* always */)
+
+	q.Enqueue(make([]byte, 16), []byte("via node"))
+	q.processOnce(context.Background())
+
+	if got := sender.sendCount(); got != 0 {
+		t.Errorf("direct sendCount = %d, want 0 in always mode", got)
+	}
+	sender.mu.Lock()
+	propCalls := len(sender.propCalls)
+	sender.mu.Unlock()
+	if propCalls != 1 {
+		t.Errorf("propagated sendCount = %d, want 1", propCalls)
+	}
+}
+
+func TestPropagatedTerminalFailureDrops(t *testing.T) {
+	// An already-propagated message that exhausts its budget must fail
+	// terminally, not convert again (no infinite re-route loop).
+	sender := &fakeSender{
+		hasPropNode: true,
+		propErrs:    []error{errors.New("x"), errors.New("x"), errors.New("x")},
+	}
+	q := newTestQueue(t, sender, nil)
+	q.SetPropagation(true, true)
+	q.maxAttempts = 3
+	q.retryWait = 0
+
+	q.Enqueue(make([]byte, 16), []byte("dead end"))
+	q.processOnce(context.Background())
+
+	sender.mu.Lock()
+	propCalls := len(sender.propCalls)
+	sender.mu.Unlock()
+	if propCalls != 3 {
+		t.Errorf("propagated attempts = %d, want 3", propCalls)
+	}
+	if got := q.pendingCount(); got != 0 {
+		t.Errorf("pendingCount = %d, want 0 (terminal drop)", got)
+	}
+}
+
+func TestPropagatedFlagPersistsAcrossReload(t *testing.T) {
+	// A message converted to propagated must stay propagated after a
+	// service restart — otherwise a restart demotes it back to direct
+	// and it burns a second direct budget.
+	dir := t.TempDir()
+	store := newOutboundStore(filepath.Join(dir, "outbound.json"))
+
+	sender := &fakeSender{hasPropNode: true}
+	q := newTestQueue(t, sender, store)
+	q.SetPropagation(false, true)
+	q.Enqueue(make([]byte, 16), []byte("persist me"))
+
+	loaded, err := store.load()
+	if err != nil {
+		t.Fatalf("store.load: %v", err)
+	}
+	if len(loaded) != 1 || !loaded[0].Propagated {
+		t.Fatalf("loaded = %+v, want 1 message with Propagated=true", loaded)
+	}
+}
+
+func TestNoPropagationNodeDefersWithoutBurningBudget(t *testing.T) {
+	// "Always" mode with no node discovered yet: attempts must not
+	// count toward the terminal budget — the message waits for a node
+	// announce instead of dropping.
+	sender := &fakeSender{
+		propErrs: []error{errNoPropagationNode, errNoPropagationNode, nil},
+	}
+	q := newTestQueue(t, sender, nil)
+	q.SetPropagation(false, true)
+	q.maxAttempts = 2 // tighter than the number of deferrals
+	q.retryWait = time.Millisecond
+
+	q.Enqueue(make([]byte, 16), []byte("waiting for a node"))
+
+	for i := 0; i < 3; i++ {
+		q.processOnce(context.Background())
+		time.Sleep(2 * time.Millisecond)
+	}
+
+	sender.mu.Lock()
+	propCalls := len(sender.propCalls)
+	sender.mu.Unlock()
+	if propCalls != 3 {
+		t.Errorf("propagated attempts = %d, want 3 (2 deferrals + success)", propCalls)
+	}
+	if got := q.pendingCount(); got != 0 {
+		t.Errorf("pendingCount = %d, want 0 (delivered once a node appeared)", got)
 	}
 }

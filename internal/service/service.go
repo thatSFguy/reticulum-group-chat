@@ -73,6 +73,10 @@ type Service struct {
 	// on shutdown; the OS also drops the flock on process exit regardless.
 	instanceUnlock func()
 
+	// announcePersist debounces announce-cache writes off the Transport
+	// dispatcher goroutine; its run loop is started in Run.
+	announcePersist *announcePersistTap
+
 	logger *log.Logger
 	now    func() time.Time
 }
@@ -174,12 +178,28 @@ func New(cfg *config.Config) (*Service, error) {
 		return nil, fmt.Errorf("register delivery: %w", err)
 	}
 
+	// Store-and-forward via LXMF propagation nodes (SPEC §5.8). The
+	// tracker learns nodes from their lxmf.propagation announces; the
+	// sender consults it per submission, so node selection follows the
+	// network live rather than being fixed at startup.
+	var propNodes *propagationTracker
+	if cfg.Propagation.Enabled {
+		propNodes = newPropagationTracker(logger, cfg.Propagation.NodeBytes())
+		transport.RegisterAnnounceHandler(propNodes)
+	}
+
 	outboundStore := newOutboundStore(outboundStorePath(cfg.Service.StatePath))
 	outbound := newOutboundQueue(
-		&deliverySender{delivery: delivery, transport: transport},
+		&deliverySender{delivery: delivery, transport: transport, nodes: propNodes},
 		outboundStore,
 		logger,
 	)
+	if cfg.Propagation.Enabled {
+		outbound.SetPropagation(
+			cfg.Propagation.Mode == config.PropagationModeFallback,
+			cfg.Propagation.Mode == config.PropagationModeAlways,
+		)
+	}
 	if err := outbound.Load(); err != nil {
 		return nil, fmt.Errorf("load outbound queue: %w", err)
 	}
@@ -247,11 +267,8 @@ func New(cfg *config.Config) (*Service, error) {
 				len(entries), dropped, announceStoreMaxAge)
 		}
 	}
-	transport.RegisterAnnounceHandler(&announcePersistTap{
-		transport: transport,
-		store:     announceStore,
-		logger:    logger,
-	})
+	svc.announcePersist = newAnnouncePersistTap(transport, announceStore, logger)
+	transport.RegisterAnnounceHandler(svc.announcePersist)
 
 	return svc, nil
 }
@@ -280,12 +297,22 @@ func (s *Service) Run(ctx context.Context) error {
 	s.logger.Printf("locked (invite-only): %v", s.cfg.Service.Locked)
 	s.logger.Printf("roster size         : %d", len(s.roster.Hashes()))
 	s.logger.Printf("history size        : %d", s.history.Len())
+	if s.cfg.Propagation.Enabled {
+		node := "auto-discover"
+		if s.cfg.Propagation.Node != "" {
+			node = s.cfg.Propagation.Node
+		}
+		s.logger.Printf("propagation         : mode=%s node=%s", s.cfg.Propagation.Mode, node)
+	}
 
 	tCtx, tCancel := context.WithCancel(ctx)
 	defer tCancel()
 
 	go s.transport.Run(tCtx)
 	go s.transport.AnnouncePeriodically(tCtx, s.cfg.Service.AnnounceInterval.Std(), s.buildAnnounce)
+	// Announce-cache persistence runs off the dispatcher: OnAnnounce only
+	// kicks this loop, which debounces bursts into one snapshot write.
+	go s.announcePersist.run(tCtx)
 	// RunLinkSweeper closes idle outbound links and emits KEEPALIVE on
 	// active ones so the responder doesn't tear them down for inactivity.
 	go s.transport.RunLinkSweeper(tCtx)
@@ -294,6 +321,18 @@ func (s *Service) Run(ctx context.Context) error {
 	// path-request defer for unknown recipients. Sequential by design
 	// (half-duplex collision resilience).
 	go s.outbound.Run(tCtx)
+
+	// A pinned propagation node we haven't heard from (fresh state dir,
+	// or the announce cache aged out) can't be linked to until its
+	// announce arrives. Ask for it proactively so the first fallback
+	// submission doesn't have to eat a retry to trigger the request.
+	if s.cfg.Propagation.Enabled {
+		if pinned := s.cfg.Propagation.NodeBytes(); pinned != nil && s.transport.Recall(pinned) == nil {
+			if err := s.transport.RequestPath(pinned); err != nil {
+				s.logger.Printf("propagation: path request for pinned node: %v", err)
+			}
+		}
+	}
 
 	s.logger.Printf("outbound queue depth   : %d", s.outbound.pendingCount())
 

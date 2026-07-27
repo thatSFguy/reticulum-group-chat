@@ -38,6 +38,13 @@ type Transport struct {
 	pathRequestsSent     map[string]time.Time // key: hex dest_hash, dedup window for outbound
 	pathResponseTagsSeen map[string]time.Time // key: hex tag, dedup for inbound path? we've already responded to
 
+	// packetProofWaiters tracks outbound DATA packets awaiting their
+	// SPEC §6.5 delivery proof (the PacketReceipt concept from upstream
+	// RNS). Key: hex of packet_hash[:16] — the synthetic dest_hash the
+	// receiver addresses the PROOF to. Registered by
+	// RegisterPacketProofWaiter, resolved in handlePacketProof.
+	packetProofWaiters map[string]*packetProofWaiter
+
 	// initiatorIdentity, when set, signs SPEC §6.6 LINKIDENTIFY packets
 	// emitted on every link the local node initiates that reaches the
 	// Active state. Set via SetInitiatorIdentity; nil means we never
@@ -446,10 +453,99 @@ func (t *Transport) dispatch(raw []byte) {
 			t.handleLinkProof(p)
 			return
 		}
-		// Opportunistic-DATA proofs come back at us when we send
-		// opportunistic LXMF, but we don't track outstanding
-		// PacketReceipts there yet, so we drop them silently. Future PR
-		// could plumb delivery confirmation through to Delivery.Send.
+		// Anything else is a plain packet proof — the receiver's
+		// SPEC §6.5 acknowledgement of an opportunistic DATA packet we
+		// broadcast. Resolves the matching RegisterPacketProofWaiter
+		// waiter (Delivery.Send blocks on it); proofs nobody is waiting
+		// for are dropped silently.
+		t.handlePacketProof(p)
+	}
+}
+
+// packetProofWaiter is one outstanding delivery-proof subscription. ch is
+// buffered(1) and receives nil exactly once when a valid proof arrives.
+type packetProofWaiter struct {
+	fullHash []byte // 32-byte SHA-256 of the original packet's hashable part
+	edPub    []byte // recipient's long-term Ed25519 public key
+	ch       chan error
+}
+
+// RegisterPacketProofWaiter subscribes to the SPEC §6.5 delivery proof
+// for an outbound DATA packet. packetHash is the full 32-byte SHA-256 of
+// the packet's HashablePart (compute it BEFORE broadcasting and register
+// first — a fast receiver can ack before Broadcast returns).
+// recipientEd25519Pub verifies the proof signature.
+//
+// Returns the resolution channel and a cancel func the caller MUST
+// invoke (defer) to release the slot. The channel receives nil when a
+// valid proof arrives; it never receives a non-nil error today (invalid
+// proofs are logged and ignored, since a forger must not be able to
+// fail a send that the real recipient might still ack).
+func (t *Transport) RegisterPacketProofWaiter(packetHash, recipientEd25519Pub []byte) (<-chan error, func(), error) {
+	if len(packetHash) != sha256.Size {
+		return nil, nil, fmt.Errorf("packet hash must be %d bytes, got %d", sha256.Size, len(packetHash))
+	}
+	if len(recipientEd25519Pub) != ed25519.PublicKeySize {
+		return nil, nil, fmt.Errorf("recipient Ed25519 pub must be %d bytes, got %d", ed25519.PublicKeySize, len(recipientEd25519Pub))
+	}
+	key := hex.EncodeToString(packetHash[:IdentityHashLen])
+	w := &packetProofWaiter{
+		fullHash: append([]byte(nil), packetHash...),
+		edPub:    append([]byte(nil), recipientEd25519Pub...),
+		ch:       make(chan error, 1),
+	}
+	t.mu.Lock()
+	if t.packetProofWaiters == nil {
+		t.packetProofWaiters = map[string]*packetProofWaiter{}
+	}
+	t.packetProofWaiters[key] = w
+	t.mu.Unlock()
+	cancel := func() {
+		t.mu.Lock()
+		delete(t.packetProofWaiters, key)
+		t.mu.Unlock()
+	}
+	return w.ch, cancel, nil
+}
+
+// handlePacketProof resolves a waiter registered via
+// RegisterPacketProofWaiter. The proof's outer dest_hash is
+// packet_hash[:16]; the body is length-dispatched between implicit
+// (64B signature) and explicit (32B hash || 64B signature) forms per
+// SPEC §6.5.1. The signature covers the FULL 32-byte packet hash.
+func (t *Transport) handlePacketProof(p *Packet) {
+	key := hex.EncodeToString(p.DestHash)
+	t.mu.RLock()
+	w := t.packetProofWaiters[key]
+	t.mu.RUnlock()
+	if w == nil {
+		return // nobody waiting (not ours, duplicate, or already resolved+cancelled)
+	}
+
+	var sig []byte
+	switch len(p.Data) {
+	case ProofBodyImplicitLen:
+		sig = p.Data
+	case ProofBodyExplicitLen:
+		if !bytesEqual(p.Data[:sha256.Size], w.fullHash) {
+			t.logger.Printf("packet proof for %x: explicit hash mismatch", p.DestHash[:4])
+			return
+		}
+		sig = p.Data[sha256.Size:]
+	default:
+		t.logger.Printf("packet proof for %x: bad body length %d", p.DestHash[:4], len(p.Data))
+		return
+	}
+	if !Validate(w.edPub, w.fullHash, sig) {
+		// Log-and-ignore rather than failing the waiter: an invalid
+		// proof from a third party must not mask a valid one the real
+		// recipient may still send.
+		t.logger.Printf("packet proof for %x: invalid signature", p.DestHash[:4])
+		return
+	}
+	select {
+	case w.ch <- nil:
+	default: // already resolved (duplicate proof via a second path)
 	}
 }
 

@@ -1,6 +1,7 @@
 package service
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -98,28 +99,86 @@ func (s *announceStore) save(entries []*rns.KnownIdentity) error {
 	return atomicWrite(s.path, data, 0o600)
 }
 
-// announcePersistTap is an AnnounceHandler that re-snapshots the
-// Transport's known map and saves it after every verified announce.
-// Matches every aspect (returns true unconditionally from AspectMatch)
-// so we cache identities for any aspect we may want to reach in the
-// future, not just lxmf.delivery.
+// announcePersistDebounce is how long the persist goroutine waits after
+// the first kick before snapshotting, so a testnet announce burst
+// (several per second) coalesces into one write instead of N.
+const announcePersistDebounce = 2 * time.Second
+
+// announcePersistTap is an AnnounceHandler that keeps announces.json in
+// sync with the Transport's known map. Matches every aspect (returns
+// true unconditionally from AspectMatch) so we cache identities for any
+// aspect we may want to reach in the future, not just lxmf.delivery.
 //
-// Snapshot-on-every-announce keeps the on-disk file consistent with
-// in-memory state but does mean we write to disk from the Transport
-// dispatcher goroutine. This is the same pattern the existing
-// announceTap uses to update the roster's last_announce timestamp,
-// so it's already on the dispatcher's hot path; the marginal cost
-// of the announce-cache write is one additional ~few-KB JSON
-// serialize per inbound announce.
+// Persistence is asynchronous: OnAnnounce only sets a non-blocking kick
+// flag, and the run goroutine (started from Service.Run) debounces and
+// writes off the dispatcher. This used to save synchronously per
+// announce, which was fine when the cache was a few KB — but the known
+// map grows with every peer ever heard (2000+ entries, ~1 MB JSON on a
+// long-lived testnet deployment), and a ~1 MB marshal+write inside the
+// dispatcher goroutine per announce delays every inbound DATA packet
+// and outbound delivery proof queued behind it.
 type announcePersistTap struct {
 	transport *rns.Transport
 	store     *announceStore
 	logger    *log.Logger
+
+	// kick is buffered(1): OnAnnounce sets it without blocking; the run
+	// loop drains it. Multiple announces between saves collapse into
+	// one pending kick.
+	kick chan struct{}
+
+	// debounce defaults to announcePersistDebounce; overridable in tests.
+	debounce time.Duration
+}
+
+func newAnnouncePersistTap(transport *rns.Transport, store *announceStore, logger *log.Logger) *announcePersistTap {
+	return &announcePersistTap{
+		transport: transport,
+		store:     store,
+		logger:    logger,
+		kick:      make(chan struct{}, 1),
+		debounce:  announcePersistDebounce,
+	}
 }
 
 func (t *announcePersistTap) AspectMatch(_ []byte) bool { return true }
 
 func (t *announcePersistTap) OnAnnounce(_ *rns.Announce) {
+	select {
+	case t.kick <- struct{}{}:
+	default: // a save is already pending; it will cover this announce
+	}
+}
+
+// run is the persist loop. Call as a goroutine from Service.Run; exits
+// on ctx cancel after one final save so the freshest announces survive
+// a graceful shutdown.
+func (t *announcePersistTap) run(ctx context.Context) {
+	for {
+		select {
+		case <-ctx.Done():
+			t.saveNow()
+			return
+		case <-t.kick:
+			// Coalesce the burst that typically follows the first
+			// announce, then drain any kick that arrived while we
+			// waited — the snapshot below covers those announces too.
+			select {
+			case <-time.After(t.debounce):
+			case <-ctx.Done():
+				t.saveNow()
+				return
+			}
+			select {
+			case <-t.kick:
+			default:
+			}
+			t.saveNow()
+		}
+	}
+}
+
+func (t *announcePersistTap) saveNow() {
 	if err := t.store.save(t.transport.KnownSnapshot()); err != nil {
 		t.logger.Printf("announce cache save: %v", err)
 	}

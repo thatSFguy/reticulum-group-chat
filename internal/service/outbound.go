@@ -62,6 +62,13 @@ type outboundMessage struct {
 	Attempts    int            `json:"attempts"`     // 0..maxDeliveryAttempts
 	NextAttempt time.Time      `json:"next_attempt"` // zero = ready now
 	EnqueuedAt  time.Time      `json:"enqueued_at"`
+
+	// Propagated routes this message via a propagation node (SPEC §5.8
+	// store-and-forward) instead of direct delivery. Set at enqueue when
+	// propagation mode is "always", or flipped by the drain loop when
+	// direct delivery exhausts its retry budget in "fallback" mode.
+	// Persisted so a restart doesn't demote a message back to direct.
+	Propagated bool `json:"propagated,omitempty"`
 }
 
 // outboundSender is the subset of *lxmf.Delivery + *rns.Transport the
@@ -72,6 +79,16 @@ type outboundMessage struct {
 // rewritten per recipient.
 type outboundSender interface {
 	SendLXMF(recipient, body []byte, fields map[any]any) (msgID []byte, err error)
+	// SendLXMFPropagated submits the message to the currently selected
+	// propagation node for store-and-forward delivery to `recipient`.
+	// Success means the NODE holds the message; the recipient collects
+	// it on their next sync.
+	SendLXMFPropagated(recipient, body []byte, fields map[any]any) (msgID []byte, err error)
+	// HasPropagationNode reports whether a propagation node is currently
+	// selectable — the gate for the fallback re-route, so a message
+	// isn't converted to propagated only to burn a second retry budget
+	// when no node exists.
+	HasPropagationNode() bool
 	RequestPath(recipient []byte) error
 	// LastAnnounceFor returns when the recipient most recently
 	// announced (verified inbound), or zero+false if we've never
@@ -112,6 +129,13 @@ type OutboundQueue struct {
 	pathlessTries   int
 	workers         int
 
+	// Propagation routing, set via SetPropagation. propagationAlways
+	// enqueues every message as propagated; propagationFallback converts
+	// a message to propagated when its direct retry budget runs out
+	// (instead of dropping it). Both false = direct-only (legacy).
+	propagationFallback bool
+	propagationAlways   bool
+
 	now func() time.Time
 }
 
@@ -129,6 +153,14 @@ func newOutboundQueue(sender outboundSender, store *outboundStore, logger *log.L
 		workers:         outboundWorkers,
 		now:             time.Now,
 	}
+}
+
+// SetPropagation configures store-and-forward routing. Call before Run.
+func (q *OutboundQueue) SetPropagation(fallback, always bool) {
+	q.mu.Lock()
+	q.propagationFallback = fallback
+	q.propagationAlways = always
+	q.mu.Unlock()
 }
 
 // SetIDMap attaches a Cache so successful per-recipient sends register
@@ -186,6 +218,7 @@ func (q *OutboundQueue) EnqueueBubble(recipient, body []byte, fields map[any]any
 		EnqueuedAt: q.now(),
 	}
 	q.mu.Lock()
+	msg.Propagated = q.propagationAlways
 	q.pending = append(q.pending, msg)
 	q.persistLocked()
 	q.mu.Unlock()
@@ -308,9 +341,16 @@ func (q *OutboundQueue) attempt(msg *outboundMessage) {
 	q.mu.Lock()
 	msg.Attempts++
 	attempts := msg.Attempts
+	propagated := msg.Propagated
 	q.mu.Unlock()
 
-	msgID, err := q.sender.SendLXMF(msg.Recipient, msg.Body, msg.Fields)
+	var msgID []byte
+	var err error
+	if propagated {
+		msgID, err = q.sender.SendLXMFPropagated(msg.Recipient, msg.Body, msg.Fields)
+	} else {
+		msgID, err = q.sender.SendLXMF(msg.Recipient, msg.Body, msg.Fields)
+	}
 
 	if err == nil && msg.Bubble != nil && q.idmap != nil && len(msgID) > 0 {
 		// Register the recipient's view of this bubble's message_id so
@@ -332,7 +372,33 @@ func (q *OutboundQueue) attempt(msg *outboundMessage) {
 		q.persistLocked()
 		return
 	}
+	// "No propagation node available" is a waiting condition, not a
+	// delivery failure — nodes appear whenever their next announce
+	// arrives. Don't burn the attempt budget against it (in "always"
+	// mode with no node discovered yet, that would drop every message
+	// within a minute of enqueue); just defer and keep the message.
+	if errors.Is(err, errNoPropagationNode) {
+		msg.Attempts--
+		msg.NextAttempt = q.now().Add(q.retryWait)
+		q.persistLocked()
+		q.logger.Printf("outbound: propagated message to %x deferred: %v", msg.Recipient[:4], err)
+		return
+	}
 	if attempts >= q.maxAttempts {
+		// Fallback re-route (mirrors LXMRouter's try_propagation_on_fail):
+		// a message that exhausted its direct budget gets one full retry
+		// budget via the propagation node — but only if a node is
+		// actually selectable, so we don't burn a silent second budget
+		// against nothing. Already-propagated messages fail terminally.
+		if q.propagationFallback && !msg.Propagated && q.sender.HasPropagationNode() {
+			msg.Propagated = true
+			msg.Attempts = 0
+			msg.NextAttempt = q.now().Add(q.retryWait)
+			q.persistLocked()
+			q.logger.Printf("outbound: direct delivery to %x failed after %d attempts (%v) — re-routing via propagation node",
+				msg.Recipient[:4], attempts, err)
+			return
+		}
 		q.failLocked(msg, err)
 		return
 	}
@@ -364,8 +430,10 @@ func (q *OutboundQueue) removeLocked(msg *outboundMessage) {
 }
 
 // failLocked is the terminal transition: max attempts exhausted, drop the
-// message and log. Mirrors LXMRouter.fail_message — no automatic re-route
-// to a different delivery method (we only have opportunistic+link).
+// message and log. Mirrors LXMRouter.fail_message. The propagation
+// fallback re-route (when configured) happens in attempt() before this
+// is reached; a message that lands here has exhausted every configured
+// delivery method.
 func (q *OutboundQueue) failLocked(msg *outboundMessage, err error) {
 	q.removeLocked(msg)
 	q.persistLocked()
@@ -397,15 +465,50 @@ func isRecipientUnknown(err error) bool {
 	return errors.Is(err, lxmf.ErrRecipientUnknown) || errors.Is(err, rns.ErrLinkPeerUnknown)
 }
 
+// errNoPropagationNode is returned by SendLXMFPropagated when no
+// propagation node is currently selectable (none discovered yet, none
+// accepting, or propagation not configured). Recoverable — a node
+// announce can arrive at any time — so the queue retries it like any
+// other transient failure.
+var errNoPropagationNode = errors.New("no propagation node available")
+
 // deliverySender adapts *lxmf.Delivery + *rns.Transport to the queue's
-// outboundSender interface. Single-purpose; not exported.
+// outboundSender interface. Single-purpose; not exported. nodes is nil
+// when propagation is disabled — SendLXMFPropagated then always errors
+// and HasPropagationNode is false, which the queue's config flags
+// prevent from ever mattering.
 type deliverySender struct {
 	delivery  *lxmf.Delivery
 	transport *rns.Transport
+	nodes     *propagationTracker
 }
 
 func (d *deliverySender) SendLXMF(recipient, body []byte, fields map[any]any) ([]byte, error) {
 	return d.delivery.SendWithID(recipient, nil, body, fields)
+}
+
+func (d *deliverySender) SendLXMFPropagated(recipient, body []byte, fields map[any]any) ([]byte, error) {
+	if d.nodes == nil {
+		return nil, errNoPropagationNode
+	}
+	node := d.nodes.Current()
+	if node == nil {
+		return nil, errNoPropagationNode
+	}
+	msgID, err := d.delivery.SendPropagated(node, recipient, nil, body, fields)
+	// A pinned node we've never heard from can't be linked to — ask the
+	// network for its announce so a later retry can succeed. (For
+	// auto-discovered nodes this can't trigger: discovery IS an announce.)
+	if errors.Is(err, lxmf.ErrPropagationNodeUnknown) {
+		if rerr := d.transport.RequestPath(node); rerr != nil {
+			return nil, fmt.Errorf("%w (path request also failed: %v)", err, rerr)
+		}
+	}
+	return msgID, err
+}
+
+func (d *deliverySender) HasPropagationNode() bool {
+	return d.nodes != nil && d.nodes.Current() != nil
 }
 
 func (d *deliverySender) RequestPath(recipient []byte) error {

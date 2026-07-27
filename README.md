@@ -141,6 +141,15 @@ messages addressed to a destination hash, deliverable opportunistically
   DATA (one Token-framed packet over a Reticulum Link) for medium
   payloads; SPEC §10 Resource transfer for anything bigger (long
   `/users` replies on big rosters, long chat messages, etc.).
+- **Propagation-node store-and-forward (opt-in, v1.13.0+).** With
+  `[propagation] enabled = true`, messages that exhaust their direct
+  retry budget are handed to an LXMF propagation node (SPEC §5.8)
+  instead of dropped — offline members get them on their client's
+  next sync. Nodes are auto-discovered from `lxmf.propagation`
+  announces (or pinned by hash), the node's declared per-transfer
+  limit is respected, and required §5.7 proof-of-work stamps are
+  ground automatically. `mode = "always"` routes everything via the
+  node. See [`[propagation]`](#propagation).
 - **Mod / admin moderation.** Config-file `admins` and `mods` lists
   get `/kick`, `/ban`, `/unban`, `/announce`, `/path`, and the
   cross-user form of `/nick`. Admins can also grant/clear roles at
@@ -443,6 +452,31 @@ addr = "10.0.0.42:4242"   # your own rnsd on the LAN
 |---|---|---|---|
 | `count`   | int      | `100` | Max messages replayed when a member joins (or rejoins). `0` disables replay entirely. |
 | `max_age` | duration | `"7d"` | Skip messages older than this in replay. |
+
+### `[propagation]`
+
+Store-and-forward delivery via LXMF propagation nodes (SPEC §5.8).
+Disabled by default; existing deployments are unaffected.
+
+| Key | Type | Default | Description |
+|---|---|---|---|
+| `enabled` | bool   | `false`      | Turn propagation-node submission on. |
+| `mode`    | string | `"fallback"` | `"fallback"`: direct delivery first, re-route via the propagation node only after the direct retry budget (5 attempts) is exhausted. `"always"`: every outbound message goes to the propagation node only — nothing is dropped for being offline, at the cost of sync latency. |
+| `node`    | hex    | unset        | Pin a specific propagation node by its `lxmf.propagation` destination hash (32 hex chars). Unset = auto-select the most recently heard node currently announcing itself as accepting messages. |
+
+Notes:
+
+- Delivery to the node rides a Reticulum Link and succeeds when the
+  **node** holds the message; the member's client (Sideband, MeshChat,
+  …) fetches it on its next propagation sync. Members must have a
+  propagation node configured client-side for this to reach them.
+- If the node's announce declares a stamp cost (§5.8.5), the required
+  proof-of-work stamp is computed automatically, up to 24 bits —
+  nodes demanding more are refused (defense against a hostile
+  announce pinning the CPU).
+- The node's announced per-transfer size limit is enforced before
+  upload; oversize messages fail that route rather than being
+  silently truncated.
 
 ---
 
@@ -770,9 +804,14 @@ round-trip with a third-party LXMF client.
   `app_data`.
 - **Opportunistic LXMF** — full sign / encrypt / decrypt / verify in
   both directions, including SPEC §5.6 dual-msgpack-variant tolerance.
-- **PROOF emission** (SPEC §6.5) — every inbound CTX_NONE DATA at a
-  SINGLE destination is acknowledged with a 64-byte implicit-form
-  proof so senders' `PacketReceipt`s resolve.
+- **PROOF emission and tracking** (SPEC §6.5) — every inbound CTX_NONE
+  DATA at a SINGLE destination is acknowledged with a 64-byte
+  implicit-form proof so senders' `PacketReceipt`s resolve. Outbound
+  opportunistic sends track the recipient's proof in return (accepting
+  implicit and explicit forms): `Send` blocks up to 15 s for it, so an
+  offline recipient surfaces as a failed attempt that the retry queue —
+  and the propagation fallback — can act on, instead of a silent
+  fire-and-forget "success".
 - **Path requests** (SPEC §7.1) — when a sender we can't verify
   contacts us, we issue a `path?` broadcast; a path-aware relay's
   path-response announce gives us their public key. Per-target 60 s
@@ -785,6 +824,15 @@ round-trip with a third-party LXMF client.
   link-form Token cipher, link-DATA framing, SPEC §6.5.6 explicit-form
   96-byte link PROOFs. Idle links auto-close after 15 min;
   KEEPALIVE every 4 min.
+- **Propagation-node submission** (SPEC §5.8, sender side) — packs
+  the propagated wire form (`dest_hash || Token-encrypted body`,
+  wrapped in the msgpack upload envelope), parses `lxmf.propagation`
+  announce app_data (the strict 7-element §5.8.5 shape, including
+  the `[5]`-as-list interop gotcha), grinds §5.7.2 propagation
+  stamps (1000-round PN workblock) when the node requires them, and
+  uploads over a Link — single link DATA or Resource by size. The
+  server role and `/get` retrieval are out of scope (members'
+  clients fetch their own mail).
 - **Resource transfer** (SPEC §10) — full sender and receiver. Send:
   link-encrypt the body, slice into raw-ciphertext parts, advertise
   via msgpack ADV, fulfill receiver-driven REQs, validate the
@@ -879,8 +927,17 @@ LXMF to run a group-chat hub. Notable gaps:
 - **No ratchets / forward secrecy.** Long-term X25519 key is used
   for every Token cipher. Future-key compromise means past messages
   are decryptable.
-- **No stamps / proof-of-work anti-spam.** Peers that *require*
-  stamps will silently reject our outbound LXMF.
+- **Partial stamps support.** Outbound §5.7 proof-of-work stamps are
+  generated for propagation-node submission (v1.13.0+), but not for
+  direct peer-to-peer delivery — a *peer* that requires stamps on
+  received messages will still silently reject our direct outbound
+  LXMF. Inbound stamps are tolerated but not validated; tickets are
+  not implemented.
+- **Propagation: sender side only.** fwdsvc can *submit* messages to
+  a propagation node (see `[propagation]`), but does not act as a
+  propagation node itself and does not retrieve its own inbound mail
+  via `/get` — people messaging the group need the service reachable
+  directly.
 - **Limited LXMF field support.** `FIELD_IMAGE` (6) and the upstream
   LXMF 1.0.0 message-meta fields — reply-to (`0x30`=48 + `0x31`=49),
   reactions (`FIELD_REACTION 0x40`=64), comments (`0x41`=65), and

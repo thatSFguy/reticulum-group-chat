@@ -15,6 +15,37 @@ import (
 // announce can populate the public key out-of-band.
 var ErrRecipientUnknown = errors.New("recipient has not announced; cannot encrypt")
 
+// ErrPropagationNodeUnknown is returned by SendPropagated when the
+// propagation node hasn't announced yet — without its announce we have
+// neither its public key (link handshake) nor its app_data (stamp cost,
+// transfer limits). Recoverable the same way as ErrRecipientUnknown:
+// request a path and retry.
+var ErrPropagationNodeUnknown = errors.New("propagation node has not announced; cannot open link")
+
+// ErrPropagationNodeDisabled is returned by SendPropagated when the
+// node's most recent announce says it is not currently accepting
+// messages (§5.8.5 element [2] false).
+var ErrPropagationNodeDisabled = errors.New("propagation node is not accepting messages")
+
+// ErrPropagationTransferTooLarge is returned when the packed bundle
+// exceeds the per-transfer limit the node announced (§5.8.5 element [3]).
+var ErrPropagationTransferTooLarge = errors.New("message exceeds propagation node per-transfer limit")
+
+// ErrDeliveryProofTimeout is returned by Send when an opportunistic DATA
+// packet went out but the recipient's SPEC §6.5 delivery proof never
+// arrived — the LXMF-level signal for "recipient is offline or
+// unreachable". Callers with a retry queue treat it like any transient
+// failure; with propagation fallback configured, exhausting the retry
+// budget on this error re-routes the message via a propagation node.
+var ErrDeliveryProofTimeout = errors.New("no delivery proof from recipient")
+
+// DefaultDeliveryProofTimeout is how long Send waits for the recipient's
+// §6.5 proof of an opportunistic DATA packet before reporting the
+// attempt failed. Long enough for a multi-hop testnet round trip; short
+// enough that five retries + backoff resolve to the propagation
+// fallback within ~2 minutes.
+const DefaultDeliveryProofTimeout = 15 * time.Second
+
 // Delivery is an LXMF "delivery destination" registered on a Transport.
 // Inbound opportunistic LXMF messages addressed to its destination hash are
 // Token-decrypted, parsed, signature-verified, and handed to OnMessage.
@@ -42,6 +73,14 @@ type Delivery struct {
 	// LINKREQUEST/LRPROOF round-trip + DATA broadcast + DATA proof wait.
 	// Defaults to rns.DefaultLinkSendTimeout (30s) when zero.
 	LinkSendTimeout time.Duration
+
+	// DeliveryProofTimeout caps how long an opportunistic Send waits for
+	// the recipient's SPEC §6.5 delivery proof before returning
+	// ErrDeliveryProofTimeout. 0 = DefaultDeliveryProofTimeout (15s).
+	// Negative = fire-and-forget (return as soon as Broadcast does) —
+	// the pre-v1.13 behavior, kept for tests and for callers that do
+	// their own confirmation.
+	DeliveryProofTimeout time.Duration
 }
 
 // NewDelivery registers the LXMF delivery destination for `identity` on
@@ -90,8 +129,11 @@ func (d *Delivery) Identity() *rns.Identity { return d.identity }
 //
 //   - If the message fits the opportunistic single-packet cap
 //     (MaxOpportunisticPayload, 295 bytes msgpack), it is sent in one
-//     Token-encrypted Reticulum DATA packet — fire-and-forget, returns
-//     as soon as Broadcast returns.
+//     Token-encrypted Reticulum DATA packet, then BLOCKS until the
+//     recipient's SPEC §6.5 delivery proof arrives or
+//     DeliveryProofTimeout (15s default) elapses — an unreachable
+//     recipient surfaces as ErrDeliveryProofTimeout instead of a
+//     silent success.
 //   - If it would overflow that cap, falls through to link delivery:
 //     opens a Reticulum Link to the recipient (handshake) if no Active
 //     one exists, then sends the LXMF body in direct form on the link
@@ -142,10 +184,48 @@ func (d *Delivery) SendWithID(recipientDestHash []byte, title, content []byte, f
 	}
 
 	pkt := buildOutboundPacket(recipientDestHash, ciphertext, known.TransportID)
+
+	// Delivery confirmation (SPEC §6.5): register for the recipient's
+	// proof BEFORE broadcasting — a fast/local recipient can ack before
+	// Broadcast returns. Without this wait, opportunistic Send is
+	// fire-and-forget: it reports success the moment the packet leaves
+	// our interface, an offline recipient never surfaces as a failure,
+	// and retry/propagation-fallback logic upstream of us never engages.
+	// HashablePart is invariant under the HEADER_1↔HEADER_2 rewriting
+	// relays do in flight, so our hash matches what the recipient signs.
+	hashable, err := pkt.HashablePart()
+	if err != nil {
+		return nil, fmt.Errorf("hashable: %w", err)
+	}
+	packetHash := sha256Sum(hashable)
+	proofCh, cancelWaiter, err := d.transport.RegisterPacketProofWaiter(packetHash, known.Ed25519Public())
+	if err != nil {
+		return nil, fmt.Errorf("register proof waiter: %w", err)
+	}
+	defer cancelWaiter()
+
 	if err := d.transport.Broadcast(pkt); err != nil {
 		return nil, err
 	}
-	return packedID, nil
+
+	wait := d.DeliveryProofTimeout
+	if wait < 0 {
+		return packedID, nil // explicit fire-and-forget
+	}
+	if wait == 0 {
+		wait = DefaultDeliveryProofTimeout
+	}
+	timer := time.NewTimer(wait)
+	defer timer.Stop()
+	select {
+	case proofErr := <-proofCh:
+		if proofErr != nil {
+			return nil, proofErr
+		}
+		return packedID, nil
+	case <-timer.C:
+		return nil, fmt.Errorf("%w: %x after %s", ErrDeliveryProofTimeout, recipientDestHash[:4], wait)
+	}
 }
 
 // sendOverLink is the link-delivery fallback path used by Send when the
@@ -168,6 +248,83 @@ func (d *Delivery) sendOverLink(recipientDestHash, title, content []byte, fields
 	}
 	if err := d.transport.SendOverLink(recipientDestHash, directBody, timeout); err != nil {
 		return nil, fmt.Errorf("link send: %w", err)
+	}
+	return packedID, nil
+}
+
+// SendPropagated submits an LXMF message for `recipientDestHash` to the
+// propagation node at `nodeDestHash` for store-and-forward delivery
+// (SPEC §5.8, flows/send-propagated-lxmf.md). The recipient fetches it
+// later via /get; this call succeeds when the NODE has the message, not
+// when the recipient does.
+//
+// Pipeline: pack the propagated form (encrypted to the RECIPIENT — the
+// node never decrypts), grind a §5.7 propagation stamp if the node's
+// announce demands one, wrap in the msgpack upload envelope, and ship it
+// over a Link to the node's lxmf.propagation destination —
+// Transport.SendOverLink picks single link DATA or a Resource transfer
+// by size and blocks for the node's proof.
+//
+// Both the recipient AND the node must have announced: the recipient for
+// the encryption keys, the node for the link handshake + its §5.8.5
+// app_data (enabled state, stamp cost, transfer limit — all enforced
+// here). Returns the recipient-view message_id, same as SendWithID.
+func (d *Delivery) SendPropagated(nodeDestHash, recipientDestHash []byte, title, content []byte, fields map[any]any) (msgID []byte, err error) {
+	if len(nodeDestHash) != rns.IdentityHashLen {
+		return nil, fmt.Errorf("propagation node dest_hash must be %d bytes", rns.IdentityHashLen)
+	}
+	if len(recipientDestHash) != rns.IdentityHashLen {
+		return nil, fmt.Errorf("recipient dest_hash must be %d bytes", rns.IdentityHashLen)
+	}
+	recipient := d.transport.Recall(recipientDestHash)
+	if recipient == nil {
+		return nil, fmt.Errorf("%w: %x", ErrRecipientUnknown, recipientDestHash[:4])
+	}
+	node := d.transport.Recall(nodeDestHash)
+	if node == nil {
+		return nil, fmt.Errorf("%w: %x", ErrPropagationNodeUnknown, nodeDestHash[:4])
+	}
+	info, err := ParsePropagationNodeAppData(node.AppData)
+	if err != nil {
+		return nil, fmt.Errorf("node %x: %w", nodeDestHash[:4], err)
+	}
+	if !info.Enabled {
+		return nil, fmt.Errorf("%w: %x", ErrPropagationNodeDisabled, nodeDestHash[:4])
+	}
+
+	lxmfData, transientID, packedID, err := SignAndPackPropagated(
+		d.identity, d.destHash, recipientDestHash,
+		recipient.X25519Public(), identityHashFromPublic(recipient.PublicKey),
+		title, content, fields)
+	if err != nil {
+		return nil, fmt.Errorf("pack propagated: %w", err)
+	}
+
+	if info.StampCost > 0 {
+		stamp, err := GeneratePropagationStamp(transientID, info.StampCost)
+		if err != nil {
+			return nil, fmt.Errorf("node %x: %w", nodeDestHash[:4], err)
+		}
+		// Appended AFTER the transient_id is computed — the stamp is
+		// derived from it (flows/send-propagated-lxmf.md step 5).
+		lxmfData = append(lxmfData, stamp...)
+	}
+
+	bundle, err := PackPropagationBundle(time.Now(), lxmfData)
+	if err != nil {
+		return nil, err
+	}
+	if info.PerTransferLimitKB > 0 && int64(len(bundle)) > info.PerTransferLimitKB*1000 {
+		return nil, fmt.Errorf("%w: bundle is %d B, node cap is %d KB",
+			ErrPropagationTransferTooLarge, len(bundle), info.PerTransferLimitKB)
+	}
+
+	timeout := d.LinkSendTimeout
+	if timeout <= 0 {
+		timeout = rns.DefaultLinkSendTimeout
+	}
+	if err := d.transport.SendOverLink(nodeDestHash, bundle, timeout); err != nil {
+		return nil, fmt.Errorf("propagation upload: %w", err)
 	}
 	return packedID, nil
 }

@@ -115,5 +115,26 @@ timeout = "10s"
 count   = 100
 max_age = "7d"
 
+[propagation]
+# Store-and-forward delivery via LXMF propagation nodes. When enabled,
+# messages the service can't deliver directly (recipient offline or
+# unreachable) are handed to a propagation node; the recipient's client
+# (Sideband etc.) picks them up on its next sync instead of the message
+# being dropped after the direct retry budget runs out.
+enabled = false
+
+# Delivery strategy:
+#   "fallback" (default) — try direct delivery first; only messages whose
+#     direct retries are exhausted get re-routed via the propagation node.
+#   "always" — every outbound message goes to the propagation node only;
+#     members receive everything on their next sync (higher latency, but
+#     nothing is ever dropped for being offline).
+mode = "fallback"
+
+# Optional: pin a specific propagation node by its lxmf.propagation
+# destination hash (32 hex chars). Leave empty to auto-select the most
+# recently heard node that announces itself as accepting messages.
+#node = "00112233445566778899aabbccddeeff"
+
 # (admins / mods are now at the top of the file — see the comment block
 # at the start. They MUST be top-level keys before any [section] header.)
