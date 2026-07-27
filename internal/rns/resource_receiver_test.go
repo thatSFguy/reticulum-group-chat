@@ -4,6 +4,8 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"os"
+	"path/filepath"
 	"testing"
 	"time"
 )
@@ -166,5 +168,60 @@ func TestReceiverTimeoutSendsRcl(t *testing.T) {
 	}
 	if !findRcl(t, rr, iface) {
 		t.Error("no RESOURCE_RCL was broadcast on receiver-side abort")
+	}
+}
+
+// TestDecompressBombIsBounded is the replacement defense for the c=1
+// rejection lifted in v1.14.1. The fixture is 49 bytes of real Python
+// bz2 output that expands to 10 MiB — a ~214,000x amplification — so
+// the decompressor's OUTPUT must be bounded. The ADV's declared `d` is
+// attacker-supplied and cannot be trusted on its own.
+func TestDecompressBombIsBounded(t *testing.T) {
+	bomb, err := os.ReadFile(filepath.Join("testdata", "bz2_bomb_10mib.bin"))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// A sender that LIES about d: declares a tiny body, ships a bomb.
+	rr := &ResourceReceiver{flags: int(ResourceFlagCompressed), dataSize: 1024}
+	if _, err := rr.decompressIfNeeded(bomb); err == nil {
+		t.Fatal("bomb accepted; the output bound is not enforced")
+	} else if !errors.Is(err, ErrResourceTooLarge) {
+		t.Errorf("err = %v, want ErrResourceTooLarge", err)
+	}
+
+	// And an honest-but-oversized d is still clamped by the absolute cap.
+	rr2 := &ResourceReceiver{flags: int(ResourceFlagCompressed), dataSize: 10 << 20}
+	if _, err := rr2.decompressIfNeeded(bomb); err == nil {
+		t.Fatal("bomb accepted when d exceeds MaxDecompressedResourceLen")
+	}
+}
+
+// TestDecompressRoundTrip is the functional half: legitimate compressed
+// bodies — the ordinary prose that RNS compresses and that this service
+// was silently dropping — must survive intact.
+func TestDecompressRoundTrip(t *testing.T) {
+	compressed, err := os.ReadFile(filepath.Join("testdata", "bz2_prose.bin"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	original, err := os.ReadFile(filepath.Join("testdata", "bz2_prose.expected"))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	rr := &ResourceReceiver{flags: int(ResourceFlagCompressed), dataSize: len(original)}
+	got, err := rr.decompressIfNeeded(compressed)
+	if err != nil {
+		t.Fatalf("legitimate compressed body rejected: %v", err)
+	}
+	if !bytes.Equal(got, original) {
+		t.Errorf("round-trip mismatch: got %d bytes, want %d", len(got), len(original))
+	}
+
+	// Uncompressed bodies must pass through untouched.
+	rr.flags = 0
+	if got, err := rr.decompressIfNeeded(original); err != nil || !bytes.Equal(got, original) {
+		t.Errorf("uncompressed passthrough broken: %v", err)
 	}
 }

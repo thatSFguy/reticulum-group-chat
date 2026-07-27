@@ -1,9 +1,12 @@
 package rns
 
 import (
+	"bytes"
+	"compress/bzip2"
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -47,12 +50,12 @@ type ResourceReceiver struct {
 	logger    Logger
 
 	// Identification — captured from the ADV, immutable after.
-	resourceHash    []byte
-	randomR         []byte
-	expectedSize    int
-	dataSize        int
-	flags           int
-	multihopID      []byte
+	resourceHash []byte
+	randomR      []byte
+	expectedSize int
+	dataSize     int
+	flags        int
+	multihopID   []byte
 
 	linkSigning    []byte
 	linkEncryption []byte
@@ -599,6 +602,14 @@ func (rr *ResourceReceiver) assemble() ([]byte, error) {
 	}
 	body := plaintext[ResourceRandomHashSize:] // strip the 4-byte body prefix (SPEC §10.8 callout)
 
+	// SPEC §10.8 order: strip prefix -> decompress -> hash. Both the
+	// length check and the hash below are defined over the DECOMPRESSED
+	// body, so this must happen first.
+	body, err = rr.decompressIfNeeded(body)
+	if err != nil {
+		return nil, err
+	}
+
 	// Belt-and-suspenders: compare actual body length to advertised.
 	// dataSize is the original plaintext length per SPEC §10.4 `d`.
 	if len(body) != rr.dataSize {
@@ -611,6 +622,44 @@ func (rr *ResourceReceiver) assemble() ([]byte, error) {
 		return nil, ErrResourceHashMismatch
 	}
 	return body, nil
+}
+
+// decompressIfNeeded bz2-expands the body when the advertisement set
+// c=1, with the output bounded per the SPEC §10.4 security callout.
+//
+// The bound is the load-bearing defense: a few tens of KB of bz2 input
+// can legitimately expand to gigabytes, and neither the chunk-count cap
+// nor the `t`/`d` parse-time checks constrain post-decompression size
+// on their own. Two limits apply here:
+//
+//   - `d` (the advertised uncompressed length) is already capped at
+//     MaxAcceptedResourceSize when the ADV is parsed; and
+//   - we read at most d+1 bytes and reject anything longer, so a
+//     sender that LIES about `d` gains nothing — the running output
+//     total is what's bounded, exactly as the spec requires.
+//
+// This mirrors upstream RNS 1.1.9's fix (BZ2Decompressor with
+// max_length plus an eof check). Go's compress/bzip2 is streaming and
+// allocates only what we read, so an io.LimitReader gives the same
+// guarantee; reading one byte past the limit is how we detect overrun.
+func (rr *ResourceReceiver) decompressIfNeeded(body []byte) ([]byte, error) {
+	if rr.flags&int(ResourceFlagCompressed) == 0 {
+		return body, nil
+	}
+	limit := rr.dataSize
+	if limit < 0 || limit > MaxDecompressedResourceLen {
+		limit = MaxDecompressedResourceLen
+	}
+	zr := bzip2.NewReader(bytes.NewReader(body))
+	out, err := io.ReadAll(io.LimitReader(zr, int64(limit)+1))
+	if err != nil {
+		return nil, fmt.Errorf("%w: bz2 decompress: %v", ErrResourceHashMismatch, err)
+	}
+	if len(out) > limit {
+		return nil, fmt.Errorf("%w: decompressed output exceeds %d bytes (declared d=%d) — possible decompression bomb",
+			ErrResourceTooLarge, limit, rr.dataSize)
+	}
+	return out, nil
 }
 
 // broadcastProof emits the RESOURCE_PRF as a PROOF-type packet (NOT
@@ -632,6 +681,13 @@ func (rr *ResourceReceiver) broadcastProof() error {
 		return fmt.Errorf("decrypt for PRF: %w", err)
 	}
 	body := plaintext[ResourceRandomHashSize:]
+	// The proof, like the hash, is defined over the UNCOMPRESSED body
+	// (SPEC §10.8 step 5 / §10.12). Proving over compressed bytes would
+	// make the sender reject every c=1 transfer as unproven.
+	body, err = rr.decompressIfNeeded(body)
+	if err != nil {
+		return fmt.Errorf("decompress for PRF: %w", err)
+	}
 	fullProof := ResourceExpectedProof(body, rr.resourceHash)
 
 	prfBody, err := BuildResourceProof(&ResourceProof{

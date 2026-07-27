@@ -171,19 +171,23 @@ func ParseResourceAdv(body []byte) (*ResourceAdvertisement, error) {
 	if adv.NumParts > MaxAcceptedResourceParts {
 		return nil, fmt.Errorf("%w: n=%d cap=%d", ErrResourceTooManyParts, adv.NumParts, MaxAcceptedResourceParts)
 	}
-	// Reject compressed resources. fwdsvc never sends c=1 (we never
-	// produce inbound bodies large enough to benefit from bz2), and
-	// accepting c=1 means inviting bz2 decompression-bomb attacks
-	// per the SPEC §10.4 callout. A 256 KiB encrypted body that bz2-
-	// expands to 100 MiB would OOM the daemon. Rejecting outright is
-	// the most defensive posture; if a real use case for inbound
-	// compressed Resources appears, add bounded
-	// bz2.NewReader(io.LimitReader(...)) decompression in assemble
-	// and verify post-decompress size against MaxDecompressedResourceLen.
-	if adv.Flags&int(ResourceFlagCompressed) != 0 {
-		return nil, fmt.Errorf("%w: compressed (c=1) resources rejected — fwdsvc has no use case + bz2 decompression-bomb risk",
-			ErrResourceTooLarge)
-	}
+	// Compressed (c=1) resources ARE accepted, with bounded
+	// decompression in ResourceReceiver.assemble.
+	//
+	// They were rejected outright until v1.14.1, on the reasoning that
+	// we never send c=1 so we need never receive it. That was wrong in
+	// practice: RNS compresses a Resource whenever bz2 shrinks it, and
+	// ordinary prose shrinks by ~30% — so a perfectly normal ~450-char
+	// chat message from Sideband or any upstream client arrived as
+	// c=1 and was silently dropped, despite being well inside
+	// max_inbound_chars. Live interop against RNS 1.4.2 caught it.
+	//
+	// The bomb risk is real and is handled where the spec says to
+	// handle it (§10.4 security callout): the decompressor output is
+	// bounded, not the flag. Two independent limits apply — `d` is
+	// already capped above by MaxAcceptedResourceSize, and assemble
+	// refuses to emit more than `d` bytes, so a sender that lies about
+	// `d` cannot bypass the parse-time check.
 	// Reject metadata-bearing resources (x=1, SPEC §10.2.1). fwdsvc never
 	// sets x, and it does NOT strip the leading `uint24-len ‖ msgpack`
 	// metadata prefix on receive — accepting x=1 would hand that prefix to
