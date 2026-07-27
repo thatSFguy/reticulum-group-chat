@@ -94,7 +94,31 @@ func (s *announceStore) save(entries []*rns.KnownIdentity) error {
 		Entries: entries,
 	}, "", "  ")
 	if err != nil {
-		return err
+		// One unmarshalable entry must not cost us the whole cache.
+		// Entry contents derive from peer-supplied announce fields, so
+		// a single hostile or broken peer could otherwise stop the
+		// cache persisting entirely — which is not a visible failure,
+		// it just means every peer has to be re-learned after each
+		// restart. Drop the offenders and save the rest.
+		kept := make([]*rns.KnownIdentity, 0, len(entries))
+		skipped := 0
+		for _, e := range entries {
+			if _, mErr := json.Marshal(e); mErr != nil {
+				skipped++
+				continue
+			}
+			kept = append(kept, e)
+		}
+		if skipped == 0 {
+			return err // not an per-entry problem; surface it
+		}
+		data, err = json.MarshalIndent(announceFile{
+			Version: announceStoreVersion,
+			Entries: kept,
+		}, "", "  ")
+		if err != nil {
+			return err
+		}
 	}
 	return atomicWrite(s.path, data, 0o600)
 }

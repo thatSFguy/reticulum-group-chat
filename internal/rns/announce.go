@@ -317,3 +317,35 @@ func bytesEqual(a, b []byte) bool {
 // randReader is the production randomness source; tests inject deterministic
 // alternatives.
 func randReader(p []byte) (int, error) { return rand.Read(p) }
+
+// Bounds for a believable announce emission time. EmittedAt decodes a
+// 40-bit seconds value out of random_hash, so its full range reaches
+// year 36812 — and a peer is free to put anything there.
+//
+// An implausible value is not merely useless for the freshness
+// comparison it feeds; it is actively dangerous to STORE, because
+// time.Time refuses to marshal a year outside [0,9999]. Caching one
+// such peer failed the ENTIRE announce-cache save, so the cache silently
+// stopped persisting and every peer had to be re-learned after a
+// restart. (Introduced in v1.14.0, fixed in v1.14.2 — the failure mode
+// was one bad peer poisoning a shared structure, which is exactly the
+// class this codebase keeps having to defend against.)
+var (
+	announceTimeFloor = time.Date(2020, 1, 1, 0, 0, 0, 0, time.UTC)
+	announceTimeSkew  = 24 * time.Hour
+)
+
+// plausibleEmittedAt returns the announce's signed emission time when it
+// is believable, and ok=false otherwise. Callers must treat !ok as "this
+// peer has no usable timestamp" rather than substituting a default —
+// the value is attacker-controlled.
+func plausibleEmittedAt(a *Announce) (time.Time, bool) {
+	emitted, err := a.EmittedAt()
+	if err != nil {
+		return time.Time{}, false
+	}
+	if emitted.Before(announceTimeFloor) || emitted.After(time.Now().Add(announceTimeSkew)) {
+		return time.Time{}, false
+	}
+	return emitted, true
+}

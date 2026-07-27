@@ -679,13 +679,13 @@ func (t *Transport) handleAnnounce(p *Packet) {
 	// loses the right to re-route us. Announces without a decodable
 	// timestamp keep the previous behavior.
 	acceptRouting := true
-	if emitted, err := a.EmittedAt(); err == nil && !prev.EmittedAt.IsZero() {
-		acceptRouting = !emitted.Before(prev.EmittedAt)
+	if emitted, ok := plausibleEmittedAt(a); ok {
+		if !prev.EmittedAt.IsZero() {
+			acceptRouting = !emitted.Before(prev.EmittedAt)
+		}
 		if acceptRouting {
 			prev.EmittedAt = emitted
 		}
-	} else if err == nil {
-		prev.EmittedAt = emitted
 	}
 	if acceptRouting {
 		prev.Hops = a.Hops

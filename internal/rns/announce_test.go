@@ -2,6 +2,7 @@ package rns
 
 import (
 	"bytes"
+	"encoding/json"
 	"testing"
 	"time"
 )
@@ -231,5 +232,51 @@ func TestDecodeLXMFAppDataAcceptsLegacyForms(t *testing.T) {
 	// Empty.
 	if got, err := DecodeLXMFAppDataDisplayName(nil); err != nil || got != nil {
 		t.Errorf("empty: got %v err %v", got, err)
+	}
+}
+
+// TestPlausibleEmittedAtRejectsOutOfRange is the regression for the
+// v1.14.0 announce-cache breakage. EmittedAt decodes 40 bits of
+// peer-supplied data, so its range reaches year 36812 — and time.Time
+// refuses to marshal a year outside [0,9999]. Caching one such peer
+// failed the entire cache save, so the announce cache silently stopped
+// persisting and every peer had to be re-learned after a restart.
+func TestPlausibleEmittedAtRejectsOutOfRange(t *testing.T) {
+	mk := func(tsSecs uint64) *Announce {
+		rh := make([]byte, 10)
+		// random_hash = 5 random bytes || 5 bytes big-endian seconds
+		for i := 0; i < 5; i++ {
+			rh[9-i] = byte(tsSecs >> (8 * i))
+		}
+		return &Announce{RandomHash: rh}
+	}
+
+	// Top of the 40-bit range: year 36812. Must be refused.
+	if ts, ok := plausibleEmittedAt(mk(1<<40 - 1)); ok {
+		t.Errorf("year-%d timestamp accepted; it cannot even be marshalled", ts.Year())
+	}
+	// Pre-Reticulum epoch nonsense.
+	if _, ok := plausibleEmittedAt(mk(0)); ok {
+		t.Error("zero timestamp accepted")
+	}
+	// Far future beyond allowed skew.
+	if _, ok := plausibleEmittedAt(mk(uint64(time.Now().Add(72 * time.Hour).Unix()))); ok {
+		t.Error("far-future timestamp accepted")
+	}
+	// A normal, current announce must be accepted.
+	now := uint64(time.Now().Add(-time.Minute).Unix())
+	if got, ok := plausibleEmittedAt(mk(now)); !ok {
+		t.Error("current timestamp rejected")
+	} else if got.Unix() != int64(now) {
+		t.Errorf("decoded %d, want %d", got.Unix(), now)
+	}
+
+	// Whatever we accept must survive a JSON round trip, since it is
+	// stored in the announce cache.
+	accepted, _ := plausibleEmittedAt(mk(now))
+	if _, err := json.Marshal(struct {
+		T time.Time `json:"t"`
+	}{accepted}); err != nil {
+		t.Errorf("accepted timestamp is not marshalable: %v", err)
 	}
 }
