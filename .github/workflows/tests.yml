@@ -1,0 +1,74 @@
+name: tests
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch: {}
+
+jobs:
+  # Unit tests run as their own job so they report independently and
+  # don't wait on the Python/RNS install. They were missing entirely
+  # until v1.14.1 — CI built the code and ran the interop harness, so
+  # every in-process test (including the security regression suite)
+  # was only ever run on developer machines.
+  unit:
+    name: unit + race (ubuntu-latest)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Set up Go
+        uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+
+      - name: Vet
+        run: go vet ./...
+
+      - name: Unit tests
+        run: go test ./... -count=1
+
+      # Concurrency bugs in the transport/queue layers are the kind that
+      # pass a thousand local runs and fail in production, so the race
+      # detector is not optional here.
+      - name: Unit tests (race detector)
+        run: go test -race ./... -count=1
+
+      # Fuzz seed corpora run as regular tests above; this gives the
+      # msgpack structural guard a short live fuzz on every push, since
+      # it stands in front of every attacker-controlled decode.
+      - name: Fuzz msgpack guard (short)
+        run: go test ./internal/rns/ -run=XXX -fuzz=FuzzValidateMsgpackBounds -fuzztime=60s
+
+  harness:
+    name: interop harness (ubuntu-latest)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Set up Go
+        uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+
+      - name: Install RNS + LXMF
+        run: |
+          python -m pip install --upgrade pip
+          pip install rns lxmf
+          which rnsd
+          rnsd --version
+
+      - name: Build fwdsvc (sanity)
+        run: go build ./...
+
+      - name: Run interop harness
+        run: bash tests/interop/run.sh
