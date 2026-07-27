@@ -380,3 +380,44 @@ func TestAcceptIncomingLinkRequestNoSignallingWhenInitiatorOmits(t *testing.T) {
 		t.Errorf("LRPROOF.Verify: %v — initiator would reject this proof", err)
 	}
 }
+
+// TestResponderLinkFloodIsBounded covers the unauthenticated
+// LINKREQUEST flood: before the cap, every distinct initiator key
+// inserted a new link entry, reaped only by the 15-minute idle sweep —
+// a memory leak driven by a 66-byte pre-auth packet.
+func TestResponderLinkFloodIsBounded(t *testing.T) {
+	responder, _ := NewIdentity()
+	lm := NewLinkManager()
+
+	for i := 0; i < MaxResponderLinks+200; i++ {
+		initiator, _ := NewIdentity()
+		_, ephPub, err := newClampedX25519()
+		if err != nil {
+			t.Fatal(err)
+		}
+		req, err := BuildLinkRequest(ephPub, initiator.PublicKey()[32:], make([]byte, IdentityHashLen), nil)
+		if err != nil {
+			t.Fatalf("build link request %d: %v", i, err)
+		}
+		if _, _, err := lm.AcceptIncomingLinkRequest(req, responder, nil); err != nil {
+			t.Fatalf("accept %d: %v", i, err)
+		}
+	}
+
+	lm.mu.Lock()
+	total := len(lm.links)
+	lm.mu.Unlock()
+	if total > MaxResponderLinks {
+		t.Errorf("link table holds %d entries, want <= %d", total, MaxResponderLinks)
+	}
+}
+
+// TestResponderCapLeavesHeadroomForOutbound verifies the reservation:
+// an inbound flood must never consume the slots our own outbound
+// delivery links need.
+func TestResponderCapLeavesHeadroomForOutbound(t *testing.T) {
+	if MaxResponderLinks >= MaxConcurrentLinks {
+		t.Fatalf("MaxResponderLinks (%d) must leave headroom below MaxConcurrentLinks (%d)",
+			MaxResponderLinks, MaxConcurrentLinks)
+	}
+}

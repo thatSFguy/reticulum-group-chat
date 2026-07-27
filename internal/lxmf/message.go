@@ -20,13 +20,26 @@ import (
 )
 
 // safeUnmarshal wraps msgpack.Unmarshal for inbound attacker-controlled
-// payloads. All receive-path decodes route through this; today it is a
-// thin wrapper because vmihailenco/msgpack/v5's default allocation
-// limit (see Decoder.DisableAllocLimit) already caps memory during a
-// single decode, which is the load-bearing defense against decoder
-// bombs. If we ever swap msgpack libraries or want a stricter cap we
-// have one place to change.
+// payloads. All receive-path decodes route through this.
+//
+// It pre-validates structure because the library's allocation limit is
+// BROKEN in the pinned version: vmihailenco/msgpack v5.4.1 tests
+// `flags&disableAllocLimitFlag != 1` where the flag is 8, so the guard
+// is always bypassed and both the typed and untyped slice paths
+// allocate straight from the length header. A 5-byte array32 header
+// claiming 2^32-1 elements requests ~103 GB — an unrecoverable Go
+// runtime OOM, not a catchable panic.
+//
+// This is reachable pre-authentication: an attacker can Token-encrypt
+// to our announced public key, and unpackPayload decodes the resulting
+// array BEFORE the LXMF signature is verified. rns.ValidateMsgpackBounds
+// rejects any length header the remaining bytes cannot satisfy, which
+// is exactly the shape of that attack and costs nothing for real input.
+// See internal/rns/msgpack_guard.go for the full analysis.
 func safeUnmarshal(data []byte, v any) error {
+	if err := rns.ValidateMsgpackBounds(data); err != nil {
+		return err
+	}
 	return msgpack.Unmarshal(data, v)
 }
 
@@ -331,8 +344,36 @@ func ComputeMessageID(destHash, sourceHash, msgpackPayload []byte) []byte {
 // MessageID returns the LXMF message_id (32 bytes, SPEC §5.4) for a
 // parsed inbound message. Only valid after a successful Parse; Verify is
 // not required, since message_id is independent of the signature.
+//
+// NOTE: message_id is MALLEABLE and must not be used to suppress
+// replays — see DedupKey. It remains the correct identifier for
+// reply-to / reaction binding, because that is what peer clients
+// compute and reference.
 func (m *Message) MessageID() []byte {
 	return ComputeMessageID(m.DestHash, m.SourceHash, m.rawPayload)
+}
+
+// DedupKey returns a replay-resistant identity for a VERIFIED inbound
+// message: SHA-256(source_hash || signature).
+//
+// WHY NOT message_id: SPEC §5.6 lets a stamp be added, changed or
+// removed without invalidating the signature, and message_id is
+// computed over the raw stamp-inclusive payload. So the same captured,
+// genuinely-signed body yields a different message_id for every stamp
+// value — an attacker can replay one message unboundedly and every copy
+// looks new. Keying on the signature instead is stable under exactly
+// the mutation the spec permits, and cannot be forged for different
+// content without the sender's private key. Ed25519 is deterministic,
+// so a genuine resend of identical content also collapses correctly,
+// while two distinct sends differ (the signed payload carries the
+// sender's timestamp).
+//
+// Only meaningful after Verify has succeeded.
+func (m *Message) DedupKey() []byte {
+	h := sha256.New()
+	h.Write(m.SourceHash)
+	h.Write(m.Signature)
+	return h.Sum(nil)
 }
 
 // msgpackNil is the msgpack format byte for nil (0xc0).
@@ -355,6 +396,14 @@ func decodeFields(raw []byte) (map[any]any, error) {
 	// msgpack nil → no fields (tolerated like an empty map).
 	if len(raw) == 1 && raw[0] == msgpackNil {
 		return nil, nil
+	}
+	// Guarded separately from safeUnmarshal: this path builds its own
+	// Decoder, and DecodeUntypedMap descends into nested ARRAYS via the
+	// untyped decodeSlice path — which has the same unclamped
+	// make([]interface{}, 0, n) as the typed path. A field value like
+	// {6: <array32 claiming 2^32-1>} would otherwise be a remote OOM.
+	if err := rns.ValidateMsgpackBounds(raw); err != nil {
+		return nil, err
 	}
 	dec := msgpack.NewDecoder(bytes.NewReader(raw))
 	dec.SetMapDecoder(func(d *msgpack.Decoder) (interface{}, error) {
@@ -411,6 +460,26 @@ func (m *Message) unpackPayload() error {
 // reencodeFirstFour decodes the msgpack array, drops everything past
 // element [3], and re-encodes — used to strip an optional stamp before
 // signature verification (SPEC §5.6).
+// reencodeFirstFour rebuilds the 4-element signed payload from a
+// 5-element (stamped) one, for SPEC §5.6 variant-2 verification.
+//
+// It SPLICES the original element bytes rather than decoding and
+// re-marshalling them. The previous decode/re-encode approach was broken
+// twice over:
+//
+//   - It decoded with the DEFAULT map decoder, which cannot handle the
+//     integer-keyed inner dicts real LXMF fields use (FIELD_REPLY_TO
+//     0x30, FIELD_REACTION 0x40, FIELD_IMAGE 0x06) — exactly the failure
+//     decodeFields exists to work around. Every stamped message carrying
+//     those fields failed variant 2 and was dropped, so stamp-using
+//     senders silently lost all reactions, replies and images.
+//   - Re-marshalling a Go map is order-nondeterministic, so even with a
+//     working decoder a multi-key fields map would produce different
+//     bytes than the sender signed and verify only by luck.
+//
+// Splicing sidesteps both: the bytes handed to Verify are byte-identical
+// to what the sender signed. The 0x94 prefix is msgpack fixarray-of-4,
+// which is what any encoder emits for a 4-element array.
 func reencodeFirstFour(payload []byte) ([]byte, error) {
 	var elems []msgpack.RawMessage
 	if err := safeUnmarshal(payload, &elems); err != nil {
@@ -419,15 +488,12 @@ func reencodeFirstFour(payload []byte) ([]byte, error) {
 	if len(elems) < 4 {
 		return nil, errors.New("payload has fewer than 4 elements")
 	}
-	first4 := make([]any, 4)
+	out := make([]byte, 0, len(payload))
+	out = append(out, 0x94) // fixarray, 4 elements
 	for i := 0; i < 4; i++ {
-		var raw any
-		if err := safeUnmarshal(elems[i], &raw); err != nil {
-			return nil, err
-		}
-		first4[i] = raw
+		out = append(out, elems[i]...)
 	}
-	return msgpack.Marshal(first4)
+	return out, nil
 }
 
 func splitSeconds(secs float64) (whole int64, nanos int64) {

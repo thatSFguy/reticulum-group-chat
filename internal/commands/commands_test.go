@@ -850,6 +850,8 @@ func TestListUsersTruncatesWhenOverBudget(t *testing.T) {
 		overflow = fmt.Sprintf(format, args...)
 	}
 
+	// /users is members-only, so the caller must be on the roster.
+	_, _ = d.Roster.AddOrUpdate(mustBytes(t, userHash), time.Now())
 	for i := 0; i < 30; i++ {
 		hash := strings.Repeat(string(rune('a'+byte(i%6))), 32)
 		// avoid hash collisions across the loop by varying char
@@ -890,6 +892,8 @@ func TestListUsersUnlimitedByDefault(t *testing.T) {
 	overflowCalled := false
 	d.OverflowLog = func(format string, args ...any) { overflowCalled = true }
 
+	// /users is members-only, so the caller must be on the roster.
+	_, _ = d.Roster.AddOrUpdate(mustBytes(t, userHash), time.Now())
 	for i := 0; i < 100; i++ {
 		hash := fmt.Sprintf("%02x%s", i, strings.Repeat("a", 30))
 		_, _ = d.Roster.AddOrUpdate(mustBytes(t, hash), time.Now())

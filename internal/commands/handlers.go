@@ -115,6 +115,15 @@ func (d *Dispatcher) Dispatch(senderHash string, parsed Parsed) string {
 	case "about", "version":
 		return aboutText()
 	case "users":
+		// Members only. The roster (nicknames + hash prefixes) is
+		// group-internal information, and the reply is one line per
+		// member — so an unauthenticated 6-byte request used to return
+		// an arbitrarily large Resource transfer, retried up to 5x if
+		// unacknowledged. Gating on membership removes both the
+		// disclosure and the amplification for non-members.
+		if !caller.Member && caller.Role == RoleUser {
+			return "Only members can list users. Send /join first."
+		}
 		return d.listUsers()
 	case "mods":
 		return d.listConfigList("mods", d.Cfg.Mods)
@@ -267,13 +276,24 @@ func helpText(c *Caller) string {
 	return b.String()
 }
 
+// maxListedUsers caps how many entries a /users reply enumerates. The
+// reply is otherwise O(roster) with no ceiling — on a large roster that
+// is a multi-hundred-KB Resource transfer per request. The count is
+// always reported in full; only the enumeration is truncated.
+const maxListedUsers = 200
+
 func (d *Dispatcher) listUsers() string {
 	users := d.Roster.List()
 	if len(users) == 0 {
 		return "No users."
 	}
 	header := fmt.Sprintf("Users (%d):", len(users))
-	lines := make([]string, 0, len(users))
+	truncated := 0
+	if len(users) > maxListedUsers {
+		truncated = len(users) - maxListedUsers
+		users = users[:maxListedUsers]
+	}
+	lines := make([]string, 0, len(users)+1)
 	for _, u := range users {
 		nick := u.Nickname
 		if nick == "" {
@@ -284,6 +304,9 @@ func (d *Dispatcher) listUsers() string {
 			mark = " [paused]"
 		}
 		lines = append(lines, fmt.Sprintf("  %s — %s%s", nick, u.Hash[:8], mark))
+	}
+	if truncated > 0 {
+		lines = append(lines, fmt.Sprintf("  … and %d more", truncated))
 	}
 	return d.fitList("/users", header, lines)
 }

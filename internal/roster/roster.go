@@ -105,6 +105,10 @@ type Roster struct {
 	users   map[string]*User // key: lowercase hex hash
 	banlist map[string]struct{}
 	store   *Store
+
+	// dirty marks state changed by deferPersistLocked (the announce
+	// path) but not yet written. Cleared by any persist. See Flush.
+	dirty bool
 }
 
 func New(store *Store) (*Roster, error) {
@@ -201,7 +205,13 @@ func (r *Roster) Touch(hashBytes []byte, now time.Time) (bool, error) {
 	}
 	u.LastCommandAt = now
 	u.Invited = false // heard from them — they're a full member now
-	return true, r.persistLocked()
+	// Deferred like the announce path: this fires on EVERY inbound
+	// message, and a synchronous whole-roster marshal per message is
+	// pure amplification. Activity timestamps only drive multi-week
+	// prune windows, so losing the most recent one to a hard kill is
+	// harmless — the next message re-stamps it.
+	r.deferPersistLocked()
+	return true, nil
 }
 
 // MarkMessage refreshes last_message_at for an existing member — the signal
@@ -223,7 +233,8 @@ func (r *Roster) MarkMessage(hashBytes []byte, now time.Time) (bool, error) {
 	}
 	u.LastMessageAt = now
 	u.Invited = false // heard from them — they're a full member now
-	return true, r.persistLocked()
+	r.deferPersistLocked() // see Touch
+	return true, nil
 }
 
 // UpdateLastAnnounce only refreshes existing users; announces from
@@ -255,7 +266,12 @@ func (r *Roster) UpdateLastAnnounce(hashBytes []byte, at time.Time) error {
 	}
 	u.LastAnnounceAt = at
 	u.Invited = false // a fresh announce is real presence — full member now
-	return r.persistLocked()
+	// Deferred: this runs on the packet dispatcher. Losing an
+	// announce timestamp to a hard kill is harmless — the next announce
+	// re-stamps it, and the value only feeds prune decisions on a
+	// multi-week horizon.
+	r.deferPersistLocked()
+	return nil
 }
 
 // Prune removes a user when EITHER inactivity rule fires:
@@ -550,10 +566,36 @@ func (r *Roster) Banlist() []string {
 	return out
 }
 
+// deferPersistLocked marks state dirty WITHOUT writing. Used only by
+// the announce path, which runs on the Transport dispatcher goroutine:
+// a synchronous whole-roster marshal + write there blocks every inbound
+// packet and outbound delivery proof queued behind it — the same
+// failure the announce cache was moved off the dispatcher to avoid.
+// Flush (called on a timer and at shutdown) does the write.
+// Callers must hold r.mu.
+func (r *Roster) deferPersistLocked() {
+	if r.store != nil {
+		r.dirty = true
+	}
+}
+
+// Flush writes roster state if a deferred change is outstanding. Safe
+// to call concurrently; a no-op when nothing changed.
+func (r *Roster) Flush() error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if !r.dirty {
+		return nil
+	}
+	return r.persistLocked()
+}
+
 func (r *Roster) persistLocked() error {
 	if r.store == nil {
 		return nil
 	}
+	// Any write covers every pending deferred change.
+	r.dirty = false
 	state := State{
 		Users:   make(map[string]*User, len(r.users)),
 		Banlist: make([]string, 0, len(r.banlist)),

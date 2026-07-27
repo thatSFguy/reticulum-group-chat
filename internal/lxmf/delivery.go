@@ -1,6 +1,7 @@
 package lxmf
 
 import (
+	"bytes"
 	"errors"
 	"fmt"
 	"time"
@@ -46,6 +47,22 @@ var ErrDeliveryProofTimeout = errors.New("no delivery proof from recipient")
 // fallback within ~2 minutes.
 const DefaultDeliveryProofTimeout = 15 * time.Second
 
+// MaxConcurrentInboundHandlers bounds the OnMessage goroutines a
+// Delivery will have in flight. The spawn is deliberate (see
+// handleInbound) but was unbounded: under a flood each goroutine holds
+// a parsed message — fields up to ~1 MiB — while contending on locks
+// that are held across disk writes, so they accumulate at exactly the
+// rate lock contention slows them. Past the ceiling, inbound messages
+// are dropped with a log rather than growing the pile; the peer's
+// retry (or its propagation fallback) covers the loss.
+const MaxConcurrentInboundHandlers = 256
+
+// DefaultPropagationSendTimeout bounds one upload to a propagation
+// node. Kept well under the Resource path's size-scaled ceiling (up to
+// 20 minutes) because all propagated traffic funnels through a single
+// selected node — see SendPropagated.
+const DefaultPropagationSendTimeout = 45 * time.Second
+
 // Delivery is an LXMF "delivery destination" registered on a Transport.
 // Inbound opportunistic LXMF messages addressed to its destination hash are
 // Token-decrypted, parsed, signature-verified, and handed to OnMessage.
@@ -64,6 +81,10 @@ type Delivery struct {
 	// callback should hand off to its own goroutine.
 	OnMessage func(*Message)
 
+	// inflight bounds concurrent OnMessage goroutines; see
+	// MaxConcurrentInboundHandlers.
+	inflight chan struct{}
+
 	// OnError is called when an inbound packet can't be decrypted, parsed,
 	// or verified. Implementations typically log.
 	OnError func(error)
@@ -73,6 +94,10 @@ type Delivery struct {
 	// LINKREQUEST/LRPROOF round-trip + DATA broadcast + DATA proof wait.
 	// Defaults to rns.DefaultLinkSendTimeout (30s) when zero.
 	LinkSendTimeout time.Duration
+
+	// PropagationSendTimeout caps a single SendPropagated upload
+	// (handshake + transfer + proof). 0 = DefaultPropagationSendTimeout.
+	PropagationSendTimeout time.Duration
 
 	// DeliveryProofTimeout caps how long an opportunistic Send waits for
 	// the recipient's SPEC §6.5 delivery proof before returning
@@ -101,6 +126,7 @@ func NewDelivery(transport *rns.Transport, identity *rns.Identity, buildAnnounce
 		transport: transport,
 		identity:  identity,
 		destHash:  identity.DestinationHashFor(FullName()),
+		inflight:  make(chan struct{}, MaxConcurrentInboundHandlers),
 	}
 	if err := transport.RegisterLocal(&rns.LocalDestination{
 		DestHash:        d.destHash,
@@ -319,9 +345,19 @@ func (d *Delivery) SendPropagated(nodeDestHash, recipientDestHash []byte, title,
 			ErrPropagationTransferTooLarge, len(bundle), info.PerTransferLimitKB)
 	}
 
-	timeout := d.LinkSendTimeout
+	// Deliberately SHORTER than the general link timeout, and never
+	// extended by size. SendOverLink's Resource path stretches its
+	// deadline to a size-proportional budget capped at 20 minutes —
+	// sensible for interactive delivery to a peer, dangerous here:
+	// every propagated message targets the SAME selected node, so a
+	// node that completes the handshake and then stalls would wedge
+	// every outbound worker simultaneously and halt the queue,
+	// including direct sends to online members. A store-and-forward
+	// upload has no interactivity to preserve, and failing fast just
+	// re-queues the message.
+	timeout := d.PropagationSendTimeout
 	if timeout <= 0 {
-		timeout = rns.DefaultLinkSendTimeout
+		timeout = DefaultPropagationSendTimeout
 	}
 	if err := d.transport.SendOverLink(nodeDestHash, bundle, timeout); err != nil {
 		return nil, fmt.Errorf("propagation upload: %w", err)
@@ -397,18 +433,7 @@ func (d *Delivery) handleInbound(p *rns.Packet) {
 		return
 	}
 
-	if d.OnMessage != nil {
-		// CRITICAL: dispatch on a goroutine so a slow OnMessage cannot
-		// block the Transport dispatcher. The forwarder calls
-		// Delivery.Send from within OnMessage, and Send may block on a
-		// Reticulum Link handshake (LRPROOF round-trip) — which arrives
-		// on the SAME dispatcher goroutine. Running OnMessage inline
-		// causes a deadlock: dispatch is stuck in Send waiting for an
-		// LRPROOF that's queued waiting for dispatch. Spawning here
-		// turns Send's blocking semantics back into the per-call wait
-		// it's documented to be, without holding the dispatcher.
-		go d.OnMessage(msg)
-	}
+	d.dispatchInbound(msg)
 }
 
 // handleInboundLinkPlaintext is invoked by the Transport when a link
@@ -428,6 +453,22 @@ func (d *Delivery) handleInboundLinkPlaintext(plaintext []byte) {
 		d.errorf("link LXMF parse: %w", err)
 		return
 	}
+	// CRITICAL: the direct form carries its destination INSIDE the
+	// signed body, and Verify signs over that same field — so a body
+	// the sender legitimately addressed to someone else verifies
+	// perfectly here. Without this check, anyone who holds a link-form
+	// body signed by Alice (any peer she ever sent a >295-byte message
+	// to) can open an unauthenticated link to us and replay it: it is
+	// attributed to Alice, fanned out to the roster, and executed with
+	// her privileges if it parses as a command and she is an admin.
+	// The opportunistic path needs no equivalent check — there the
+	// dest_hash comes from the outer packet header the Transport
+	// already routed to us.
+	if !bytes.Equal(msg.DestHash, d.destHash) {
+		d.errorf("link LXMF addressed to %x, not us (%x) — refusing replayed body",
+			msg.DestHash[:4], d.destHash[:4])
+		return
+	}
 	sender := d.transport.Recall(msg.SourceHash)
 	if sender == nil {
 		d.errorf("link sender %x unknown — must announce first", msg.SourceHash[:4])
@@ -440,18 +481,33 @@ func (d *Delivery) handleInboundLinkPlaintext(plaintext []byte) {
 		d.errorf("link LXMF verify: %w", err)
 		return
 	}
-	if d.OnMessage != nil {
-		// CRITICAL: dispatch on a goroutine so a slow OnMessage cannot
-		// block the Transport dispatcher. The forwarder calls
-		// Delivery.Send from within OnMessage, and Send may block on a
-		// Reticulum Link handshake (LRPROOF round-trip) — which arrives
-		// on the SAME dispatcher goroutine. Running OnMessage inline
-		// causes a deadlock: dispatch is stuck in Send waiting for an
-		// LRPROOF that's queued waiting for dispatch. Spawning here
-		// turns Send's blocking semantics back into the per-call wait
-		// it's documented to be, without holding the dispatcher.
-		go d.OnMessage(msg)
+	d.dispatchInbound(msg)
+}
+
+// dispatchInbound hands a verified message to OnMessage on its own
+// goroutine, bounded by MaxConcurrentInboundHandlers.
+//
+// CRITICAL that this is NOT inline: the forwarder calls Delivery.Send
+// from within OnMessage, and Send may block on a Reticulum Link
+// handshake whose LRPROOF arrives on the SAME dispatcher goroutine.
+// Running OnMessage inline deadlocks — dispatch stuck in Send, waiting
+// for an LRPROOF queued behind dispatch. Spawning restores Send's
+// documented per-call blocking without holding the dispatcher.
+func (d *Delivery) dispatchInbound(msg *Message) {
+	if d.OnMessage == nil {
+		return
 	}
+	select {
+	case d.inflight <- struct{}{}:
+	default:
+		d.errorf("inbound handler pool full (%d in flight) — dropping message from %x",
+			MaxConcurrentInboundHandlers, msg.SourceHash[:4])
+		return
+	}
+	go func() {
+		defer func() { <-d.inflight }()
+		d.OnMessage(msg)
+	}()
 }
 
 func (d *Delivery) errorf(format string, args ...any) {

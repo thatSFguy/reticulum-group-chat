@@ -5,7 +5,9 @@ import (
 	"context"
 	"errors"
 	"io"
+	"io/fs"
 	"log"
+	"os"
 	"path/filepath"
 	"sync"
 	"sync/atomic"
@@ -267,6 +269,7 @@ func TestPersistenceRoundTrip(t *testing.T) {
 	body := []byte("survive a restart")
 	recipient := bytes.Repeat([]byte{0xab}, 16)
 	q1.Enqueue(recipient, body)
+	q1.Flush() // persistence is coalesced; force the write
 
 	// Brand-new queue, same store: it should pick up the persisted
 	// message on Load and drain it on processOnce.
@@ -312,7 +315,7 @@ func TestPickDuePrioritisesMostRecentlyAnnouncedRecipient(t *testing.T) {
 	now := time.Now()
 	sender := &fakeSender{
 		recency: map[byte]time.Time{
-			0x01: now.Add(-1 * time.Hour),  // older
+			0x01: now.Add(-1 * time.Hour),    // older
 			0x02: now.Add(-10 * time.Minute), // newest
 			0x03: now.Add(-30 * time.Minute), // middle
 		},
@@ -434,16 +437,19 @@ func TestWorkersRunInParallelToAvoidHeadOfLineBlocking(t *testing.T) {
 	}
 }
 
-func TestEnqueuePersistsImmediately(t *testing.T) {
-	// A crash between enqueue and the next drain tick must not lose
-	// the message — this verifies the file is written from inside
-	// Enqueue, not lazily on first drain.
+func TestEnqueuePersistsOnFlush(t *testing.T) {
+	// A crash between enqueue and the next drain tick must not lose the
+	// message. Queue writes are coalesced (persistFlushInterval) rather
+	// than synchronous, so the guarantee is "the enqueue is marked
+	// dirty and the next flush writes it" — Run's persist loop flushes
+	// within 250ms and again on shutdown.
 	dir := t.TempDir()
 	storePath := filepath.Join(dir, "outbound.json")
 	store := newOutboundStore(storePath)
 
 	q := newTestQueue(t, &fakeSender{}, store)
 	q.Enqueue(make([]byte, 16), []byte("durable"))
+	q.Flush()
 
 	loaded, err := store.load()
 	if err != nil {
@@ -568,6 +574,7 @@ func TestPropagatedFlagPersistsAcrossReload(t *testing.T) {
 	q := newTestQueue(t, sender, store)
 	q.SetPropagation(false, true, 0)
 	q.Enqueue(make([]byte, 16), []byte("persist me"))
+	q.Flush()
 
 	loaded, err := store.load()
 	if err != nil {
@@ -722,5 +729,92 @@ func TestDirectBudgetAtLeastMaxAttemptsDisablesShortening(t *testing.T) {
 	q.mu.Unlock()
 	if got != 5 {
 		t.Errorf("directBudgetLocked() = %d, want 5 (>=maxAttempts disables shortening)", got)
+	}
+}
+
+func TestQueueRefusesPastCap(t *testing.T) {
+	// Without a cap, queue depth is driven by remote input: fan-out
+	// enqueues one entry per member per message, so memory and
+	// outbound.json grow without bound under a flood.
+	q := newTestQueue(t, &fakeSender{}, nil)
+
+	for i := 0; i < maxPendingMessages; i++ {
+		if id := q.Enqueue(make([]byte, 16), []byte("x")); id == "" {
+			t.Fatalf("enqueue %d refused before the cap", i)
+		}
+	}
+	if got := q.pendingCount(); got != maxPendingMessages {
+		t.Fatalf("pendingCount = %d, want %d", got, maxPendingMessages)
+	}
+	if id := q.Enqueue(make([]byte, 16), []byte("over")); id != "" {
+		t.Error("enqueue past the cap returned an ID; want refusal")
+	}
+	if got := q.pendingCount(); got != maxPendingMessages {
+		t.Errorf("pendingCount grew past the cap to %d", got)
+	}
+}
+
+func TestPersistenceIsCoalesced(t *testing.T) {
+	// The point of coalescing: a fan-out of N messages must produce ONE
+	// write, not N full-file rewrites (which was quadratic disk I/O per
+	// inbound message).
+	dir := t.TempDir()
+	store := newOutboundStore(filepath.Join(dir, "outbound.json"))
+	q := newTestQueue(t, &fakeSender{}, store)
+
+	for i := 0; i < 50; i++ {
+		q.Enqueue(bytes.Repeat([]byte{byte(i)}, 16), []byte("fan-out"))
+	}
+	// Nothing written yet — the enqueues only marked the queue dirty.
+	if _, err := os.Stat(store.path); !errors.Is(err, fs.ErrNotExist) {
+		t.Fatalf("store written synchronously during enqueue (err=%v)", err)
+	}
+
+	q.Flush()
+	loaded, err := store.load()
+	if err != nil {
+		t.Fatalf("load: %v", err)
+	}
+	if len(loaded) != 50 {
+		t.Errorf("one flush persisted %d messages, want all 50", len(loaded))
+	}
+
+	// A second flush with no changes must not rewrite.
+	before, err := os.Stat(store.path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	q.Flush()
+	after, err := os.Stat(store.path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !before.ModTime().Equal(after.ModTime()) {
+		t.Error("clean flush rewrote the file; dirty tracking is not working")
+	}
+}
+
+func TestRunFlushesOnShutdown(t *testing.T) {
+	// A graceful stop must not lose queued messages — that is what
+	// bounds the coalescing trade-off to hard kills only.
+	dir := t.TempDir()
+	store := newOutboundStore(filepath.Join(dir, "outbound.json"))
+	q := newTestQueue(t, &fakeSender{sendErrs: []error{errors.New("hold")}}, store)
+	q.flushEvery = time.Hour // never fires on its own
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() { q.Run(ctx); close(done) }()
+
+	q.Enqueue(make([]byte, 16), []byte("graceful"))
+	cancel()
+	<-done
+
+	loaded, err := store.load()
+	if err != nil {
+		t.Fatalf("load: %v", err)
+	}
+	if len(loaded) != 1 {
+		t.Fatalf("shutdown flush persisted %d messages, want 1", len(loaded))
 	}
 }

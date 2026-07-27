@@ -108,12 +108,34 @@ type Link struct {
 	// LINKREQUEST.
 	responderIdentity *Identity
 
+	// lrProof is the LRPROOF we issued as responder, retained so a
+	// retransmitted or replayed LINKREQUEST can be answered with the
+	// same proof instead of re-keying an established link.
+	lrProof *Packet
+
+	// authenticated records that at least one link DATA packet from the
+	// peer decrypted and authenticated successfully. KEEPALIVE bodies
+	// are unencrypted by design, so only an authenticated link may have
+	// its idle timer refreshed by them — otherwise anyone who observes
+	// a link_id could keep a link alive forever and defeat the idle
+	// sweep that bounds the link table.
+	authenticated bool
+
 	CreatedAt    time.Time
 	LastActivity time.Time
 
 	// OnInboundData is called from the Transport's dispatcher with each
 	// successfully decrypted link DATA payload. Non-nil during Active.
 	OnInboundData func(plaintext []byte)
+}
+
+// MarkAuthenticated records that traffic from the peer has decrypted
+// and authenticated on this link. Gates whether unencrypted KEEPALIVE
+// packets may refresh the idle timer — see Link.authenticated.
+func (l *Link) MarkAuthenticated() {
+	l.mu.Lock()
+	l.authenticated = true
+	l.mu.Unlock()
 }
 
 // IsInitiator returns true when this Link was opened locally (we sent
@@ -226,6 +248,16 @@ func (l *Link) IsActive() bool {
 // callers (Delivery / Service) wire its outbound packets through their own
 // Transport.Broadcast and route inbound LINKREQUEST/LRPROOF/link-addressed
 // DATA/PROOF packets through the Handle* methods.
+// Link table bounds. MaxResponderLinks caps links created by INBOUND
+// (unauthenticated) LINKREQUESTs; the difference up to
+// MaxConcurrentLinks is reserved headroom for links WE initiate, so an
+// inbound flood can never starve outbound message delivery. See
+// makeRoomForResponderLocked.
+const (
+	MaxConcurrentLinks = 512
+	MaxResponderLinks  = 384
+)
+
 type LinkManager struct {
 	mu    sync.Mutex
 	links map[string]*Link // hex link_id -> *Link
@@ -581,10 +613,84 @@ func (lm *LinkManager) AcceptIncomingLinkRequest(reqPkt *Packet, localID *Identi
 		CreatedAt:          time.Now(),
 		LastActivity:       time.Now(),
 	}
+	key := hex.EncodeToString(id)
 	lm.mu.Lock()
-	lm.links[hex.EncodeToString(id)] = l
+	// REPLAY / RETRANSMIT GUARD. link_id is derived from the request, so
+	// a retransmitted or replayed LINKREQUEST maps to the SAME id.
+	// Overwriting the entry would install fresh session keys, silently
+	// breaking an established peer's link until the idle sweep — a
+	// targeted teardown available to anyone who observed the original
+	// request on the shared hub. Instead, re-send the LRPROOF we already
+	// issued: a genuine retransmit gets the answer it expected, and a
+	// replay changes nothing.
+	if existing, ok := lm.links[key]; ok {
+		existing.mu.Lock()
+		state, saved := existing.State, existing.lrProof
+		existing.mu.Unlock()
+		if state == LinkActive && saved != nil {
+			lm.mu.Unlock()
+			return existing, saved, nil
+		}
+	}
+	if err := lm.makeRoomForResponderLocked(); err != nil {
+		lm.mu.Unlock()
+		return nil, nil, err
+	}
+	l.lrProof = proofPkt
+	lm.links[key] = l
 	lm.mu.Unlock()
 	return l, proofPkt, nil
+}
+
+// ErrTooManyLinks is returned when an inbound LINKREQUEST cannot be
+// accepted because the responder-link budget is full and nothing was
+// evictable.
+var ErrTooManyLinks = errors.New("link table full; refusing inbound link request")
+
+// makeRoomForResponderLocked enforces MaxResponderLinks before a new
+// inbound link is admitted. Callers must hold lm.mu.
+//
+// WHY: LINKREQUEST is unauthenticated by design (SPEC §6), and every
+// distinct initiator public key derives a distinct link_id — so before
+// this bound existed, a flood inserted one entry per request, each
+// holding session keys, reaped only by the 15-minute idle sweep. It was
+// simultaneously a memory leak and a CPU amplifier (each request costs
+// two X25519 operations and an Ed25519 sign, inline on the dispatcher).
+//
+// Policy: evict the least-recently-active responder link to admit the
+// new one. Eviction rather than rejection keeps legitimate peers able
+// to connect during a flood — an attacker's idle links are the natural
+// eviction target, since a real peer's link sees traffic and stays
+// recent. The budget deliberately covers responder links ONLY, leaving
+// MaxConcurrentLinks-MaxResponderLinks headroom that a flood can never
+// consume, so our own outbound delivery links always have room.
+func (lm *LinkManager) makeRoomForResponderLocked() error {
+	var (
+		responders int
+		oldestKey  string
+		oldestAt   time.Time
+	)
+	for k, l := range lm.links {
+		l.mu.Lock()
+		isResponder := l.responderIdentity != nil
+		last := l.LastActivity
+		l.mu.Unlock()
+		if !isResponder {
+			continue
+		}
+		responders++
+		if oldestKey == "" || last.Before(oldestAt) {
+			oldestKey, oldestAt = k, last
+		}
+	}
+	if responders < MaxResponderLinks {
+		return nil
+	}
+	if oldestKey == "" {
+		return ErrTooManyLinks
+	}
+	delete(lm.links, oldestKey)
+	return nil
 }
 
 // HandleLinkData processes an inbound link DATA packet — verifies the
@@ -615,6 +721,10 @@ func (lm *LinkManager) HandleLinkData(p *Packet) ([]byte, *Link, error) {
 	if err != nil {
 		return nil, l, err
 	}
+	// Authenticated: the payload decrypted and its MAC verified, so the
+	// peer holds the session keys. Only now may unencrypted KEEPALIVEs
+	// refresh this link's idle timer (see handleKeepalive).
+	l.MarkAuthenticated()
 	if cb != nil {
 		cb(plaintext)
 	} else if lm.defaultOnInboundData != nil {

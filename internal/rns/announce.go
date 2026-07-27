@@ -17,6 +17,14 @@ import (
 // memory during a single decode, which is the practical defense
 // against decoder bombs.
 func safeUnmarshalAnnounce(data []byte, v any) error {
+	// Announce app_data is fully attacker-controlled and reaches this
+	// decoder pre-authentication (an attacker signs their own announce,
+	// so verification proves nothing about trust). The pinned msgpack
+	// library's allocation limit is broken — see msgpack_guard.go — so
+	// structure is validated before decoding.
+	if err := ValidateMsgpackBounds(data); err != nil {
+		return err
+	}
 	return msgpack.Unmarshal(data, v)
 }
 
@@ -211,16 +219,24 @@ func (a *Announce) Verify() error {
 		return errors.New("announce: malformed pubkey or signature length")
 	}
 
-	signed := buildAnnounceSignedData(a.DestHash, a.PublicKey, a.NameHash, a.RandomHash, a.RatchetPub, a.AppData)
-	ed25519Pub := a.PublicKey[32:]
-	if !Validate(ed25519Pub, signed, a.Signature) {
-		return errors.New("announce: Ed25519 signature invalid")
-	}
-
+	// CHEAP CHECK FIRST. Both checks must pass, so the order is purely
+	// about cost: the destination-hash recompute is two SHA-256 ops
+	// (~1 µs) while Ed25519 verification is ~50 µs. Announces arrive
+	// pre-authentication on a shared hub and are verified inline on the
+	// single dispatcher goroutine, so doing the expensive one first
+	// handed an attacker a ~50x CPU amplifier for garbage input. A
+	// determined attacker can still supply a self-consistent dest_hash,
+	// so this is a cost reduction, not a defense.
 	idHash := sha256.Sum256(a.PublicKey)
 	expected := DestinationHash(a.NameHash, idHash[:IdentityHashLen])
 	if !bytesEqual(expected, a.DestHash) {
 		return fmt.Errorf("announce: destination_hash mismatch (got %x, derived %x)", a.DestHash, expected)
+	}
+
+	signed := buildAnnounceSignedData(a.DestHash, a.PublicKey, a.NameHash, a.RandomHash, a.RatchetPub, a.AppData)
+	ed25519Pub := a.PublicKey[32:]
+	if !Validate(ed25519Pub, signed, a.Signature) {
+		return errors.New("announce: Ed25519 signature invalid")
 	}
 	return nil
 }

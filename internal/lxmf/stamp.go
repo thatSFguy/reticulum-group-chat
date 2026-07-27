@@ -4,6 +4,7 @@ import (
 	"crypto/rand"
 	"crypto/sha256"
 	"encoding"
+	"encoding/binary"
 	"errors"
 	"fmt"
 	"math/bits"
@@ -32,12 +33,19 @@ const (
 	workblockRoundLen = 256
 
 	// MaxPropagationStampCost caps the stamp_cost this implementation
-	// will grind for. The cost comes from an unauthenticated-content
-	// announce field; without a cap, a hostile or misconfigured node
-	// announcing cost=200 would pin a CPU forever. 2^24 attempts is a
-	// few seconds of SHA-256 on current hardware — anything above that
-	// is refused and the caller should pick a different node.
-	MaxPropagationStampCost = 24
+	// will grind for. The cost comes from an announce field that any
+	// stranger can set, so without a cap a hostile node announcing
+	// cost=200 would pin a CPU forever.
+	//
+	// Lowered from 24 to 16 after the v1.13.1 audit. The grind is per
+	// message PER RECIPIENT and runs inside an outbound worker, so at
+	// cost 24 (~16.7M expected iterations) a hostile node could turn one
+	// group message into hundreds of CPU-seconds and saturate the whole
+	// worker pool. 2^16 is ~256x cheaper and still far above real-world
+	// node policies, which are typically 0-8. Nodes demanding more are
+	// filtered out at SELECTION time (see service.propagationTracker) so
+	// the refusal never costs a message.
+	MaxPropagationStampCost = 20
 )
 
 // ErrStampCostTooHigh is returned when a propagation node demands more
@@ -113,12 +121,21 @@ func GeneratePropagationStamp(transientID []byte, cost int) ([]byte, error) {
 		return nil, fmt.Errorf("snapshot hash state: %w", err)
 	}
 
+	// One CSPRNG read for the base, then vary a counter suffix per
+	// candidate. Reading 32 fresh random bytes per iteration made the
+	// syscall — not the hash — the dominant cost of the search, for no
+	// security benefit: the candidates only need to be distinct and
+	// unpredictable to the node, which a random base plus a counter
+	// already provides.
 	stamp := make([]byte, StampSize)
+	if _, err := rand.Read(stamp); err != nil {
+		return nil, fmt.Errorf("stamp base: %w", err)
+	}
 	digestBuf := make([]byte, 0, sha256.Size)
+	var counter uint64
 	for {
-		if _, err := rand.Read(stamp); err != nil {
-			return nil, fmt.Errorf("stamp candidate: %w", err)
-		}
+		counter++
+		binary.BigEndian.PutUint64(stamp[StampSize-8:], counter)
 		h := sha256.New()
 		if err := h.(encoding.BinaryUnmarshaler).UnmarshalBinary(state); err != nil {
 			return nil, fmt.Errorf("restore hash state: %w", err)

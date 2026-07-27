@@ -69,9 +69,14 @@ max_inbound_chars = 500
 
 # Maximum number of members in the chat. /join attempts past this cap
 # are refused with a "the chat is full" reply; existing and paused
-# members both count toward the limit. Set to 0 (default) for
-# unlimited.
-max_members = 0
+# members both count toward the limit.
+#
+# Defaults to 512 rather than unlimited: in an open group anyone can
+# generate identities and /join, and roster size multiplies every
+# fan-out (one queued message per member per message, a replay burst on
+# each join). Prune runs hourly against multi-week windows, so it is no
+# defense against a burst. Set to 0 for genuinely unlimited.
+max_members = 512
 
 # How long to remember an inbound message's ID so a message Reticulum
 # delivers more than once (multiple paths, retransmits, or a propagation

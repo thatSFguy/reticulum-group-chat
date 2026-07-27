@@ -288,7 +288,7 @@ everything.
 |---|---|---|
 | `/?` or `/help`           | anyone      | List commands available to you |
 | `/about` or `/version`    | anyone      | Show version and repo URL |
-| `/users`                  | anyone      | List roster (paused members marked `[paused]`) |
+| `/users`                  | members     | List roster (paused members marked `[paused]`). Long rosters list the first 200 with a "… and N more" footer; the total is always shown. |
 | `/mods`                   | anyone      | List configured mods |
 | `/admin`                  | anyone      | List configured admins |
 | `/join`                   | non-members | Opt in: receive forwarded messages, your messages get forwarded. In a `locked` group this is refused with your own address echoed back to hand to an admin. |
@@ -410,7 +410,7 @@ Both lists MUST be declared at the top of the file, before any
 | `prune_interval`     | duration | `"1h"`                      | How often the prune sweep runs. |
 | `announce_interval`  | duration | `"10m"`                     | How often we re-announce ourselves. |
 | `max_inbound_chars`  | int      | `500`                       | Reject non-command messages longer than this many UTF-8 chars. `0` disables. |
-| `max_members`        | int      | `0`                         | Cap on roster size. `/join` past the cap is refused. `0` = unlimited. |
+| `max_members`        | int      | `512`                       | Cap on roster size. `/join` past the cap is refused. Defaults to a bound rather than unlimited because in an open group anyone can mint identities and join, and roster size multiplies every fan-out. `0` = unlimited (not recommended unless `locked = true`). |
 | `locked`             | bool     | `false`                     | Invite-only mode. `/join` is refused for non-admins/mods; membership is managed with `/adduser` / `/removeuser`, and config admins/mods are auto-enrolled. See [Private (invite-only) groups](#private-invite-only-groups). Must be placed **under** `[service]`. |
 | `dedup_window`       | duration | `"1h"`                      | Remember each inbound `message_id` for this long and drop redeliveries (multi-path / retransmit / propagation replay) before forwarding. `0` disables. |
 | `forward_attachments`| bool     | `true`                      | Pass LXMF non-text fields (images, etc.) through forwarding. `false` drops all attachments silently. |

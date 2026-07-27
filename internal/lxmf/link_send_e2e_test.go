@@ -707,8 +707,8 @@ func TestSendFromInsideOnMessageDoesNotDeadlock(t *testing.T) {
 
 	// Alice listens for the reply.
 	var (
-		muA           sync.Mutex
-		gotOnA        []*Message
+		muA    sync.Mutex
+		gotOnA []*Message
 	)
 	f.delA.OnMessage = func(m *Message) {
 		muA.Lock()
@@ -773,4 +773,60 @@ func plantKnown(t *testing.T, tr *rns.Transport, id *rns.Identity, destHash []by
 	if !waitFor(500*time.Millisecond, func() bool { return tr.Recall(destHash) != nil }) {
 		t.Fatal("plantKnown: announce never registered")
 	}
+}
+
+// TestLinkPlaintextRejectsWrongDestination reproduces the replay attack
+// the direct-form destination check exists to stop.
+//
+// The direct (link) LXMF form carries its destination INSIDE the signed
+// body, and Verify signs over that same field — so a body the sender
+// legitimately addressed to a THIRD PARTY verifies perfectly when
+// replayed at us. Anyone can open an unauthenticated link to this
+// service, so without the check a held body signed by Alice is
+// attributed to Alice, fanned out to the roster, and executed with her
+// privileges if it parses as a command.
+func TestLinkPlaintextRejectsWrongDestination(t *testing.T) {
+	f := newTwoNodeFixture(t)
+
+	// Alice signs a body addressed to a third party — NOT to bob.
+	thirdParty := bytes.Repeat([]byte{0x77}, rns.IdentityHashLen)
+	body, _, err := SignAndPackDirect(f.alice, f.delA.Hash(), thirdParty,
+		nil, []byte("private message for someone else"), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Confirm the premise: the signature genuinely verifies. This is why
+	// the destination check is load-bearing — crypto alone accepts it.
+	msg, err := ParseDirectBody(body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := msg.Verify(f.alice.PublicKey()[32:]); err != nil {
+		t.Fatalf("premise broken — body should verify: %v", err)
+	}
+
+	// Replay it into bob's delivery destination.
+	var gotErr string
+	f.delB.OnError = func(e error) { gotErr = e.Error() }
+	f.delB.handleInboundLinkPlaintext(body)
+
+	f.receivedOnBMutex.Lock()
+	got := len(*f.receivedOnB)
+	f.receivedOnBMutex.Unlock()
+	if got != 0 {
+		t.Fatalf("replayed body addressed to a third party was ACCEPTED (%d messages delivered)", got)
+	}
+	if !strings.Contains(gotErr, "refusing replayed body") {
+		t.Errorf("error = %q, want the wrong-destination refusal", gotErr)
+	}
+
+	// A correctly-addressed body on the same path must still be accepted.
+	good, _, err := SignAndPackDirect(f.alice, f.delA.Hash(), f.delB.Hash(),
+		nil, []byte("legitimate"), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	f.delB.handleInboundLinkPlaintext(good)
+	f.waitForReceivedCount(t, 1, 2*time.Second)
 }
