@@ -198,6 +198,7 @@ func New(cfg *config.Config) (*Service, error) {
 			delivery:  delivery,
 			transport: transport,
 			nodes:     propNodes,
+			logger:    logger,
 			propSlots: make(chan struct{}, maxConcurrentPropagationSends),
 		},
 		outboundStore,

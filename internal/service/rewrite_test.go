@@ -242,7 +242,7 @@ func TestSubstituteReplyHashRewritesRawBytes(t *testing.T) {
 	bubble := &fakeBubble{views: map[string]string{aliceHex: aliceMsgIDHex}}
 
 	in := map[any]any{
-		fieldReplyTo:    bytes.Repeat([]byte{0xDE, 0xAD}, 16),       // sender's view
+		fieldReplyTo:    bytes.Repeat([]byte{0xDE, 0xAD}, 16),        // sender's view
 		fieldReplyQuote: []byte("> original message quoted preview"), // text passes through
 	}
 	out, ok := substituteReplyHash(in, aliceHex, bubble)

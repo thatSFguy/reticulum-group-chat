@@ -721,6 +721,7 @@ type deliverySender struct {
 	delivery  *lxmf.Delivery
 	transport *rns.Transport
 	nodes     *propagationTracker
+	logger    *log.Logger
 
 	// propSlots caps how many workers may be inside a propagation
 	// upload at once. Every propagated message targets the SAME selected
@@ -728,6 +729,12 @@ type deliverySender struct {
 	// pool and direct delivery to online members stops with it.
 	// Buffered channel used as a semaphore; nil means unlimited (tests).
 	propSlots chan struct{}
+}
+
+func (d *deliverySender) logf(format string, args ...any) {
+	if d.logger != nil {
+		d.logger.Printf(format, args...)
+	}
 }
 
 // maxConcurrentPropagationSends reserves worker capacity for direct
@@ -759,6 +766,15 @@ func (d *deliverySender) SendLXMFPropagated(recipient, body []byte, fields map[a
 		}
 	}
 	msgID, err := d.delivery.SendPropagated(node, recipient, nil, body, fields)
+	// Name the node. Store-and-forward only completes when the
+	// RECIPIENT fetches, so "which node did we hand this to?" is the
+	// first question when mail is accepted here but never arrives —
+	// and it was previously unanswerable from the log.
+	if err == nil {
+		d.logf("propagation: uploaded message for %x to node %x", recipient[:4], node[:4])
+	} else {
+		d.logf("propagation: upload for %x to node %x failed: %v", recipient[:4], node[:4], err)
+	}
 	// A pinned node we've never heard from can't be linked to — ask the
 	// network for its announce so a later retry can succeed. (For
 	// auto-discovered nodes this can't trigger: discovery IS an announce.)
