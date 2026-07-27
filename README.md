@@ -125,12 +125,12 @@ messages addressed to a destination hash, deliverable opportunistically
   users' terminals.
 - **Outbound retry queue.** Every outbound message goes through a
   persistent queue mirroring LXMF's `LXMRouter.process_outbound`
-  policy: 5 attempts at 10-second intervals, 7-second `path?`-backed
-  defer when the recipient hasn't announced. Survives restarts via
-  `outbound.json`. Drained by a 4-worker pool so a slow send to one
-  recipient doesn't block command replies to others. Picker
-  prioritises by recipient recency (peers we just heard announce go
-  first).
+  policy: 5 attempts with exponential backoff (10 s doubling to a
+  60 s cap), 7-second `path?`-backed defer when the recipient hasn't
+  announced. Survives restarts via `outbound.json`. Drained by an
+  8-worker pool so a slow send to one recipient doesn't block command
+  replies to others. Picker prioritises by recipient recency (peers
+  we just heard announce go first).
 - **Announce cache survives restart.** Verified announces persist to
   `announces.json` — after a restart, every previously-known peer is
   immediately addressable instead of waiting up to one
@@ -463,6 +463,7 @@ Disabled by default; existing deployments are unaffected.
 | `enabled` | bool   | `false`      | Turn propagation-node submission on. |
 | `mode`    | string | `"fallback"` | `"fallback"`: direct delivery first, re-route via the propagation node only after the direct retry budget (5 attempts) is exhausted. `"always"`: every outbound message goes to the propagation node only — nothing is dropped for being offline, at the cost of sync latency. |
 | `node`    | hex    | unset        | Pin a specific propagation node by its `lxmf.propagation` destination hash (32 hex chars). Unset = auto-select the most recently heard node currently announcing itself as accepting messages. |
+| `direct_attempts` | int | `3` | **Shortens the direct retry budget, but only while a propagation node is available to fall back to** — failing over after 3 attempts (~75 s) instead of the standard 5 (~3.5 min) gets an offline member's mail onto the node sooner. Whenever no node is known, the full 5-attempt budget still applies before a message is dropped. Both numbers are printed at startup. Set to `5` to disable the shortening. Fallback mode only. |
 
 Notes:
 
@@ -708,13 +709,18 @@ shape what you'd notice first if you pushed harder:
   inbound chat message produces one `outbound.json` entry per active
   (non-paused) recipient. A 60-member roster + one message in flight =
   up to ~59 pending entries. They drain promptly when recipients are
-  reachable; an unreachable recipient stays queued for up to
-  `5 × 10s ≈ 50s` before the queue gives up.
-- **Drain concurrency is fixed at 4 workers**, not scaled with roster
+  reachable; an unreachable recipient rides retries with exponential
+  backoff (10 s → 60 s cap, each attempt also waiting up to 15 s for
+  a delivery proof). With the propagation fallback active that's
+  `direct_attempts` tries (default 3, ~75 s) before the message is
+  handed to the node; without a node it's the full 5 attempts
+  (~3 minutes) before the queue gives up.
+- **Drain concurrency is fixed at 8 workers**, not scaled with roster
   size (`outboundWorkers` constant in `internal/service/outbound.go`).
-  Four is enough that a slow send to one recipient doesn't head-of-line
-  block the others. For very large rosters (hundreds of members) on a
-  fast interface, raising the constant and rebuilding would speed up
+  Eight absorbs several concurrent 15-second delivery-proof waits on
+  offline members without head-of-line blocking replies to online
+  ones. For very large rosters (hundreds of members) on a fast
+  interface, raising the constant and rebuilding would speed up
   fan-out.
 - **No upper bound on pending depth.** Nothing rejects new messages
   when the queue is long. In steady state the queue is bounded by chat

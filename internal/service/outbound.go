@@ -35,11 +35,19 @@ const (
 	// calls. Higher values let a fast command reply to user A skip
 	// past a slow link send to user B (head-of-line avoidance), at
 	// the cost of more parallel work on the underlying interface.
-	// Four matches the typical LXMF/Sideband fan-out for small
-	// rosters; bump it if your roster is large and your interface
-	// can absorb the parallelism (a TCP-attached rnsd handles the
-	// per-radio scheduling for us).
-	outboundWorkers = 4
+	// Eight, up from the original four: since delivery-proof tracking,
+	// a send to an offline recipient holds its worker for the full
+	// DeliveryProofTimeout (15s), so a handful of offline members
+	// could occupy the whole pool and delay replies to online ones.
+	// Workers are cheap (each just waits on a channel); the TCP-
+	// attached rnsd handles per-radio scheduling for us.
+	outboundWorkers = 8
+
+	// maxRetryBackoff caps the exponential retry backoff (see
+	// backoffWait). One minute keeps the worst-case time-to-propagation-
+	// fallback bounded (~3 min) while cutting how often a persistently
+	// offline recipient re-occupies a worker.
+	maxRetryBackoff = 60 * time.Second
 )
 
 // outboundMessage is one queued LXMF message awaiting delivery. The drain
@@ -136,6 +144,13 @@ type OutboundQueue struct {
 	propagationFallback bool
 	propagationAlways   bool
 
+	// directAttempts, when 1..maxAttempts-1, is the SHORTENED direct
+	// budget used only while a propagation node is available to fall
+	// back to (config propagation.direct_attempts). 0 or >= maxAttempts
+	// means the full maxAttempts budget applies in all cases. See
+	// directBudgetLocked.
+	directAttempts int
+
 	now func() time.Time
 }
 
@@ -156,11 +171,25 @@ func newOutboundQueue(sender outboundSender, store *outboundStore, logger *log.L
 }
 
 // SetPropagation configures store-and-forward routing. Call before Run.
-func (q *OutboundQueue) SetPropagation(fallback, always bool) {
+// directAttempts shortens the direct budget while a node is available
+// (see the field docs); pass 0 to keep the full maxAttempts budget.
+func (q *OutboundQueue) SetPropagation(fallback, always bool, directAttempts int) {
 	q.mu.Lock()
 	q.propagationFallback = fallback
 	q.propagationAlways = always
+	q.directAttempts = directAttempts
 	q.mu.Unlock()
+}
+
+// directBudgetLocked returns the attempt count at which a direct message
+// converts to propagated, GIVEN a node is available: the shortened
+// directAttempts when configured below maxAttempts, else maxAttempts.
+// Callers must hold q.mu.
+func (q *OutboundQueue) directBudgetLocked() int {
+	if q.directAttempts > 0 && q.directAttempts < q.maxAttempts {
+		return q.directAttempts
+	}
+	return q.maxAttempts
 }
 
 // SetIDMap attaches a Cache so successful per-recipient sends register
@@ -384,21 +413,25 @@ func (q *OutboundQueue) attempt(msg *outboundMessage) {
 		q.logger.Printf("outbound: propagated message to %x deferred: %v", msg.Recipient[:4], err)
 		return
 	}
+	// Fallback re-route (mirrors LXMRouter's try_propagation_on_fail): a
+	// direct message that exhausted its budget gets one full retry budget
+	// via the propagation node instead of dropping. The budget is the
+	// SHORTENED directAttempts (propagation.direct_attempts) — but only
+	// when a node is actually selectable RIGHT NOW: with no node, the
+	// full maxAttempts budget keeps protecting the message, and we never
+	// burn a silent second budget against nothing. Already-propagated
+	// messages fail terminally below.
+	if q.propagationFallback && !msg.Propagated &&
+		attempts >= q.directBudgetLocked() && q.sender.HasPropagationNode() {
+		msg.Propagated = true
+		msg.Attempts = 0
+		msg.NextAttempt = q.now().Add(q.retryWait)
+		q.persistLocked()
+		q.logger.Printf("outbound: direct delivery to %x failed after %d attempts (%v) — re-routing via propagation node",
+			msg.Recipient[:4], attempts, err)
+		return
+	}
 	if attempts >= q.maxAttempts {
-		// Fallback re-route (mirrors LXMRouter's try_propagation_on_fail):
-		// a message that exhausted its direct budget gets one full retry
-		// budget via the propagation node — but only if a node is
-		// actually selectable, so we don't burn a silent second budget
-		// against nothing. Already-propagated messages fail terminally.
-		if q.propagationFallback && !msg.Propagated && q.sender.HasPropagationNode() {
-			msg.Propagated = true
-			msg.Attempts = 0
-			msg.NextAttempt = q.now().Add(q.retryWait)
-			q.persistLocked()
-			q.logger.Printf("outbound: direct delivery to %x failed after %d attempts (%v) — re-routing via propagation node",
-				msg.Recipient[:4], attempts, err)
-			return
-		}
 		q.failLocked(msg, err)
 		return
 	}
@@ -413,11 +446,28 @@ func (q *OutboundQueue) attempt(msg *outboundMessage) {
 		}
 		msg.NextAttempt = q.now().Add(q.pathRequestWait)
 	} else {
-		msg.NextAttempt = q.now().Add(q.retryWait)
+		msg.NextAttempt = q.now().Add(q.backoffWait(attempts))
 	}
 	q.persistLocked()
 	q.logger.Printf("outbound: attempt %d/%d to %x failed: %v",
 		attempts, q.maxAttempts, msg.Recipient[:4], err)
+}
+
+// backoffWait returns the delay before the next attempt: retryWait
+// doubled per completed attempt (10s, 20s, 40s, 60s…) capped at
+// maxRetryBackoff. Exponential rather than fixed because each attempt
+// to an offline recipient holds a worker for the full delivery-proof
+// wait (15s) — with a fixed interval a few offline members re-occupy
+// the pool every 10s and starve sends to reachable recipients.
+func (q *OutboundQueue) backoffWait(attempts int) time.Duration {
+	wait := q.retryWait
+	for i := 1; i < attempts && wait < maxRetryBackoff; i++ {
+		wait *= 2
+	}
+	if wait > maxRetryBackoff {
+		wait = maxRetryBackoff
+	}
+	return wait
 }
 
 func (q *OutboundQueue) removeLocked(msg *outboundMessage) {

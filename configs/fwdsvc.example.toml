@@ -131,6 +131,19 @@ enabled = false
 #     nothing is ever dropped for being offline).
 mode = "fallback"
 
+# IMPORTANT: in fallback mode the direct retry budget is SPLIT, and this
+# setting is why sends can fail over before the standard 5 attempts:
+#   - While a propagation node is available, direct delivery gets only
+#     `direct_attempts` tries (default 3) before the message is handed
+#     to the node — failing fast into the safety net puts an offline
+#     member's mail on the node in ~75s instead of ~3.5 minutes.
+#   - Whenever NO node is known (none discovered / none accepting), the
+#     full 5-attempt budget still applies before a message is given up
+#     on — the shortened budget never risks dropping mail.
+# The startup log prints both numbers. Set to 5 to disable the
+# shortening and always use the full budget.
+direct_attempts = 3
+
 # Optional: pin a specific propagation node by its lxmf.propagation
 # destination hash (32 hex chars). Leave empty to auto-select the most
 # recently heard node that announces itself as accepting messages.

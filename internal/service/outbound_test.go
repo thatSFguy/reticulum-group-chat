@@ -465,7 +465,7 @@ func TestFallbackReroutesViaPropagationNode(t *testing.T) {
 		sendErrs:    []error{errors.New("x"), errors.New("x"), errors.New("x")},
 	}
 	q := newTestQueue(t, sender, nil)
-	q.SetPropagation(true /* fallback */, false)
+	q.SetPropagation(true /* fallback */, false, 0)
 	q.maxAttempts = 3
 	q.retryWait = 0
 
@@ -494,7 +494,7 @@ func TestFallbackWithoutNodeFailsTerminally(t *testing.T) {
 		sendErrs:    []error{errors.New("x"), errors.New("x"), errors.New("x")},
 	}
 	q := newTestQueue(t, sender, nil)
-	q.SetPropagation(true, false)
+	q.SetPropagation(true, false, 0)
 	q.maxAttempts = 3
 	q.retryWait = 0
 
@@ -515,7 +515,7 @@ func TestFallbackWithoutNodeFailsTerminally(t *testing.T) {
 func TestAlwaysModeSendsPropagatedOnly(t *testing.T) {
 	sender := &fakeSender{hasPropNode: true}
 	q := newTestQueue(t, sender, nil)
-	q.SetPropagation(false, true /* always */)
+	q.SetPropagation(false, true /* always */, 0)
 
 	q.Enqueue(make([]byte, 16), []byte("via node"))
 	q.processOnce(context.Background())
@@ -539,7 +539,7 @@ func TestPropagatedTerminalFailureDrops(t *testing.T) {
 		propErrs:    []error{errors.New("x"), errors.New("x"), errors.New("x")},
 	}
 	q := newTestQueue(t, sender, nil)
-	q.SetPropagation(true, true)
+	q.SetPropagation(true, true, 0)
 	q.maxAttempts = 3
 	q.retryWait = 0
 
@@ -566,7 +566,7 @@ func TestPropagatedFlagPersistsAcrossReload(t *testing.T) {
 
 	sender := &fakeSender{hasPropNode: true}
 	q := newTestQueue(t, sender, store)
-	q.SetPropagation(false, true)
+	q.SetPropagation(false, true, 0)
 	q.Enqueue(make([]byte, 16), []byte("persist me"))
 
 	loaded, err := store.load()
@@ -586,7 +586,7 @@ func TestNoPropagationNodeDefersWithoutBurningBudget(t *testing.T) {
 		propErrs: []error{errNoPropagationNode, errNoPropagationNode, nil},
 	}
 	q := newTestQueue(t, sender, nil)
-	q.SetPropagation(false, true)
+	q.SetPropagation(false, true, 0)
 	q.maxAttempts = 2 // tighter than the number of deferrals
 	q.retryWait = time.Millisecond
 
@@ -605,5 +605,122 @@ func TestNoPropagationNodeDefersWithoutBurningBudget(t *testing.T) {
 	}
 	if got := q.pendingCount(); got != 0 {
 		t.Errorf("pendingCount = %d, want 0 (delivered once a node appeared)", got)
+	}
+}
+
+func TestRetryBackoffGrowsExponentially(t *testing.T) {
+	// Each failed attempt doubles the wait before the next one, so a
+	// persistently offline recipient occupies a worker progressively
+	// less often instead of re-taking one every retryWait.
+	sender := &fakeSender{}
+	for i := 0; i < 4; i++ {
+		sender.sendErrs = append(sender.sendErrs, errors.New("offline"))
+	}
+	q := newTestQueue(t, sender, nil)
+	q.retryWait = 10 * time.Millisecond
+	clock := time.Unix(1700000000, 0)
+	q.now = func() time.Time { return clock }
+
+	q.Enqueue(make([]byte, 16), []byte("m"))
+
+	for i, want := range []time.Duration{
+		10 * time.Millisecond, // after attempt 1
+		20 * time.Millisecond, // after attempt 2
+		40 * time.Millisecond, // after attempt 3
+	} {
+		q.processOnce(context.Background())
+		q.mu.Lock()
+		next := q.pending[0].NextAttempt
+		q.mu.Unlock()
+		if got := next.Sub(clock); got != want {
+			t.Fatalf("backoff after attempt %d = %v, want %v", i+1, got, want)
+		}
+		clock = next // advance the fake clock to the due time
+	}
+}
+
+func TestBackoffWaitCapped(t *testing.T) {
+	q := newTestQueue(t, &fakeSender{}, nil)
+	q.retryWait = 40 * time.Second
+	if got := q.backoffWait(1); got != 40*time.Second {
+		t.Errorf("backoffWait(1) = %v, want 40s", got)
+	}
+	// 40s doubled once = 80s → capped at maxRetryBackoff.
+	if got := q.backoffWait(2); got != maxRetryBackoff {
+		t.Errorf("backoffWait(2) = %v, want cap %v", got, maxRetryBackoff)
+	}
+	if got := q.backoffWait(10); got != maxRetryBackoff {
+		t.Errorf("backoffWait(10) = %v, want cap %v", got, maxRetryBackoff)
+	}
+}
+
+func TestShortDirectBudgetConvertsEarlyWhenNodeAvailable(t *testing.T) {
+	// direct_attempts=3 with a node available: convert after 3 direct
+	// attempts even though maxAttempts is 5.
+	sender := &fakeSender{hasPropNode: true}
+	for i := 0; i < 5; i++ {
+		sender.sendErrs = append(sender.sendErrs, errors.New("offline"))
+	}
+	q := newTestQueue(t, sender, nil)
+	q.SetPropagation(true, false, 3)
+	q.maxAttempts = 5
+	q.retryWait = 0
+
+	q.Enqueue(make([]byte, 16), []byte("fail fast into the net"))
+	q.processOnce(context.Background())
+
+	if got := sender.sendCount(); got != 3 {
+		t.Errorf("direct attempts = %d, want 3 (shortened budget)", got)
+	}
+	sender.mu.Lock()
+	propCalls := len(sender.propCalls)
+	sender.mu.Unlock()
+	if propCalls != 1 {
+		t.Errorf("propagated sendCount = %d, want 1", propCalls)
+	}
+	if got := q.pendingCount(); got != 0 {
+		t.Errorf("pendingCount = %d, want 0", got)
+	}
+}
+
+func TestShortDirectBudgetIgnoredWithoutNode(t *testing.T) {
+	// direct_attempts=3 but NO node available: the message keeps its
+	// full 5-attempt budget before dropping — the shortened budget only
+	// applies when there is actually a net to fall into.
+	sender := &fakeSender{hasPropNode: false}
+	for i := 0; i < 6; i++ {
+		sender.sendErrs = append(sender.sendErrs, errors.New("offline"))
+	}
+	q := newTestQueue(t, sender, nil)
+	q.SetPropagation(true, false, 3)
+	q.maxAttempts = 5
+	q.retryWait = 0
+
+	q.Enqueue(make([]byte, 16), []byte("no net"))
+	q.processOnce(context.Background())
+
+	if got := sender.sendCount(); got != 5 {
+		t.Errorf("direct attempts = %d, want full 5 without a node", got)
+	}
+	sender.mu.Lock()
+	propCalls := len(sender.propCalls)
+	sender.mu.Unlock()
+	if propCalls != 0 {
+		t.Errorf("propagated sendCount = %d, want 0", propCalls)
+	}
+	if got := q.pendingCount(); got != 0 {
+		t.Errorf("pendingCount = %d, want 0 (terminal drop)", got)
+	}
+}
+
+func TestDirectBudgetAtLeastMaxAttemptsDisablesShortening(t *testing.T) {
+	q := newTestQueue(t, &fakeSender{}, nil)
+	q.maxAttempts = 5
+	q.SetPropagation(true, false, 5)
+	q.mu.Lock()
+	got := q.directBudgetLocked()
+	q.mu.Unlock()
+	if got != 5 {
+		t.Errorf("directBudgetLocked() = %d, want 5 (>=maxAttempts disables shortening)", got)
 	}
 }

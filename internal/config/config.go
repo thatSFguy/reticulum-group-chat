@@ -55,6 +55,19 @@ type PropagationConfig struct {
 	//   "always" — every outbound message goes to the propagation node
 	//     only; recipients get everything on their next sync.
 	Mode string `toml:"mode"`
+
+	// DirectAttempts SHORTENS the direct-delivery retry budget — but
+	// only while a propagation node is actually available to fall back
+	// to. The standard budget is 5 attempts (upstream LXMF's
+	// MAX_DELIVERY_ATTEMPTS), sized for the case where exhausting it
+	// DROPS the message; with a fallback route, extra direct attempts
+	// mostly delay the re-route, so failing over sooner gets an offline
+	// member's mail onto the node in ~75s instead of ~3.5min. Whenever
+	// no node is known (none discovered, none accepting), the full
+	// 5-attempt budget still applies before a message is given up on.
+	// Only meaningful in mode "fallback". Default 3. Values >= 5
+	// disable the shortening (the standard budget wins).
+	DirectAttempts int `toml:"direct_attempts"`
 }
 
 // Propagation mode values accepted in PropagationConfig.Mode.
@@ -62,6 +75,11 @@ const (
 	PropagationModeFallback = "fallback"
 	PropagationModeAlways   = "always"
 )
+
+// DefaultPropagationDirectAttempts is the direct-delivery budget used
+// while a propagation fallback node is available. Applied by normalize
+// when direct_attempts is unset (0).
+const DefaultPropagationDirectAttempts = 3
 
 // NodeBytes returns the pinned propagation node's destination hash, or
 // nil when no node is pinned. Only valid after Load/normalize.
@@ -289,8 +307,9 @@ func defaults() *Config {
 			MaxAge: Duration(7 * 24 * time.Hour),
 		},
 		Propagation: PropagationConfig{
-			Enabled: false,
-			Mode:    PropagationModeFallback,
+			Enabled:        false,
+			Mode:           PropagationModeFallback,
+			DirectAttempts: 3,
 		},
 	}
 }
@@ -380,6 +399,13 @@ func (c *Config) normalize() error {
 	if c.Propagation.Mode != PropagationModeFallback && c.Propagation.Mode != PropagationModeAlways {
 		return fmt.Errorf("propagation.mode must be %q or %q, got %q",
 			PropagationModeFallback, PropagationModeAlways, c.Propagation.Mode)
+	}
+	if c.Propagation.DirectAttempts < 0 {
+		return fmt.Errorf("propagation.direct_attempts must be >= 1 (or unset for the default %d), got %d",
+			DefaultPropagationDirectAttempts, c.Propagation.DirectAttempts)
+	}
+	if c.Propagation.DirectAttempts == 0 {
+		c.Propagation.DirectAttempts = DefaultPropagationDirectAttempts
 	}
 	c.Propagation.Node = strings.ToLower(strings.TrimSpace(c.Propagation.Node))
 	if c.Propagation.Node != "" {

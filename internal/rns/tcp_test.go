@@ -89,3 +89,34 @@ func TestTCPClientCloseShutsReader(t *testing.T) {
 		t.Fatal("reader didn't exit after Close")
 	}
 }
+
+func TestSendWriteTimeoutClosesConnection(t *testing.T) {
+	// A peer that stops draining its socket must not block Send forever
+	// — the dispatcher calls Send synchronously, so a wedged write
+	// freezes the whole service. net.Pipe is unbuffered: with no reader
+	// on the far end, the write blocks until the deadline fires.
+	c1, c2 := net.Pipe()
+	defer c2.Close()
+	client := NewTCPClient(c1)
+	client.writeTimeout = 50 * time.Millisecond
+
+	start := time.Now()
+	err := client.Send([]byte("stuck"))
+	if err == nil {
+		t.Fatal("expected a write-timeout error from Send with no reader")
+	}
+	if elapsed := time.Since(start); elapsed > 2*time.Second {
+		t.Fatalf("Send blocked %v — deadline did not bound the write", elapsed)
+	}
+
+	// The failed write must close the connection (partial HDLC frame =
+	// corrupt stream) so the reconnect supervisor sees Done and redials.
+	select {
+	case <-client.Done():
+	case <-time.After(time.Second):
+		t.Fatal("read loop did not exit after write timeout")
+	}
+	if err := client.Send([]byte("x")); err == nil {
+		t.Fatal("Send on a closed client should error")
+	}
+}

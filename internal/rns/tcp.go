@@ -15,6 +15,15 @@ import (
 // Inbound packets land on the channel returned by Inbox(); outbound packets
 // are sent via Send(). The reader goroutine runs until Close() or the
 // underlying connection drops.
+// tcpWriteTimeout bounds a single Send's conn.Write. Without it, a peer
+// that stops draining its socket (congested hub, half-dead NAT path)
+// fills the kernel send buffer and Write blocks INDEFINITELY — and since
+// the Transport dispatcher emits proofs/announces synchronously, one
+// wedged peer freezes the whole service. 5s is generous for pushing a
+// few KB to a live peer; a peer that can't manage that is effectively
+// down and gets the reconnect treatment.
+const tcpWriteTimeout = 5 * time.Second
+
 type TCPClient struct {
 	conn   net.Conn
 	mu     sync.Mutex // guards Write
@@ -22,6 +31,9 @@ type TCPClient struct {
 	done   chan struct{}
 	err    atomic.Value // last receive-side error, set once
 	closed atomic.Bool
+
+	// writeTimeout defaults to tcpWriteTimeout; overridable in tests.
+	writeTimeout time.Duration
 }
 
 // DialTCP opens a TCP connection to addr (e.g. "amsterdam.connect.reticulum.network:4965")
@@ -40,16 +52,23 @@ func DialTCP(addr string, timeout time.Duration) (*TCPClient, error) {
 // before handing the connection over).
 func NewTCPClient(conn net.Conn) *TCPClient {
 	t := &TCPClient{
-		conn:  conn,
-		inbox: make(chan []byte, 64),
-		done:  make(chan struct{}),
+		conn:         conn,
+		inbox:        make(chan []byte, 64),
+		done:         make(chan struct{}),
+		writeTimeout: tcpWriteTimeout,
 	}
 	go t.readLoop()
 	return t
 }
 
 // Send writes a Reticulum packet to the wire (HDLC-framed). Safe to call
-// from multiple goroutines.
+// from multiple goroutines. Each write carries a deadline
+// (tcpWriteTimeout); on ANY write error the connection is closed, for
+// two reasons: a timed-out or short write may have left a partial HDLC
+// frame on the wire (the stream is corrupt from here on), and closing
+// makes the read loop exit so ReconnectingTCPClient's supervisor
+// notices and redials — a wedged-but-not-dropped peer would otherwise
+// keep the broken connection alive indefinitely.
 func (t *TCPClient) Send(packet []byte) error {
 	if t.closed.Load() {
 		return errors.New("tcp client closed")
@@ -57,8 +76,17 @@ func (t *TCPClient) Send(packet []byte) error {
 	framed := EncodeHDLC(packet)
 	t.mu.Lock()
 	defer t.mu.Unlock()
-	_, err := t.conn.Write(framed)
-	return err
+	if t.writeTimeout > 0 {
+		if err := t.conn.SetWriteDeadline(time.Now().Add(t.writeTimeout)); err != nil {
+			_ = t.Close()
+			return fmt.Errorf("set write deadline: %w", err)
+		}
+	}
+	if _, err := t.conn.Write(framed); err != nil {
+		_ = t.Close()
+		return fmt.Errorf("tcp write: %w", err)
+	}
+	return nil
 }
 
 // Inbox returns a receive-only channel of inbound Reticulum packet bytes.
