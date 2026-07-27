@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"crypto/sha256"
+	"encoding/json"
 	"errors"
 	"io"
 	"io/fs"
@@ -271,5 +272,55 @@ func TestPersistTapFinalSaveOnShutdown(t *testing.T) {
 	}
 	if len(entries) != 1 {
 		t.Fatalf("final save wrote %d entries, want 1", len(entries))
+	}
+}
+
+// TestAnnounceStoreSkipsUnmarshalableEntry covers the second half of the
+// v1.14.2 fix — the one the plausibility bound is a backstop for.
+//
+// Entry contents derive from peer-supplied announce fields. Before this,
+// a single entry that json.Marshal rejected failed the WHOLE cache save,
+// and the failure is invisible in normal operation: the service runs on,
+// but nothing persists, so every peer must be re-learned after a restart
+// (and until they re-announce, their messages cannot be verified and are
+// dropped). One bad peer therefore degraded delivery for all of them.
+func TestAnnounceStoreSkipsUnmarshalableEntry(t *testing.T) {
+	dir := t.TempDir()
+	store := newAnnounceStore(filepath.Join(dir, "announces.json"))
+
+	good1 := makeKnownIdentity(0x01, time.Now())
+	good2 := makeKnownIdentity(0x02, time.Now())
+
+	// Year 36812 — the top of EmittedAt's 40-bit range. time.Time
+	// refuses to marshal any year outside [0,9999].
+	poisoned := makeKnownIdentity(0x03, time.Now())
+	poisoned.EmittedAt = time.Unix(1<<40-1, 0).UTC()
+	if _, err := json.Marshal(poisoned); err == nil {
+		t.Fatal("premise broken: poisoned entry should not marshal")
+	}
+
+	if err := store.save([]*rns.KnownIdentity{good1, poisoned, good2}); err != nil {
+		t.Fatalf("save failed on one bad entry instead of skipping it: %v", err)
+	}
+
+	entries, _, err := store.load(time.Now())
+	if err != nil {
+		t.Fatalf("load: %v", err)
+	}
+	if len(entries) != 2 {
+		t.Fatalf("persisted %d entries, want the 2 good ones", len(entries))
+	}
+	for _, e := range entries {
+		if bytes.Equal(e.DestHash, poisoned.DestHash) {
+			t.Error("poisoned entry was persisted")
+		}
+	}
+
+	// A save with no bad entries must still work normally.
+	if err := store.save([]*rns.KnownIdentity{good1}); err != nil {
+		t.Fatalf("clean save failed: %v", err)
+	}
+	if entries, _, _ := store.load(time.Now()); len(entries) != 1 {
+		t.Errorf("clean save persisted %d entries, want 1", len(entries))
 	}
 }
