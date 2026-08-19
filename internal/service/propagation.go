@@ -8,8 +8,8 @@ import (
 	"sync"
 	"time"
 
-	"github.com/thatSFguy/reticulum-group-chat/internal/lxmf"
-	"github.com/thatSFguy/reticulum-group-chat/internal/rns"
+	"github.com/thatSFguy/reticulum-go/lxmf"
+	"github.com/thatSFguy/reticulum-go/rns"
 )
 
 var lxmfPropagationNameHash = rns.NameHash(lxmf.PropagationFullName())

@@ -15,8 +15,8 @@ import (
 	"time"
 
 	"github.com/thatSFguy/reticulum-group-chat/internal/idmap"
-	"github.com/thatSFguy/reticulum-group-chat/internal/lxmf"
-	"github.com/thatSFguy/reticulum-group-chat/internal/rns"
+	"github.com/thatSFguy/reticulum-go/lxmf"
+	"github.com/thatSFguy/reticulum-go/rns"
 )
 
 // Constants mirror LXMF 0.9.7's LXMRouter.process_outbound retry policy.

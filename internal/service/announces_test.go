@@ -14,7 +14,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/thatSFguy/reticulum-group-chat/internal/rns"
+	"github.com/thatSFguy/reticulum-go/rns"
 )
 
 // makeKnownIdentity returns a syntactically-valid KnownIdentity for

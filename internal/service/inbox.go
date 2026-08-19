@@ -8,7 +8,7 @@ import (
 
 	"github.com/thatSFguy/reticulum-group-chat/internal/commands"
 	"github.com/thatSFguy/reticulum-group-chat/internal/history"
-	"github.com/thatSFguy/reticulum-group-chat/internal/lxmf"
+	"github.com/thatSFguy/reticulum-go/lxmf"
 )
 
 // onLXMFReceived is the lxmf.Delivery callback for verified inbound

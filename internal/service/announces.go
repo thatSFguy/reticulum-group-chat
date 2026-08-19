@@ -12,7 +12,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/thatSFguy/reticulum-group-chat/internal/rns"
+	"github.com/thatSFguy/reticulum-go/rns"
 )
 
 // announceStoreMaxAge bounds how stale a persisted announce can be at

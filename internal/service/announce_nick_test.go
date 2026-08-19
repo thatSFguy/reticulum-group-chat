@@ -9,7 +9,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/thatSFguy/reticulum-group-chat/internal/rns"
+	"github.com/thatSFguy/reticulum-go/rns"
 	"github.com/thatSFguy/reticulum-group-chat/internal/roster"
 )
 

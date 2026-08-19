@@ -23,8 +23,8 @@ import (
 	"sync"
 	"testing"
 
-	"github.com/thatSFguy/reticulum-group-chat/internal/lxmf"
-	"github.com/thatSFguy/reticulum-group-chat/internal/rns"
+	"github.com/thatSFguy/reticulum-go/lxmf"
+	"github.com/thatSFguy/reticulum-go/rns"
 )
 
 // pythonPeer wraps the helper subprocess and serializes JSON ops over its
