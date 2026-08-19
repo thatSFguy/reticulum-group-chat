@@ -9,8 +9,8 @@ import (
 
 	"github.com/vmihailenco/msgpack/v5"
 
-	"github.com/thatSFguy/reticulum-group-chat/internal/lxmf"
-	"github.com/thatSFguy/reticulum-group-chat/internal/rns"
+	"github.com/thatSFguy/reticulum-go/lxmf"
+	"github.com/thatSFguy/reticulum-go/rns"
 )
 
 func pnAnnounce(t *testing.T, destByte byte, enabled bool) *rns.Announce {

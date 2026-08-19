@@ -14,7 +14,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/thatSFguy/reticulum-group-chat/internal/lxmf"
+	"github.com/thatSFguy/reticulum-go/lxmf"
 )
 
 // fakeSender records every Send/RequestPath call and lets a test inject

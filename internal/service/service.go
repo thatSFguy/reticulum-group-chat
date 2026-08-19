@@ -21,8 +21,8 @@ import (
 	"github.com/thatSFguy/reticulum-group-chat/internal/config"
 	"github.com/thatSFguy/reticulum-group-chat/internal/history"
 	"github.com/thatSFguy/reticulum-group-chat/internal/idmap"
-	"github.com/thatSFguy/reticulum-group-chat/internal/lxmf"
-	"github.com/thatSFguy/reticulum-group-chat/internal/rns"
+	"github.com/thatSFguy/reticulum-go/lxmf"
+	"github.com/thatSFguy/reticulum-go/rns"
 	"github.com/thatSFguy/reticulum-group-chat/internal/roster"
 )
 

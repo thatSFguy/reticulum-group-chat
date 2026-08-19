@@ -8,8 +8,8 @@ import (
 	"testing"
 
 	"github.com/thatSFguy/reticulum-group-chat/internal/config"
-	"github.com/thatSFguy/reticulum-group-chat/internal/lxmf"
-	"github.com/thatSFguy/reticulum-group-chat/internal/rns"
+	"github.com/thatSFguy/reticulum-go/lxmf"
+	"github.com/thatSFguy/reticulum-go/rns"
 )
 
 // newTestService builds a real Service via New() against a fresh temp-dir
