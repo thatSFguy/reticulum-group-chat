@@ -567,9 +567,9 @@ Notes:
   …) fetches it on its next propagation sync. Members must have a
   propagation node configured client-side for this to reach them.
 - If the node's announce declares a stamp cost (§5.8.5), the required
-  proof-of-work stamp is computed automatically, up to 24 bits —
-  nodes demanding more are refused (defense against a hostile
-  announce pinning the CPU).
+  proof-of-work stamp is computed automatically, up to 20 bits —
+  nodes demanding more are skipped at selection time (defense against
+  a hostile announce pinning the CPU).
 - The node's announced per-transfer size limit is enforced before
   upload; oversize messages fail that route rather than being
   silently truncated.
@@ -925,6 +925,15 @@ round-trip with a third-party LXMF client.
   link-form Token cipher, link-DATA framing, SPEC §6.5.6 explicit-form
   96-byte link PROOFs. Idle links auto-close after 15 min;
   KEEPALIVE every 4 min.
+- **Delivery stamps** (SPEC §5.7.2, outbound) — when a recipient's
+  announce declares a `stamp_cost` (§4.3 element [1]), grinds the
+  proof-of-work over the message_id on the 3000-round (768 KiB)
+  workblock and carries it as payload element [4], so peers that
+  enforce stamps accept our direct sends. Capped at 16 bits: the cost
+  is chosen by the recipient and the grind runs once per member per
+  message, so an absurd demand is refused outright rather than
+  allowed to occupy an outbound worker. Inbound validation is out of
+  scope — a stamp we receive is carried through unverified.
 - **Propagation-node submission** (SPEC §5.8, sender side) — packs
   the propagated wire form (`dest_hash || Token-encrypted body`,
   wrapped in the msgpack upload envelope), parses `lxmf.propagation`
@@ -1028,12 +1037,14 @@ LXMF to run a group-chat hub. Notable gaps:
 - **No ratchets / forward secrecy.** Long-term X25519 key is used
   for every Token cipher. Future-key compromise means past messages
   are decryptable.
-- **Partial stamps support.** Outbound §5.7 proof-of-work stamps are
-  generated for propagation-node submission (v1.13.0+), but not for
-  direct peer-to-peer delivery — a *peer* that requires stamps on
-  received messages will still silently reject our direct outbound
-  LXMF. Inbound stamps are tolerated but not validated; tickets are
-  not implemented.
+- **Stamps: outbound only.** Both §5.7 proof-of-work flavors are
+  generated — delivery stamps for recipients whose announce declares
+  a `stamp_cost`, and propagation stamps for nodes that require them.
+  Inbound stamps are tolerated but never *validated*, and tickets
+  (§5.7.3) are not implemented, so fwdsvc can only pay proof-of-work,
+  never charge it. A sender therefore costs the group nothing to
+  message, which is what makes the fan-out worth rate-limiting by
+  other means.
 - **Propagation: sender side only.** fwdsvc can *submit* messages to
   a propagation node (see `[propagation]`), but does not act as a
   propagation node itself and does not retrieve its own inbound mail
