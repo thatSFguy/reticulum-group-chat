@@ -5,11 +5,12 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
-	"github.com/thatSFguy/reticulum-group-chat/internal/config"
 	"github.com/thatSFguy/reticulum-go/lxmf"
 	"github.com/thatSFguy/reticulum-go/rns"
+	"github.com/thatSFguy/reticulum-group-chat/internal/config"
 )
 
 // newTestService builds a real Service via New() against a fresh temp-dir
@@ -127,5 +128,100 @@ func TestServiceDedupDisabledForwardsDuplicates(t *testing.T) {
 	svc.onLXMFReceived(msg)
 	if got := svc.history.Len() - before; got != 2 {
 		t.Fatalf("with dedup disabled, both deliveries should process; history grew by %d, want 2", got)
+	}
+}
+
+// inboundWithFields is inbound() with an LXMF field map, for exercising
+// the attachment policy on a real parsed message.
+func inboundWithFields(t *testing.T, svc *Service, senderID *rns.Identity, senderDest []byte, content string, fields map[any]any) *lxmf.Message {
+	t.Helper()
+	svcDest := svc.delivery.Hash()
+	wire, _, err := lxmf.SignAndPackOpportunistic(senderID, senderDest, svcDest, nil, []byte(content), fields)
+	if err != nil {
+		t.Fatal(err)
+	}
+	msg, err := lxmf.ParseOpportunisticBody(wire, svcDest)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return msg
+}
+
+// queuedTo returns the bodies of everything currently queued for recipient.
+func queuedTo(q *OutboundQueue, recipient []byte) []string {
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	var out []string
+	for _, m := range q.pending {
+		if bytes.Equal(m.Recipient, recipient) {
+			out = append(out, string(m.Body))
+		}
+	}
+	return out
+}
+
+// TestAudioOnlyMessageTellsSenderItWasRefused drives the real inbound path
+// with a voice clip (FIELD_AUDIO 7, absent from the default allowlist) and
+// no text. Before, that combination reassembled perfectly and then vanished:
+// nothing forwarded, nothing logged to the sender, no signal anywhere.
+func TestAudioOnlyMessageTellsSenderItWasRefused(t *testing.T) {
+	svc := newTestService(t, "")
+
+	senderID, senderDest := newSender(t)
+	if _, err := svc.roster.AddOrUpdate(senderDest, svc.now()); err != nil {
+		t.Fatal(err)
+	}
+	other := bytes.Repeat([]byte{0xBB}, 16)
+	if _, err := svc.roster.AddOrUpdate(other, svc.now()); err != nil {
+		t.Fatal(err)
+	}
+
+	beforeHistory := svc.history.Len()
+	svc.onLXMFReceived(inboundWithFields(t, svc, senderID, senderDest, "", map[any]any{7: []byte("opus-bytes")}))
+
+	// The sender is told why, in plain language naming the kind.
+	replies := queuedTo(svc.outbound, senderDest)
+	if len(replies) != 1 {
+		t.Fatalf("queued %d replies to the sender, want 1: %v", len(replies), replies)
+	}
+	if !strings.Contains(replies[0], "audio") {
+		t.Errorf("reply should name the refused kind, got %q", replies[0])
+	}
+	if !strings.Contains(replies[0], "Nothing was sent") {
+		t.Errorf("audio-only message sends nothing; reply should say so, got %q", replies[0])
+	}
+
+	// ...and the group is untouched: no fan-out, no history entry.
+	if got := queuedTo(svc.outbound, other); len(got) != 0 {
+		t.Errorf("refused attachment must not fan out, got %v", got)
+	}
+	if got := svc.history.Len() - beforeHistory; got != 0 {
+		t.Errorf("history grew by %d, want 0", got)
+	}
+}
+
+// TestTextWithRefusedAudioStillForwardsTheText asserts the notice does not
+// swallow the rest of the message: text rides on, the clip does not.
+func TestTextWithRefusedAudioStillForwardsTheText(t *testing.T) {
+	svc := newTestService(t, "")
+
+	senderID, senderDest := newSender(t)
+	if _, err := svc.roster.AddOrUpdate(senderDest, svc.now()); err != nil {
+		t.Fatal(err)
+	}
+	other := bytes.Repeat([]byte{0xCC}, 16)
+	if _, err := svc.roster.AddOrUpdate(other, svc.now()); err != nil {
+		t.Fatal(err)
+	}
+
+	svc.onLXMFReceived(inboundWithFields(t, svc, senderID, senderDest, "listen to this", map[any]any{7: []byte("opus")}))
+
+	replies := queuedTo(svc.outbound, senderDest)
+	if len(replies) != 1 || !strings.Contains(replies[0], "The rest of your message was sent") {
+		t.Fatalf("sender should be told the text still went; got %v", replies)
+	}
+	fanout := queuedTo(svc.outbound, other)
+	if len(fanout) != 1 || !strings.Contains(fanout[0], "listen to this") {
+		t.Fatalf("text must still reach the group, got %v", fanout)
 	}
 }

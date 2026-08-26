@@ -1057,7 +1057,11 @@ LXMF to run a group-chat hub. Notable gaps:
   default; `FIELD_FILE_ATTACHMENTS` (5) and `FIELD_AUDIO` (7) can
   be enabled per-operator via `forwarded_fields`. Stickers, embedded
   LXMs, telemetry, icon-appearance, and command fields are still
-  parsed but discarded.
+  parsed but discarded. A sender whose *attachment* (file, image or
+  audio) is refused by the policy gets a private reply saying so —
+  otherwise a voice clip reassembles perfectly and then vanishes with
+  no signal to anyone. Refused metadata (a reaction, say) is silent,
+  since the user did not choose to attach it.
 - **Reactions / reply-to lifetime.** Because the relay re-emits each
   forwarded message under its own identity, every recipient computes
   a different `message_id` for the same bubble — so cross-client

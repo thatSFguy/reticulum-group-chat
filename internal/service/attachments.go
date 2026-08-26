@@ -13,11 +13,16 @@ import (
 // filterAttachments applies the operator's attachment policy to an
 // inbound msg.Fields map:
 //
-//   - cfg.ForwardAttachments == false → returns (nil, nil). Every field
-//     is silently dropped; only the text body is forwarded.
-//   - keys not in cfg.ForwardedFields → dropped silently. Not
-//     user-visible; it's defense against a misbehaving client stuffing
-//     unknown keys.
+//   - cfg.ForwardAttachments == false → no field is forwarded; only the
+//     text body is.
+//   - keys not in cfg.ForwardedFields → dropped. Not appended to the
+//     forwarded body (that would let a misbehaving client stuffing
+//     unknown keys write into everyone's chat), but a recognized
+//     ATTACHMENT kind is named in `rejected` so the sender can be told
+//     privately why their file went nowhere. Metadata keys (reply-to,
+//     reaction, comment, continuation) are deliberately excluded: they
+//     are not something a user chose to attach, and a policy that
+//     strips them would otherwise reply to every reaction.
 //   - allowed keys whose msgpack-encoded value exceeds
 //     cfg.MaxAttachmentBytes → dropped, with one human-readable note
 //     appended to drops so the inbox can suffix the forwarded body
@@ -26,13 +31,33 @@ import (
 //
 // Returned map is nil when no fields survive (so the queue stays on the
 // text-only path and doesn't allocate an empty map for every forward).
-func filterAttachments(in map[any]any, cfg config.ServiceConfig) (out map[any]any, drops []string) {
-	if len(in) == 0 || !cfg.ForwardAttachments {
-		return nil, nil
+func filterAttachments(in map[any]any, cfg config.ServiceConfig) (out map[any]any, drops, rejected []string) {
+	if len(in) == 0 {
+		return nil, nil, nil
+	}
+	if !cfg.ForwardAttachments {
+		// Policy is "text only". The sender still deserves to know their
+		// attachment went nowhere, so recognized kinds are reported even
+		// though no filtering loop runs.
+		for k := range in {
+			if keyInt, ok := keyAsInt(k); ok {
+				if label, named := attachmentLabel(keyInt); named {
+					rejected = append(rejected, label)
+				}
+			}
+		}
+		slices.Sort(rejected)
+		return nil, nil, rejected
 	}
 	for k, v := range in {
 		keyInt, ok := keyAsInt(k)
-		if !ok || !slices.Contains(cfg.ForwardedFields, keyInt) {
+		if !ok {
+			continue
+		}
+		if !slices.Contains(cfg.ForwardedFields, keyInt) {
+			if label, named := attachmentLabel(keyInt); named {
+				rejected = append(rejected, label)
+			}
 			continue
 		}
 		size, err := msgpackSize(v)
@@ -49,7 +74,28 @@ func filterAttachments(in map[any]any, cfg config.ServiceConfig) (out map[any]an
 		}
 		out[k] = v
 	}
-	return out, drops
+	// Map iteration is unordered; sort so the sender-facing notice reads
+	// the same way every time.
+	slices.Sort(rejected)
+	return out, drops, rejected
+}
+
+// attachmentLabel names the LXMF field kinds that represent something a
+// user deliberately attached, and reports whether the key is one. Only
+// these are worth telling a sender about when policy refuses them —
+// unknown keys stay anonymous (an attacker must not be able to choose
+// text we echo back) and metadata keys are not attachments at all.
+func attachmentLabel(key int) (string, bool) {
+	switch key {
+	case 5:
+		return "file", true
+	case 6:
+		return "image", true
+	case 7:
+		return "audio", true
+	default:
+		return "", false
+	}
 }
 
 // keyAsInt coerces a msgpack-decoded key (could be any signed/unsigned

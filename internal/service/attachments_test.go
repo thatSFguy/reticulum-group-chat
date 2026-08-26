@@ -23,7 +23,7 @@ func TestFilterAttachmentsPassesAllowedImage(t *testing.T) {
 	in := map[any]any{
 		6: []any{"jpg", bytes.Repeat([]byte{0xAB}, 1000)},
 	}
-	out, drops := filterAttachments(in, defaultAttachmentCfg())
+	out, drops, _ := filterAttachments(in, defaultAttachmentCfg())
 	if len(drops) != 0 {
 		t.Errorf("unexpected drops: %v", drops)
 	}
@@ -41,7 +41,7 @@ func TestFilterAttachmentsForwardAttachmentsFalseDropsAll(t *testing.T) {
 	in := map[any]any{
 		6: []any{"jpg", bytes.Repeat([]byte{0xAB}, 100)},
 	}
-	out, drops := filterAttachments(in, cfg)
+	out, drops, _ := filterAttachments(in, cfg)
 	if out != nil {
 		t.Errorf("expected nil out when ForwardAttachments=false, got %v", out)
 	}
@@ -61,7 +61,7 @@ func TestFilterAttachmentsDropsDisallowedKeysSilently(t *testing.T) {
 		6:  []any{"jpg", []byte{0xFF, 0xD8, 0xFF, 0xE0}},
 		99: "junk",
 	}
-	out, drops := filterAttachments(in, defaultAttachmentCfg())
+	out, drops, _ := filterAttachments(in, defaultAttachmentCfg())
 	if len(out) != 1 {
 		t.Fatalf("out has %d entries, want 1 (key 6 only)", len(out))
 	}
@@ -80,7 +80,7 @@ func TestFilterAttachmentsCapDropsOversized(t *testing.T) {
 	in := map[any]any{
 		6: []any{"jpg", bytes.Repeat([]byte{0xCC}, 4096)},
 	}
-	out, drops := filterAttachments(in, cfg)
+	out, drops, _ := filterAttachments(in, cfg)
 	if len(out) != 0 {
 		t.Errorf("oversized image survived filter: %v", out)
 	}
@@ -103,7 +103,7 @@ func TestFilterAttachmentsCapZeroDisablesCap(t *testing.T) {
 	in := map[any]any{
 		6: []any{"jpg", bytes.Repeat([]byte{0xCC}, 4096)},
 	}
-	out, drops := filterAttachments(in, cfg)
+	out, drops, _ := filterAttachments(in, cfg)
 	if len(out) != 1 {
 		t.Errorf("cap=0 should pass everything, got out=%v", out)
 	}
@@ -113,11 +113,11 @@ func TestFilterAttachmentsCapZeroDisablesCap(t *testing.T) {
 }
 
 func TestFilterAttachmentsEmptyInputReturnsNil(t *testing.T) {
-	out, drops := filterAttachments(nil, defaultAttachmentCfg())
+	out, drops, _ := filterAttachments(nil, defaultAttachmentCfg())
 	if out != nil || drops != nil {
 		t.Errorf("nil input: got out=%v drops=%v, want nil/nil", out, drops)
 	}
-	out, drops = filterAttachments(map[any]any{}, defaultAttachmentCfg())
+	out, drops, _ = filterAttachments(map[any]any{}, defaultAttachmentCfg())
 	if out != nil || drops != nil {
 		t.Errorf("empty input: got out=%v drops=%v, want nil/nil", out, drops)
 	}
@@ -132,7 +132,7 @@ func TestFilterAttachmentsCoercesIntegerKeyTypes(t *testing.T) {
 		in := map[any]any{
 			key: []any{"jpg", []byte{0xFF, 0xD8, 0xFF}},
 		}
-		out, _ := filterAttachments(in, defaultAttachmentCfg())
+		out, _, _ := filterAttachments(in, defaultAttachmentCfg())
 		if len(out) != 1 {
 			t.Errorf("key type %T (%v) should be coerced to 6 and kept; got out=%v",
 				key, key, out)
@@ -176,7 +176,7 @@ func TestFilterAttachmentsPassesReactionAndReplyFields(t *testing.T) {
 		48: bytes.Repeat([]byte{0xAA}, 32),                    // 0x30 reply-to hash
 		49: []byte("> original message"),                      // 0x31 quote
 	}
-	out, drops := filterAttachments(in, cfg)
+	out, drops, _ := filterAttachments(in, cfg)
 	if len(drops) != 0 {
 		t.Errorf("unexpected drops for reaction/reply fields: %v", drops)
 	}
@@ -199,5 +199,61 @@ func TestHumanBytesSwitchesUnits(t *testing.T) {
 		if got := humanBytes(n); got != want {
 			t.Errorf("humanBytes(%d) = %q, want %q", n, got, want)
 		}
+	}
+}
+
+// TestFilterAttachmentsReportsRejectedAttachmentKinds covers the sender-
+// facing half of the policy: a refused ATTACHMENT is named so the sender
+// can be told, while metadata and unknown keys stay anonymous.
+func TestFilterAttachmentsReportsRejectedAttachmentKinds(t *testing.T) {
+	cfg := defaultAttachmentCfg() // allowlist has no audio (7)
+
+	// A voice clip: recognized attachment kind, not allowed → reported.
+	out, drops, rejected := filterAttachments(map[any]any{7: []byte("opus")}, cfg)
+	if out != nil {
+		t.Errorf("audio must not be forwarded, got %v", out)
+	}
+	if len(drops) != 0 {
+		t.Errorf("a disallowed kind must not write into the group body, got %v", drops)
+	}
+	if len(rejected) != 1 || rejected[0] != "audio" {
+		t.Fatalf("rejected = %v, want [audio]", rejected)
+	}
+
+	// An unknown key must NOT be echoed — the sender chooses that text.
+	_, _, rejected = filterAttachments(map[any]any{9999: []byte("x")}, cfg)
+	if len(rejected) != 0 {
+		t.Errorf("unknown keys must stay anonymous, got %v", rejected)
+	}
+
+	// Metadata stripped by policy is not an attachment: a group that
+	// disallows reactions must not reply to every reactor.
+	narrow := defaultAttachmentCfg()
+	narrow.ForwardedFields = []int{6}
+	_, _, rejected = filterAttachments(map[any]any{64: "👍"}, narrow)
+	if len(rejected) != 0 {
+		t.Errorf("reaction is metadata, not an attachment; got %v", rejected)
+	}
+
+	// Multiple kinds are sorted, so the notice reads the same every run.
+	_, _, rejected = filterAttachments(map[any]any{7: []byte("a"), 5: []byte("b")}, narrow)
+	if len(rejected) != 2 || rejected[0] != "audio" || rejected[1] != "file" {
+		t.Fatalf("rejected = %v, want [audio file] sorted", rejected)
+	}
+}
+
+// TestFilterAttachmentsReportsWhenPolicyIsTextOnly covers forward_attachments
+// = false, which returns before the filter loop and would otherwise report
+// nothing at all.
+func TestFilterAttachmentsReportsWhenPolicyIsTextOnly(t *testing.T) {
+	cfg := defaultAttachmentCfg()
+	cfg.ForwardAttachments = false
+
+	out, _, rejected := filterAttachments(map[any]any{6: []byte("jpeg")}, cfg)
+	if out != nil {
+		t.Errorf("text-only policy must forward no fields, got %v", out)
+	}
+	if len(rejected) != 1 || rejected[0] != "image" {
+		t.Fatalf("rejected = %v, want [image]", rejected)
 	}
 }

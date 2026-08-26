@@ -6,9 +6,9 @@ import (
 	"strings"
 	"unicode/utf8"
 
+	"github.com/thatSFguy/reticulum-go/lxmf"
 	"github.com/thatSFguy/reticulum-group-chat/internal/commands"
 	"github.com/thatSFguy/reticulum-group-chat/internal/history"
-	"github.com/thatSFguy/reticulum-go/lxmf"
 )
 
 // onLXMFReceived is the lxmf.Delivery callback for verified inbound
@@ -156,7 +156,7 @@ func (s *Service) onLXMFReceived(msg *lxmf.Message) {
 	// Apply the operator's attachment policy. Disallowed keys drop
 	// silently; oversized values drop with a "[image not forwarded: …]"
 	// suffix appended to the body so recipients know the sender tried.
-	fwdFields, drops := filterAttachments(msg.Fields, s.cfg.Service)
+	fwdFields, drops, rejected := filterAttachments(msg.Fields, s.cfg.Service)
 
 	// Compose the forwarded body. Reactions (FIELD_REACTION 0x40) and
 	// reply-to-only messages can arrive with content=""
@@ -175,6 +175,15 @@ func (s *Service) onLXMFReceived(msg *lxmf.Message) {
 		} else {
 			body += " " + note
 		}
+	}
+
+	// The attachment allowlist is deliberate flood defense, but silently
+	// eating the message makes it look like the network dropped it —
+	// a voice clip lands as a perfectly reassembled Resource and then
+	// vanishes with no signal to anyone. Tell the sender their file type
+	// isn't accepted. Privately, so the refusal doesn't reach the roster.
+	if len(rejected) > 0 {
+		s.replyUnsupportedFields(senderBytes, rejected, body == "" && len(fwdFields) == 0)
 	}
 
 	// If a metadata-only message (e.g. a reaction) had all its fields
@@ -265,6 +274,21 @@ func (s *Service) onLXMFReceived(msg *lxmf.Message) {
 func (s *Service) replyInvite(senderBytes []byte) {
 	const msg = "Welcome. To join this chat send /join. Send /? for help. Until you join, your messages aren't forwarded."
 	s.outbound.Enqueue(senderBytes, []byte(msg))
+}
+
+// replyUnsupportedFields tells a sender that an attachment they sent was
+// refused by the operator's field policy. `labels` names the kinds
+// (already sorted); `only` reports whether the attachment was the whole
+// message, which decides whether anything reached the group at all.
+func (s *Service) replyUnsupportedFields(senderBytes []byte, labels []string, only bool) {
+	list := strings.Join(labels, " and ")
+	tail := "The rest of your message was sent."
+	if only {
+		tail = "Nothing was sent, since there was no text with it."
+	}
+	msg := fmt.Sprintf("This group doesn't accept %s attachments, so it wasn't forwarded. %s", list, tail)
+	s.outbound.Enqueue(senderBytes, []byte(msg))
+	s.logger.Printf("attachment refused: to=%x kinds=%v only=%v", senderBytes[:4], labels, only)
 }
 
 // replyPaused tells a paused member that their non-command message
