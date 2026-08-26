@@ -67,6 +67,41 @@ announce_interval = "10m"
 # format size cap (~280 bytes). Set to 0 to disable.
 max_inbound_chars = 500
 
+# --- Attachments -----------------------------------------------------
+#
+# Whether non-text LXMF fields (images, files, audio, and the message-
+# meta fields that carry reactions and replies) are forwarded at all.
+# false forwards the text body only.
+forward_attachments = true
+
+# Per-field cap on the msgpack-encoded size of any single allowed field.
+# An oversize attachment is dropped and the forwarded body gets an
+# inline "[image not forwarded: 2.1 MB > 1000 KB limit]" note, so the
+# text still arrives and everyone can see something was trimmed. 0
+# disables the cap (not recommended on LoRa).
+max_attachment_bytes = 1024000
+
+# Allowlist of LXMF field keys to forward. This is flood defense as much
+# as feature selection: it is what stops a client stuffing arbitrary
+# payloads through the fan-out, which multiplies by roster size.
+#
+#     5  = FIELD_FILE_ATTACHMENTS      6  = FIELD_IMAGE
+#     7  = FIELD_AUDIO                48  = FIELD_REPLY_TO (0x30)
+#    49  = FIELD_REPLY_QUOTE (0x31)   64  = FIELD_REACTION (0x40)
+#    65  = FIELD_COMMENT (0x41)       66  = FIELD_CONTINUATION (0x42)
+#
+# The default omits 5 and 7, so files and voice clips do NOT pass. A
+# sender who attaches one gets a private reply telling them the group
+# does not accept that kind — the attachment is refused, never silently
+# swallowed. Add them here if your members want them:
+#
+#     forwarded_fields = [5, 6, 7, 48, 49, 64, 65, 66]
+#
+# 251 and 252 are refused outright: they are the relay's own attribution
+# fields, and forwarding attacker-supplied values would let a message
+# carry a forged "who reacted" that cooperating clients render.
+forwarded_fields = [6, 48, 49, 64, 65, 66]
+
 # Maximum number of members in the chat. /join attempts past this cap
 # are refused with a "the chat is full" reply; existing and paused
 # members both count toward the limit.
