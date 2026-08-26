@@ -225,3 +225,59 @@ func TestTextWithRefusedAudioStillForwardsTheText(t *testing.T) {
 		t.Fatalf("text must still reach the group, got %v", fanout)
 	}
 }
+
+// knownPeerWithStampCost registers a peer in the transport whose announce
+// app_data declares the given §4.3 stamp_cost, and returns its dest hash.
+func knownPeerWithStampCost(t *testing.T, svc *Service, cost int) []byte {
+	t.Helper()
+	id, dest := newSender(t)
+	appData, err := rns.EncodeLXMFAppData([]byte("peer"), &cost)
+	if err != nil {
+		t.Fatal(err)
+	}
+	svc.transport.Restore(&rns.KnownIdentity{
+		DestHash:  dest,
+		PublicKey: id.PublicKey(),
+		AppData:   appData,
+	})
+	if svc.transport.Recall(dest) == nil {
+		t.Fatalf("peer with cost %d was not restored into the transport", cost)
+	}
+	return dest
+}
+
+// TestWillGrindStampGatesOnlyRealGrinds checks which sends take a
+// stamp-grind slot. Taking one unnecessarily would throttle sends that
+// cost nothing, which is the opposite of the semaphore's purpose.
+func TestWillGrindStampGatesOnlyRealGrinds(t *testing.T) {
+	svc := newTestService(t, "")
+	ds, ok := svc.outbound.sender.(*deliverySender)
+	if !ok {
+		t.Fatalf("outbound sender is %T, want *deliverySender", svc.outbound.sender)
+	}
+	if svc.delivery.MaxStampCost != 16 {
+		t.Fatalf("MaxStampCost = %d, want 16", svc.delivery.MaxStampCost)
+	}
+
+	// cost 0 — 92% of the real network. Must never take a slot.
+	if ds.willGrindStamp(knownPeerWithStampCost(t, svc, 0)) {
+		t.Error("cost 0 must not take a grind slot")
+	}
+	// cost 8 — the live-network mode. This is a real grind.
+	if !ds.willGrindStamp(knownPeerWithStampCost(t, svc, 8)) {
+		t.Error("cost 8 is a real grind and must take a slot")
+	}
+	// At the cap, still ground.
+	if !ds.willGrindStamp(knownPeerWithStampCost(t, svc, 16)) {
+		t.Error("cost 16 is at the cap and must take a slot")
+	}
+	// Above the cap SendWithID refuses before building the workblock,
+	// so holding a slot would block a send that never grinds.
+	if ds.willGrindStamp(knownPeerWithStampCost(t, svc, 20)) {
+		t.Error("cost above MaxStampCost is refused, not ground — no slot")
+	}
+	// Unknown recipient fails before any grind.
+	if ds.willGrindStamp(bytes.Repeat([]byte{0xEE}, 16)) {
+		t.Error("unknown recipient must not take a grind slot")
+	}
+}

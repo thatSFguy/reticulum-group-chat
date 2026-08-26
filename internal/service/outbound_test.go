@@ -862,3 +862,41 @@ func TestStampCostRefusalDropsImmediately(t *testing.T) {
 		t.Errorf("propagated sendCount = %d, want 0 (re-route hits the same refusal)", propCalls)
 	}
 }
+
+// TestStampWorkersBusyDefersWithoutSpendingAnAttempt asserts the grind
+// semaphore's back-pressure signal is treated as "try again shortly",
+// not as a delivery failure. Getting this wrong would be worse than
+// having no semaphore: a busy spell would burn a message's five attempts
+// without ever putting it on the wire.
+func TestStampWorkersBusyDefersWithoutSpendingAnAttempt(t *testing.T) {
+	sender := &fakeSender{
+		sendErrs: []error{fmt.Errorf("send: %w", errStampWorkersBusy), nil},
+	}
+	q := newTestQueue(t, sender, nil)
+	q.maxAttempts = 5
+	// Non-zero: processOnce drains everything due, so a zero wait would
+	// make the deferral due again inside the same call and retry it
+	// immediately, hiding whether it parked at all.
+	q.retryWait = 30 * time.Millisecond
+
+	q.Enqueue(make([]byte, 16), []byte("stamped recipient"))
+	q.processOnce(context.Background())
+
+	// Deferred, still queued, and — the point — no attempt consumed.
+	if got := q.pendingCount(); got != 1 {
+		t.Fatalf("pendingCount = %d, want 1 (deferred, not dropped)", got)
+	}
+	q.mu.Lock()
+	attempts := q.pending[0].Attempts
+	q.mu.Unlock()
+	if attempts != 0 {
+		t.Errorf("Attempts = %d, want 0 — back-pressure must not spend the budget", attempts)
+	}
+
+	// A slot frees; the retry goes through.
+	time.Sleep(40 * time.Millisecond)
+	q.processOnce(context.Background())
+	if got := q.pendingCount(); got != 0 {
+		t.Errorf("pendingCount after slot freed = %d, want 0", got)
+	}
+}

@@ -14,9 +14,9 @@ import (
 	"sync"
 	"time"
 
-	"github.com/thatSFguy/reticulum-group-chat/internal/idmap"
 	"github.com/thatSFguy/reticulum-go/lxmf"
 	"github.com/thatSFguy/reticulum-go/rns"
+	"github.com/thatSFguy/reticulum-group-chat/internal/idmap"
 )
 
 // Constants mirror LXMF 0.9.7's LXMRouter.process_outbound retry policy.
@@ -534,11 +534,11 @@ func (q *OutboundQueue) attempt(msg *outboundMessage) {
 	// arrives. Don't burn the attempt budget against it (in "always"
 	// mode with no node discovered yet, that would drop every message
 	// within a minute of enqueue); just defer and keep the message.
-	if errors.Is(err, errNoPropagationNode) {
+	if errors.Is(err, errNoPropagationNode) || errors.Is(err, errStampWorkersBusy) {
 		msg.Attempts--
 		msg.NextAttempt = q.now().Add(q.retryWait)
 		q.persistLocked()
-		q.logger.Printf("outbound: propagated message to %x deferred: %v", safePrefix(msg.Recipient), err)
+		q.logger.Printf("outbound: message to %x deferred: %v", safePrefix(msg.Recipient), err)
 		return
 	}
 	// A stamp cost we refuse is a DECISION, not a failure: the recipient
@@ -741,6 +741,12 @@ func isRecipientUnknown(err error) bool {
 // other transient failure.
 var errNoPropagationNode = errors.New("no propagation node available")
 
+// errStampWorkersBusy is returned by SendLXMF when every stamp-grind
+// slot is occupied. Recoverable and self-clearing — a slot frees as soon
+// as another grind finishes — so the queue defers without spending an
+// attempt, exactly as it does for errNoPropagationNode.
+var errStampWorkersBusy = errors.New("all stamp-grind slots busy")
+
 // deliverySender adapts *lxmf.Delivery + *rns.Transport to the queue's
 // outboundSender interface. Single-purpose; not exported. nodes is nil
 // when propagation is disabled — SendLXMFPropagated then always errors
@@ -758,6 +764,17 @@ type deliverySender struct {
 	// pool and direct delivery to online members stops with it.
 	// Buffered channel used as a semaphore; nil means unlimited (tests).
 	propSlots chan struct{}
+
+	// stampSlots is the same idea for §5.7.2 delivery-stamp grinding on
+	// the DIRECT path. A recipient who declared a stamp_cost makes
+	// SendWithID CPU-bound before it is network-bound: it grinds ~2^cost
+	// hashes over a 768 KiB workblock inside this worker, per message,
+	// per recipient. Fan-out means a roster of stamp-demanding members
+	// can put every worker into that loop at once, pinning the box and
+	// starving the members who need no stamp at all — plus command
+	// replies, which are the responses a user is actually waiting on.
+	// Buffered channel used as a semaphore; nil means unlimited (tests).
+	stampSlots chan struct{}
 }
 
 func (d *deliverySender) logf(format string, args ...any) {
@@ -771,8 +788,57 @@ func (d *deliverySender) logf(format string, args ...any) {
 // propagation node simultaneously.
 const maxConcurrentPropagationSends = 3
 
+// maxConcurrentStampGrinds reserves worker capacity for sends that cost
+// nothing. Same shape and same reasoning as the propagation cap: at most
+// this many of outboundWorkers may be grinding proof-of-work at once, so
+// five workers always remain for unstamped recipients and command
+// replies. Measured costs on the live network cluster at 8 (~28ms), so
+// in practice this rarely engages — it exists for the case it is meant
+// for, a roster that demands expensive stamps.
+const maxConcurrentStampGrinds = 3
+
 func (d *deliverySender) SendLXMF(recipient, body []byte, fields map[any]any) ([]byte, error) {
+	// The grind happens INSIDE SendWithID, where we cannot gate it, so
+	// decide up front whether this send will pay proof-of-work and take
+	// a slot only then. An unstamped recipient — 92% of the network —
+	// never touches the semaphore.
+	if d.stampSlots != nil && d.willGrindStamp(recipient) {
+		select {
+		case d.stampSlots <- struct{}{}:
+			defer func() { <-d.stampSlots }()
+		default:
+			// All grind slots busy. Defer rather than queue behind them:
+			// like errNoPropagationNode this is a "try again shortly"
+			// signal and must not consume the attempt budget, or a busy
+			// spell would spend a message's five attempts without ever
+			// putting it on the wire.
+			return nil, errStampWorkersBusy
+		}
+	}
 	return d.delivery.SendWithID(recipient, nil, body, fields)
+}
+
+// willGrindStamp reports whether a send to recipient will pay §5.7.2
+// proof-of-work: the recipient must have announced a cost, and it must
+// be one we are willing to grind. A cost above the cap is refused by
+// SendWithID without ever building the workblock, so it needs no slot.
+func (d *deliverySender) willGrindStamp(recipient []byte) bool {
+	if d.delivery.DisableOutboundStamps {
+		return false
+	}
+	known := d.transport.Recall(recipient)
+	if known == nil {
+		return false // send fails on the unknown recipient, before any grind
+	}
+	cost, err := rns.DecodeLXMFAppDataStampCost(known.AppData)
+	if err != nil || cost <= 0 {
+		return false
+	}
+	max := d.delivery.MaxStampCost
+	if max <= 0 {
+		max = lxmf.MaxDeliveryStampCost
+	}
+	return cost <= max
 }
 
 func (d *deliverySender) SendLXMFPropagated(recipient, body []byte, fields map[any]any) ([]byte, error) {

@@ -17,12 +17,12 @@ import (
 	"strings"
 	"time"
 
+	"github.com/thatSFguy/reticulum-go/lxmf"
+	"github.com/thatSFguy/reticulum-go/rns"
 	"github.com/thatSFguy/reticulum-group-chat/internal/commands"
 	"github.com/thatSFguy/reticulum-group-chat/internal/config"
 	"github.com/thatSFguy/reticulum-group-chat/internal/history"
 	"github.com/thatSFguy/reticulum-group-chat/internal/idmap"
-	"github.com/thatSFguy/reticulum-go/lxmf"
-	"github.com/thatSFguy/reticulum-go/rns"
 	"github.com/thatSFguy/reticulum-group-chat/internal/roster"
 )
 
@@ -213,11 +213,12 @@ func New(cfg *config.Config) (*Service, error) {
 	outboundStore := newOutboundStore(outboundStorePath(cfg.Service.StatePath))
 	outbound := newOutboundQueue(
 		&deliverySender{
-			delivery:  delivery,
-			transport: transport,
-			nodes:     propNodes,
-			logger:    logger,
-			propSlots: make(chan struct{}, maxConcurrentPropagationSends),
+			delivery:   delivery,
+			transport:  transport,
+			nodes:      propNodes,
+			logger:     logger,
+			propSlots:  make(chan struct{}, maxConcurrentPropagationSends),
+			stampSlots: make(chan struct{}, maxConcurrentStampGrinds),
 		},
 		outboundStore,
 		logger,
