@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"io/fs"
 	"log"
@@ -816,5 +817,48 @@ func TestRunFlushesOnShutdown(t *testing.T) {
 	}
 	if len(loaded) != 1 {
 		t.Fatalf("shutdown flush persisted %d messages, want 1", len(loaded))
+	}
+}
+
+func TestStampCostRefusalDropsImmediately(t *testing.T) {
+	// A recipient demanding more proof-of-work than delivery.MaxStampCost
+	// allows is a deterministic refusal, not a transient failure: the cost
+	// is re-read from the same cached announce on every attempt. Burning
+	// the whole budget against it costs ~2 minutes of backoff per message
+	// and logs the cause as an exhausted budget. Expect exactly ONE send
+	// and an immediate drop.
+	sender := &fakeSender{
+		hasPropNode: true,
+		sendErrs: []error{
+			// Wrapped, as the real send path wraps it.
+			fmt.Errorf("pack: %w", lxmf.ErrStampCostTooHigh),
+			errors.New("must not be reached"),
+		},
+	}
+	q := newTestQueue(t, sender, nil)
+	q.SetPropagation(true /* fallback */, false, 0)
+	q.maxAttempts = 5
+	q.retryWait = 0 // due immediately, so a retry would show up at once
+
+	q.Enqueue(make([]byte, 16), []byte("too expensive"))
+
+	// Drain several times — a correctly-dropped message stays dropped.
+	for i := 0; i < 3; i++ {
+		q.processOnce(context.Background())
+	}
+
+	if got := sender.sendCount(); got != 1 {
+		t.Errorf("sendCount = %d, want 1 (refusal must not be retried)", got)
+	}
+	if got := q.pendingCount(); got != 0 {
+		t.Errorf("pendingCount = %d, want 0 (message must be dropped)", got)
+	}
+	// The propagation route grinds the SAME recipient stamp, so the
+	// fallback re-route would hit the identical refusal a budget later.
+	sender.mu.Lock()
+	propCalls := len(sender.propCalls)
+	sender.mu.Unlock()
+	if propCalls != 0 {
+		t.Errorf("propagated sendCount = %d, want 0 (re-route hits the same refusal)", propCalls)
 	}
 }

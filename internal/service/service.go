@@ -182,6 +182,24 @@ func New(cfg *config.Config) (*Service, error) {
 		return nil, fmt.Errorf("register delivery: %w", err)
 	}
 
+	// Cap the §5.7.2 delivery stamp we will grind for a recipient. The
+	// cost comes from element [1] of that peer's OWN announce, so it is
+	// stranger-controlled, and the grind runs per message PER RECIPIENT
+	// inside an outbound worker — the same amplification shape as the
+	// propagation stamp (see MaxPropagationStampCost, and P2 in
+	// docs/dos-security-audit.md), but on the path that fans out to the
+	// whole roster rather than to one selected node.
+	//
+	// 16 rather than the package default of 20, measured rather than
+	// guessed: a survey of 4096 observed peers found 92% announcing
+	// cost 0 (which short-circuits before the 768 KiB workblock is even
+	// built), a hard mode at 8, and NOTHING legitimate above 16. So this
+	// costs no reachability while cutting the tail — a grind is ~46ms at
+	// 16 but ~115ms at 18 and ~260ms at 20, per recipient, per message.
+	// The two peers in that sample announcing cost 254 are refused here
+	// instead of pinning a worker.
+	delivery.MaxStampCost = 16
+
 	// Store-and-forward via LXMF propagation nodes (SPEC §5.8). The
 	// tracker learns nodes from their lxmf.propagation announces; the
 	// sender consults it per submission, so node selection follows the

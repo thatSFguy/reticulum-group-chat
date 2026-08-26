@@ -541,6 +541,23 @@ func (q *OutboundQueue) attempt(msg *outboundMessage) {
 		q.logger.Printf("outbound: propagated message to %x deferred: %v", safePrefix(msg.Recipient), err)
 		return
 	}
+	// A stamp cost we refuse is a DECISION, not a failure: the recipient
+	// named a price in their announce and we declined it. Nothing about
+	// that changes on a retry — the cost is re-read from the same cached
+	// announce, so all five attempts re-derive the same refusal, each
+	// after its own backoff. Nor does the propagation fallback help:
+	// SendPropagated grinds the recipient's delivery stamp too (it is
+	// sealed in the payload and travels to the destination), so the
+	// re-route hits the identical refusal one budget later. Fail it here,
+	// once, with a log line that names the cost rather than burying the
+	// cause under "attempt 5/5 failed".
+	//
+	// This is terminal for the MESSAGE, not for the member: if they
+	// re-announce a cost we can afford, their next message goes through.
+	if errors.Is(err, lxmf.ErrStampCostTooHigh) {
+		q.failStampCostLocked(msg, err)
+		return
+	}
 	// Fallback re-route (mirrors LXMRouter's try_propagation_on_fail): a
 	// direct message that exhausted its budget gets one full retry budget
 	// via the propagation node instead of dropping. The budget is the
@@ -617,6 +634,18 @@ func (q *OutboundQueue) failLocked(msg *outboundMessage, err error) {
 	q.persistLocked()
 	q.logger.Printf("outbound: failing message id=%s to %x after %d attempts: %v",
 		msg.ID, safePrefix(msg.Recipient), q.maxAttempts, err)
+}
+
+// failStampCostLocked drops a message whose recipient demands more
+// proof-of-work than delivery.MaxStampCost allows. Separate from
+// failLocked because the attempt budget is irrelevant here — the message
+// is dropped on the FIRST refusal, and the log should say so rather than
+// claiming an exhausted budget it never spent.
+func (q *OutboundQueue) failStampCostLocked(msg *outboundMessage, err error) {
+	q.removeLocked(msg)
+	q.persistLocked()
+	q.logger.Printf("outbound: dropping message id=%s to %x — %v (not retried: the cost is re-read from the same announce and the propagation route grinds the same stamp)",
+		msg.ID, safePrefix(msg.Recipient), err)
 }
 
 // persistLocked marks the queue dirty and wakes the flush loop. It does
