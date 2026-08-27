@@ -4,7 +4,7 @@ go 1.26.1
 
 require (
 	github.com/BurntSushi/toml v1.4.0
-	github.com/thatSFguy/reticulum-go v0.2.1
+	github.com/thatSFguy/reticulum-go v0.3.1
 	github.com/vmihailenco/msgpack/v5 v5.4.1
 )
 
