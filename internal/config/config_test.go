@@ -371,3 +371,73 @@ func TestPropagationDirectAttempts(t *testing.T) {
 		t.Fatal("expected normalize to reject negative direct_attempts")
 	}
 }
+
+func TestInboundStampDefaults(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "c.toml")
+	if err := os.WriteFile(path, []byte("[service]\ndisplay_name = \"x\"\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	c, err := Load(path)
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	// Off by default: a release that started charging a stamp cost on
+	// upgrade would make every non-stamping client silently undeliverable.
+	if c.Service.InboundStampCost != 0 {
+		t.Errorf("inbound_stamp_cost default = %d, want 0", c.Service.InboundStampCost)
+	}
+	if c.Service.EnforceInboundStamps {
+		t.Error("enforce_inbound_stamps default = true, want false")
+	}
+}
+
+func TestInboundStampTOMLBinding(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "c.toml")
+	toml := "[service]\ndisplay_name = \"x\"\n" +
+		"inbound_stamp_cost = 8\nenforce_inbound_stamps = true\n"
+	if err := os.WriteFile(path, []byte(toml), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	c, err := Load(path)
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if c.Service.InboundStampCost != 8 {
+		t.Errorf("inbound_stamp_cost = %d, want 8", c.Service.InboundStampCost)
+	}
+	if !c.Service.EnforceInboundStamps {
+		t.Error("enforce_inbound_stamps = true did not bind")
+	}
+}
+
+func TestNormalizeRejectsOutOfRangeStampCost(t *testing.T) {
+	for _, cost := range []int{-1, MaxAnnouncedStampCost + 1} {
+		cfg := &Config{Service: validServiceConfig()}
+		cfg.Service.InboundStampCost = cost
+		if err := cfg.normalize(); err == nil {
+			t.Errorf("cost %d: expected normalize to reject", cost)
+		}
+	}
+	// The boundary itself is legal — upstream accepts 1..254.
+	cfg := &Config{Service: validServiceConfig()}
+	cfg.Service.InboundStampCost = MaxAnnouncedStampCost
+	if err := cfg.normalize(); err != nil {
+		t.Errorf("cost %d: normalize rejected the upstream maximum: %v", MaxAnnouncedStampCost, err)
+	}
+}
+
+func TestNormalizeRejectsEnforceWithoutCost(t *testing.T) {
+	// Enforcing against cost 0 drops nothing while reading like a spam
+	// defense, so it is a config error rather than a silent no-op.
+	cfg := &Config{Service: validServiceConfig()}
+	cfg.Service.EnforceInboundStamps = true
+	if err := cfg.normalize(); err == nil {
+		t.Fatal("expected normalize to reject enforce_inbound_stamps with cost 0")
+	}
+	cfg.Service.InboundStampCost = 8
+	if err := cfg.normalize(); err != nil {
+		t.Fatalf("enforce with cost 8 should be accepted: %v", err)
+	}
+}

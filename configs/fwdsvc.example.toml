@@ -131,6 +131,34 @@ dedup_window = "1h"
 # chat: anyone with the destination hash can /join).
 locked = false
 
+# --- Inbound stamps (SPEC §5.7) --------------------------------------
+#
+# Proof-of-work the group demands of anyone messaging it. The cost is
+# announced in our app_data, senders grind before sending, and we verify
+# on arrival. It is the one lever that makes reaching the whole roster
+# cost the SENDER something — every other limit here caps what we do
+# after the message has already arrived.
+#
+# The cost is in leading zero bits, so each step doubles the work: 8 is
+# roughly a second on a phone, 16 is minutes. 0 (the default) announces
+# no cost and checks nothing.
+#
+# Validating a stamp costs us a 768 KiB workblock, and that work is
+# attacker-triggered, so the library caps concurrent validations and
+# delivers unchecked past the ceiling rather than queueing.
+inbound_stamp_cost = 0
+
+# Drop messages that don't clear inbound_stamp_cost, instead of
+# accepting them and logging what they paid. Off by default (upstream
+# LXMF's _enforce_stamps default, SPEC §5.7.4).
+#
+# Read the "inbound stamp:" log lines for a while before setting this. A
+# client that doesn't implement stamps at all becomes silently
+# undeliverable to the group the moment it goes on, and the logs are how
+# you find out whether any of your members are in that group. Requires
+# inbound_stamp_cost > 0.
+enforce_inbound_stamps = false
+
 # Reticulum I/O interfaces. Currently only "tcp_client" is supported, which
 # dials a TCPServerInterface peer (e.g. a public testnet entry node) and
 # exchanges HDLC-framed packets in both directions. You can list multiple.

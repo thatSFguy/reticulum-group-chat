@@ -1,5 +1,29 @@
 # Resource transfer — security audit
 
+> **Status (2026-08-28): historical. Read the findings, not the
+> numbers.**
+>
+> This audit covers the Resource implementation as it existed *in this
+> repository* under `internal/rns/`. That code has since been extracted
+> to [`reticulum-go`](https://github.com/thatSFguy/reticulum-go), which
+> `fwdsvc` now consumes as a module — the paths cited below no longer
+> exist here, and every constant quoted must be re-read from the module
+> rather than trusted from this page. Two are already known stale:
+>
+> - `MaxAcceptedResourceSize` is no longer 256 KiB. It is
+>   `MaxEfficientSize + 8 KiB` (~1032 KiB), so the F4 allocation bound
+>   is four times what is written below.
+> - **F3 is no longer true of the receive path.** As of `reticulum-go`
+>   v0.5.0 inbound multi-segment transfers (SPEC §10.11) are accepted
+>   and reassembled, up to 16 segments — they are not refused with a
+>   "multi-segment not yet implemented" error. F3's *sender-side*
+>   reasoning still holds: our send path is single-segment, and
+>   `NewResourceSender` still refuses a body that would need more.
+>
+> The threat reasoning in each finding is what remains useful. A
+> follow-up hardening pass on the multi-segment assembler's memory
+> bounds is tracked in the `reticulum-go` repo.
+
 **Scope:** the RNS Resource transfer implementation in `internal/rns/`
 (`resource.go`, `resource_hash.go`, `resource_adv.go`, `resource_wire.go`,
 `resource_sender.go`, `resource_receiver.go`, `resource_dispatch.go`).
