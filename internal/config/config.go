@@ -89,6 +89,13 @@ const (
 // attacker unbounded growth of state, fan-out cost, and reply size.
 const DefaultMaxMembers = 512
 
+// MaxAnnouncedStampCost is the largest §5.7.2 stamp cost that can be
+// announced in app_data element [1]. Upstream LXMF accepts 1..254, and
+// rns.DecodeLXMFAppDataStampCost mirrors that range — announcing
+// anything outside it makes our announce unparseable to the peers we
+// are asking to do the work.
+const MaxAnnouncedStampCost = 254
+
 // DefaultPropagationDirectAttempts is the direct-delivery budget used
 // while a propagation fallback node is available. Applied by normalize
 // when direct_attempts is unset (0).
@@ -185,6 +192,39 @@ type ServiceConfig struct {
 	// operator can never lock themselves out. Default false (open chat:
 	// anyone with the destination hash can /join).
 	Locked bool `toml:"locked"`
+
+	// InboundStampCost is the §5.7.2 proof-of-work cost fwdsvc announces
+	// in app_data element [1] and requires of inbound senders. 0 (the
+	// default) announces no cost and checks nothing, which is what every
+	// release before this one did: messaging the group is free, and the
+	// fan-out multiplies that one free message by roster size.
+	//
+	// Setting it puts a CPU price on entry to the fan-out — the sender
+	// grinds before we relay to N members. It is not free for us either:
+	// validating one stamp builds a 768 KiB workblock, and unlike the
+	// outbound grind that is work an ATTACKER triggers by messaging us.
+	// The library bounds it at lxmf.MaxConcurrentStampValidations and
+	// delivers unchecked past the ceiling rather than queueing, so the
+	// pressure surfaces as unscored messages instead of memory.
+	//
+	// The cost is in leading zero bits, so difficulty DOUBLES per step:
+	// 8 is about a second on a phone, 16 is minutes. Start low and read
+	// the "inbound stamp:" log lines before raising it. Range
+	// 0..MaxAnnouncedStampCost.
+	InboundStampCost int `toml:"inbound_stamp_cost"`
+
+	// EnforceInboundStamps drops messages that do not clear
+	// InboundStampCost instead of accepting them and recording what they
+	// paid. Off by default, matching upstream LXMF's _enforce_stamps and
+	// the third row of §5.7.4 — cost announced, stamp missing, accept
+	// anyway.
+	//
+	// Turn it on only after watching the "inbound stamp:" lines for a
+	// while. A client that does not implement §5.7 stamps at all becomes
+	// silently undeliverable to the group the moment this is set, and
+	// until you have the observations you cannot tell which of your
+	// members those are. Requires InboundStampCost > 0.
+	EnforceInboundStamps bool `toml:"enforce_inbound_stamps"`
 
 	// ForwardAttachments controls whether non-text LXMF fields
 	// (FIELD_IMAGE = 6, FIELD_FILE_ATTACHMENTS = 5, FIELD_AUDIO = 7, …)
@@ -376,6 +416,15 @@ func (c *Config) normalize() error {
 	}
 	if c.Service.MaxAttachmentBytes < 0 {
 		return fmt.Errorf("service.max_attachment_bytes must be >= 0")
+	}
+	if c.Service.InboundStampCost < 0 || c.Service.InboundStampCost > MaxAnnouncedStampCost {
+		return fmt.Errorf("service.inbound_stamp_cost must be 0..%d (0 disables)", MaxAnnouncedStampCost)
+	}
+	// Enforcing against a cost of zero would drop nothing while reading
+	// like a working spam defense, so it is refused in config rather
+	// than being a silent no-op at runtime.
+	if c.Service.EnforceInboundStamps && c.Service.InboundStampCost == 0 {
+		return fmt.Errorf("service.enforce_inbound_stamps requires service.inbound_stamp_cost > 0")
 	}
 	if c.Service.IDCacheTTL.Std() < 0 {
 		return fmt.Errorf("service.id_cache_ttl must be >= 0 (0 disables)")

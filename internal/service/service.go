@@ -171,7 +171,7 @@ func New(cfg *config.Config) (*Service, error) {
 	// Transport can mint path-response announces (context 0x0B) on
 	// demand without duplicating the appData/identity wiring.
 	buildAnnounceWithContext := func(ctx byte) (*rns.Packet, error) {
-		appData, err := rns.EncodeLXMFAppData([]byte(cfg.Service.DisplayName), nil)
+		appData, err := rns.EncodeLXMFAppData([]byte(cfg.Service.DisplayName), announceStampCost(cfg))
 		if err != nil {
 			return nil, err
 		}
@@ -199,6 +199,19 @@ func New(cfg *config.Config) (*Service, error) {
 	// The two peers in that sample announcing cost 254 are refused here
 	// instead of pinning a worker.
 	delivery.MaxStampCost = 16
+
+	// The other direction (SPEC §5.7.2 step 3 / §5.7.4): what we require
+	// of senders, and whether we act on it. Both default to off, which
+	// keeps the library on its no-check path — a cost of 0 short-
+	// circuits before any workblock is built, so an operator who leaves
+	// this alone pays nothing for the feature existing.
+	//
+	// The cost set here is the same value announceStampCost publishes in
+	// our announce. They MUST agree: charging a cost we never announced
+	// drops senders who had no way to know, and announcing one we never
+	// check is a claim we don't back.
+	delivery.InboundStampCost = cfg.Service.InboundStampCost
+	delivery.EnforceStamps = cfg.Service.EnforceInboundStamps
 
 	// Store-and-forward via LXMF propagation nodes (SPEC §5.8). The
 	// tracker learns nodes from their lxmf.propagation announces; the
@@ -326,6 +339,12 @@ func (s *Service) Run(ctx context.Context) error {
 	s.logger.Printf("delivery destination : %s", hex.EncodeToString(s.delivery.Hash()))
 	s.logger.Printf("display name        : %s", s.cfg.Service.DisplayName)
 	s.logger.Printf("locked (invite-only): %v", s.cfg.Service.Locked)
+	if s.cfg.Service.InboundStampCost > 0 {
+		s.logger.Printf("inbound stamps      : cost=%d enforce=%v",
+			s.cfg.Service.InboundStampCost, s.cfg.Service.EnforceInboundStamps)
+	} else {
+		s.logger.Printf("inbound stamps      : none required (announcing no stamp_cost)")
+	}
 	s.logger.Printf("roster size         : %d", len(s.roster.Hashes()))
 	s.logger.Printf("history size        : %d", s.history.Len())
 	if s.cfg.Propagation.Enabled {
@@ -406,8 +425,24 @@ func (s *Service) dialInterface(iface config.InterfaceConfig) error {
 	}
 }
 
+// announceStampCost is the §5.7.2 cost published in app_data element
+// [1] — "you must do this much proof-of-work to message me" (SPEC
+// §4.3 / §5.7.4).
+//
+// nil means the element is announced as msgpack nil, which every peer
+// reads as "no stamp required". That is the default, and it is not the
+// same as announcing 0: rns.EncodeLXMFAppData takes a pointer precisely
+// so "unset" and "explicitly zero" stay distinguishable on the wire.
+func announceStampCost(cfg *config.Config) *int {
+	if cfg.Service.InboundStampCost <= 0 {
+		return nil
+	}
+	cost := cfg.Service.InboundStampCost
+	return &cost
+}
+
 func (s *Service) buildAnnounce() (*rns.Packet, error) {
-	appData, err := rns.EncodeLXMFAppData([]byte(s.cfg.Service.DisplayName), nil)
+	appData, err := rns.EncodeLXMFAppData([]byte(s.cfg.Service.DisplayName), announceStampCost(s.cfg))
 	if err != nil {
 		return nil, err
 	}

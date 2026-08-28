@@ -432,6 +432,8 @@ Both lists MUST be declared at the top of the file, before any
 | `max_inbound_chars`  | int      | `500`                       | Reject non-command messages longer than this many UTF-8 chars. `0` disables. |
 | `max_members`        | int      | `512`                       | Cap on roster size. `/join` past the cap is refused. Defaults to a bound rather than unlimited because in an open group anyone can mint identities and join, and roster size multiplies every fan-out. `0` = unlimited (not recommended unless `locked = true`). |
 | `locked`             | bool     | `false`                     | Invite-only mode. `/join` is refused for non-admins/mods; membership is managed with `/adduser` / `/removeuser`, and config admins/mods are auto-enrolled. See [Private (invite-only) groups](#private-invite-only-groups). Must be placed **under** `[service]`. |
+| `inbound_stamp_cost` | int      | `0`                         | SPEC §5.7.2 proof-of-work required of anyone messaging the group, announced in our `app_data` so senders know to pay it. Cost is in leading zero bits, so difficulty doubles per step — 8 is about a second on a phone, 16 is minutes. `0` announces no cost and checks nothing. The only limit here that charges the *sender*; everything else caps what we do after the message has arrived. Range `0`–`254`. |
+| `enforce_inbound_stamps` | bool | `false`                     | Drop messages that don't clear `inbound_stamp_cost` instead of accepting them and logging what they paid (SPEC §5.7.4; matches upstream LXMF's `_enforce_stamps` default). Watch the `inbound stamp:` log lines first — a client that doesn't implement stamps becomes silently undeliverable to the group the moment this goes on. Requires `inbound_stamp_cost > 0`. |
 | `dedup_window`       | duration | `"1h"`                      | Remember each inbound `message_id` for this long and drop redeliveries (multi-path / retransmit / propagation replay) before forwarding. `0` disables. |
 | `forward_attachments`| bool     | `true`                      | Pass LXMF non-text fields (images, etc.) through forwarding. `false` forwards text only; a sender whose file, image or audio is dropped is told so privately. |
 | `max_attachment_bytes`| int     | `1024000` (1000 KiB)        | Per-field msgpack size cap. Oversize attachments are dropped with an inline `[image not forwarded: …]` note on the forwarded body; text body still delivers. `0` disables the cap. |
@@ -947,10 +949,15 @@ round-trip with a third-party LXMF client.
   link-encrypt the body, slice into raw-ciphertext parts, advertise
   via msgpack ADV, fulfill receiver-driven REQs, validate the
   receiver's RESOURCE_PRF in constant time. Receive: parse ADV,
-  fetch parts, verify, decrypt. Up to 256 KiB / 74 parts per
+  fetch parts, verify, decrypt. Roughly 1 MiB / 74 parts per
   resource; inbound `c=1` (bz2-compressed) and `n>74` ADVs are
   rejected (bomb defense — see
   [`docs/resource-security-audit.md`](docs/resource-security-audit.md)).
+  Multi-segment transfers (§10.11) are **received** — the library
+  reassembles up to 16 segments — but not **sent**: the send path is
+  single-segment, so `fwdsvc` can accept a body it could not relay.
+  In practice `max_attachment_bytes` drops the oversize field first,
+  which is what keeps every forwarded message single-segment.
 
 Delivery-path selection is automatic: ≤ ~280 bytes is opportunistic,
 ≤ 431 bytes plaintext over a Reticulum Link is single-packet Link
@@ -1034,17 +1041,25 @@ LXMF to run a group-chat hub. Notable gaps:
   interface drops, the service logs and continues; you have to
   restart it. Use systemd `Restart=on-failure` (already in the
   recipe above).
-- **No ratchets / forward secrecy.** Long-term X25519 key is used
-  for every Token cipher. Future-key compromise means past messages
-  are decryptable.
-- **Stamps: outbound only.** Both §5.7 proof-of-work flavors are
-  generated — delivery stamps for recipients whose announce declares
-  a `stamp_cost`, and propagation stamps for nodes that require them.
-  Inbound stamps are tolerated but never *validated*, and tickets
-  (§5.7.3) are not implemented, so fwdsvc can only pay proof-of-work,
-  never charge it. A sender therefore costs the group nothing to
-  message, which is what makes the fan-out worth rate-limiting by
-  other means.
+- **No ratchets on our own key.** `fwdsvc` publishes no §7.3 ratchet,
+  so every message sent *to* the group is encrypted to our long-term
+  X25519 key and a future compromise of it decrypts past traffic.
+  Outbound is better off: since the library gained ratchet support we
+  encrypt to a *peer's* announced ratchet automatically when they
+  publish one, so what we send to a ratcheting member is already
+  forward-secret. Enabling one on our side is a config and key-rotation
+  question, not a protocol gap.
+- **Stamps: both directions, charging is opt-in.** Both §5.7 proof-of-
+  work flavors are generated — delivery stamps for recipients whose
+  announce declares a `stamp_cost`, and propagation stamps for nodes
+  that require them. Inbound stamps are now validated and scored as
+  well: set `inbound_stamp_cost` and every sender pays before the
+  fan-out, with `enforce_inbound_stamps` deciding whether a message
+  that underpays is dropped or merely logged. Both default to off, so
+  out of the box a sender still costs the group nothing to message and
+  the fan-out is worth rate-limiting by other means. Tickets (§5.7.3)
+  are supported by the library but not wired up here, so a member has
+  no way to earn an exemption from the grind yet.
 - **Propagation: sender side only.** fwdsvc can *submit* messages to
   a propagation node (see `[propagation]`), but does not act as a
   propagation node itself and does not retrieve its own inbound mail

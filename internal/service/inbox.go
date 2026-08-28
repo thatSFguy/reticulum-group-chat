@@ -47,6 +47,23 @@ func (s *Service) onLXMFReceived(msg *lxmf.Message) {
 		return
 	}
 
+	// Stamp observation (SPEC §5.7.2 step 3). Populated only when
+	// service.inbound_stamp_cost is set. StampChecked false means no
+	// check was ATTEMPTED — either we require nothing, or the library
+	// shed the validation under load (lxmf.MaxConcurrentStampValidations)
+	// — not that the stamp was absent, so StampValid is meaningless
+	// without it.
+	//
+	// Logged after the banlist so a banned sender can't drive log volume,
+	// and logged at all because it is the only way to size
+	// enforce_inbound_stamps before turning it on: under enforcement a
+	// message that fails never reaches here, so what appears below is
+	// exactly the traffic that would start being dropped.
+	if msg.StampChecked {
+		s.logger.Printf("inbound stamp: from=%s valid=%v value=%d required=%d",
+			senderHex[:8], msg.StampValid, msg.StampValue, s.cfg.Service.InboundStampCost)
+	}
+
 	// Diagnostic: dump the inbound shape (sender prefix, content length,
 	// raw fields-map key list with concrete Go types). Lets us see exactly
 	// what the wire is delivering when reactions / replies vanish before
