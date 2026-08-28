@@ -13,16 +13,20 @@
 > - `MaxAcceptedResourceSize` is no longer 256 KiB. It is
 >   `MaxEfficientSize + 8 KiB` (~1032 KiB), so the F4 allocation bound
 >   is four times what is written below.
-> - **F3 is no longer true of the receive path.** As of `reticulum-go`
->   v0.5.0 inbound multi-segment transfers (SPEC §10.11) are accepted
->   and reassembled, up to 16 segments — they are not refused with a
->   "multi-segment not yet implemented" error. F3's *sender-side*
->   reasoning still holds: our send path is single-segment, and
->   `NewResourceSender` still refuses a body that would need more.
+> - **F3's conclusion still holds, by a different mechanism.**
+>   `reticulum-go` v0.5.0 made inbound multi-segment transfers (SPEC
+>   §10.11) acceptable and reassembled rather than refused. v0.6.0 made
+>   the ceiling per-Transport, and `fwdsvc` sets
+>   `SetMaxResourceSegments(1)`, so `l>1` is once again refused in both
+>   directions — inbound before any receiver state is allocated. It is
+>   now a policy we choose rather than a gap in the library, and a
+>   future maintainer could turn it back on.
 >
-> The threat reasoning in each finding is what remains useful. A
-> follow-up hardening pass on the multi-segment assembler's memory
-> bounds is tracked in the `reticulum-go` repo.
+> The threat reasoning in each finding is what remains useful. The
+> follow-up hardening pass on the assembler's memory bounds landed in
+> `reticulum-go` v0.6.0: 64 MiB retained across all links, one partial
+> assembly per link, idle and absolute expiry, and release on link
+> teardown, against a prior ceiling near 5.8 GiB.
 
 **Scope:** the RNS Resource transfer implementation in `internal/rns/`
 (`resource.go`, `resource_hash.go`, `resource_adv.go`, `resource_wire.go`,

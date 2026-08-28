@@ -953,11 +953,13 @@ round-trip with a third-party LXMF client.
   resource; inbound `c=1` (bz2-compressed) and `n>74` ADVs are
   rejected (bomb defense — see
   [`docs/resource-security-audit.md`](docs/resource-security-audit.md)).
-  Multi-segment transfers (§10.11) are **received** — the library
-  reassembles up to 16 segments — but not **sent**: the send path is
-  single-segment, so `fwdsvc` can accept a body it could not relay.
-  In practice `max_attachment_bytes` drops the oversize field first,
-  which is what keeps every forwarded message single-segment.
+  Multi-segment transfers (§10.11) are **refused in both directions**
+  (`SetMaxResourceSegments(1)`): the send path is single-segment, so
+  accepting one inbound would mean reassembling a body `fwdsvc` then
+  could not relay. An oversize sender gets a `RESOURCE_RCL` and stops
+  retransmitting rather than timing out. `max_attachment_bytes` drops
+  the oversize field before forwarding, which is what keeps every
+  relayed message inside one segment to begin with.
 
 Delivery-path selection is automatic: ≤ ~280 bytes is opportunistic,
 ≤ 431 bytes plaintext over a Reticulum Link is single-packet Link
