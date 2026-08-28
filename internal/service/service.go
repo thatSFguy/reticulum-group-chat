@@ -166,6 +166,21 @@ func New(cfg *config.Config) (*Service, error) {
 	// from the LXMF body. Required for cross-client group reactions to
 	// reach the relay rather than going direct-to-original-sender.
 	transport.SetInitiatorIdentity(id)
+	// Refuse SPEC §10.11 multi-segment Resources in both directions.
+	//
+	// fwdsvc cannot re-emit one: the send path is single-segment, so
+	// accepting a multi-segment inbound means reassembling a body we
+	// would then fail to relay — paying the memory for a transfer that
+	// cannot reach the roster. Declining it up front is honest and
+	// cheap; the sender gets a RESOURCE_RCL and stops retransmitting
+	// instead of timing out.
+	//
+	// This restores the behaviour we had before reticulum-go v0.5.0,
+	// which rejected l>1 unconditionally. The library still bounds what
+	// it retains for consumers who do want multi-segment (64 MiB across
+	// all links, one partial assembly per link); this simply declines
+	// the feature rather than relying on those bounds.
+	transport.SetMaxResourceSegments(1)
 	// buildAnnounceWithContext is the same announce body as our periodic
 	// announce, but we let the caller pick the context byte so the
 	// Transport can mint path-response announces (context 0x0B) on
