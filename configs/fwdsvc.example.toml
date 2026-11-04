@@ -23,6 +23,15 @@ mods = [
 # Shown in our LXMF announces. Visible to all Reticulum nodes.
 display_name = "Group Chat - send /join"
 
+# There is no `info` key here on purpose: the longer group description that
+# /info returns is set from chat by an admin (`/setinfo <text>`) and stored
+# next to the roster in <state_dir>/groupinfo.json, alongside the pinned
+# messages. /info answers non-members too — it exists so someone who has
+# heard the announce can find out what the group is before joining — which
+# is why the description is capped so the whole /info reply, display_name
+# included, stays one packet on a slow link. A longer display_name leaves
+# less room; fwdsvc warns at startup if a stored description no longer fits.
+
 # Where to store the service's identity, roster, and replay buffer.
 # Tilde is expanded.
 identity_path = "~/.fwdsvc/identity"
@@ -182,6 +191,17 @@ timeout = "10s"
 # replay entirely.
 count   = 100
 max_age = "7d"
+
+# Also send the pinned-message list (/pins) to a new member, AFTER the
+# history replay above. Last, deliberately: the replay arrives as a burst of
+# separate messages, so anything sent ahead of it is the first thing to
+# scroll off — the pins are what's on screen when the burst stops.
+#
+# Costs nothing when nothing is pinned (an empty list sends no message), and
+# the whole list goes as ONE message however many pins it holds. Set false on
+# a very slow segment if you'd rather a joiner spend their airtime on real
+# traffic. Mods manage the list with /pin <text> and /unpin <n>.
+pins_on_join = true
 
 [propagation]
 # Store-and-forward delivery via LXMF propagation nodes. When enabled,

@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/thatSFguy/reticulum-group-chat/internal/config"
+	"github.com/thatSFguy/reticulum-group-chat/internal/groupinfo"
 	"github.com/thatSFguy/reticulum-group-chat/internal/roster"
 	"github.com/thatSFguy/reticulum-group-chat/internal/version"
 )
@@ -56,6 +57,12 @@ type PathInfo struct {
 type Dispatcher struct {
 	Cfg    *config.Config
 	Roster *roster.Roster
+
+	// Info is the group description + pinned-message store backing /info,
+	// /setinfo, /pins, /pin and /unpin. Nil in unit tests that exercise
+	// unrelated commands; every handler that touches it says so rather than
+	// panicking, the same way /path reports an unwired PathLookup.
+	Info *groupinfo.Store
 
 	// Announce, when set, is invoked by the /announce command to trigger
 	// an immediate fresh announce broadcast. Mod/admin only.
@@ -114,6 +121,16 @@ func (d *Dispatcher) Dispatch(senderHash string, parsed Parsed) string {
 		return helpText(caller)
 	case "about", "version":
 		return aboutText()
+	case "info":
+		return d.handleInfo(caller)
+	case "setinfo":
+		return d.handleSetInfo(caller, parsed.Rest)
+	case "pins":
+		return d.handlePins(caller)
+	case "pin":
+		return d.handlePin(caller, parsed.Rest)
+	case "unpin":
+		return d.handleUnpin(caller, parsed.Args)
 	case "users":
 		// Members only. The roster (nicknames + hash prefixes) is
 		// group-internal information, and the reply is one line per
@@ -249,11 +266,13 @@ func helpText(c *Caller) string {
 	b.WriteString("Commands:\n")
 	b.WriteString("/?, /help\n")
 	b.WriteString("/about - version + repo\n")
+	b.WriteString("/info - about this group\n")
 	b.WriteString("/users /mods /admin - lists\n")
 
 	if !c.Member {
 		b.WriteString("/join - join the chat\n")
 	} else {
+		b.WriteString("/pins - pinned messages\n")
 		b.WriteString("/nick NAME - rename self\n")
 		b.WriteString("/leave - leave the chat\n")
 		b.WriteString("/pause /resume - mute/unmute\n")
@@ -264,8 +283,10 @@ func helpText(c *Caller) string {
 		b.WriteString("/nick USER NAME - mod\n")
 		b.WriteString("/kick /ban /unban /path USER - mod\n")
 		b.WriteString("/adduser HASH /removeuser USER - mod\n")
+		b.WriteString("/pin TEXT /unpin N - mod\n")
 		b.WriteString("/announce - mod\n")
 		if c.Role == RoleAdmin {
+			b.WriteString("/setinfo TEXT - admin\n")
 			b.WriteString("/usermode ROLE USER - admin\n")
 		}
 		b.WriteString("USER = nick or hex (>=4)")
