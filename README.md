@@ -112,6 +112,17 @@ messages addressed to a destination hash, deliverable opportunistically
 - **Replay on join.** New (and returning) members receive the most
   recent buffered messages so they can read the prior conversation.
   Defaults: last 100 messages, nothing older than 7 days. Configurable.
+- **Group description and pinned messages.** `/info` answers *anyone*,
+  member or not, with the group's display name and an admin-set
+  description — so someone who has heard the announce can find out what
+  they've found before joining. Mods keep a short pinned list with
+  `/pin` and `/unpin`; new members receive it **after** their replay
+  finishes, which is where it's still on screen. Both are capped
+  because `/info` answers unauthenticated callers and the pin list ships
+  on every join: the description must leave the whole `/info` reply
+  inside one packet (with a 30-character display name, about 215 bytes
+  for an open group or 160 for a locked one, whose reply also carries the
+  asker's address; never more than 256), and pins are 10 × 200 bytes.
 - **Pause without leaving.** A member can `/pause` to stop receiving
   (and sending) forwards while staying on the roster. `/resume` reverses.
 - **Per-message char cap** (`max_inbound_chars`, default 500). Oversize
@@ -308,6 +319,8 @@ everything.
 |---|---|---|
 | `/?` or `/help`           | anyone      | List commands available to you |
 | `/about` or `/version`    | anyone      | Show version and repo URL |
+| `/info`                   | anyone      | What this group is: display name, the admin-set description, and how to get in. Deliberately open to non-members — it's how someone who has heard the announce finds out what they've found. |
+| `/pins`                   | members     | The pinned-message list, same text new members get after their join replay. |
 | `/users`                  | members     | List roster (paused members marked `[paused]`). Long rosters list the first 200 with a "… and N more" footer; the total is always shown. |
 | `/mods`                   | anyone      | List configured mods |
 | `/admin`                  | anyone      | List configured admins |
@@ -329,6 +342,9 @@ everything.
 | `/unban <user>`           | mods, admins | Remove from banlist |
 | `/adduser <hash>`         | mods, admins | Add a user by their 32-hex destination hash — the invite path for a `locked` group. Adds them to the roster and sends a welcome + replay. |
 | `/removeuser <user>`      | mods, admins | Remove a member. In a `locked` group they can't return until re-added (unlike `/kick`, which lets them `/join` again in an open group). Not punitive like `/ban`. |
+| `/pin <text>`             | mods, admins | Pin a message for the group — shown by `/pins` and replayed to every new member after their history catch-up. Max 10 pins, 200 bytes each. |
+| `/unpin <n>`              | mods, admins | Remove pin `n`, using the number `/pins` prints. |
+| `/setinfo <text>`         | admins       | Set the group description `/info` returns. It must fit, with the display name, in one packet — roughly 280 bytes shared, 256 at most for the description; a refusal tells you the exact room left. No argument clears it. |
 | `/announce`               | mods, admins | Broadcast a fresh Reticulum announce immediately |
 | `/path <user>`            | mods, admins | Show what the transport knows about reaching `<user>`: cached announce age, hop count, next-hop transport_id, whether an Active Link is open. Mostly for troubleshooting delivery problems. The hop count is approximate: peers running RNS ≥ 1.3.7 with the `local_hops_delta` privacy option inflate it by a constant 2–7 (SPEC §2.4). |
 | `/usermode <admin\|mod\|user> <user>` | admins | Grant or clear a runtime role for a roster member — no config edit or restart needed. `admin`/`mod` promote; `user` clears the runtime grant. |
@@ -474,6 +490,11 @@ addr = "10.0.0.42:4242"   # your own rnsd on the LAN
 |---|---|---|---|
 | `count`   | int      | `100` | Max messages replayed when a member joins (or rejoins). `0` disables replay entirely. |
 | `max_age` | duration | `"7d"` | Skip messages older than this in replay. |
+| `pins_on_join` | bool | `true` | Also send the pinned-message list to a new member, **after** the replay. The replay lands as a burst of separate messages, so pins sent first would be the first thing to scroll off; sent last they're what's on screen when the burst stops. Free when nothing is pinned, and the whole list goes as one message. |
+
+Both halves of the join catch-up share one per-destination cooldown
+(10 minutes), so a `/leave` + `/join` cycle can't be used to re-trigger
+the burst.
 
 ### `[propagation]`
 
@@ -774,6 +795,7 @@ Everything lives in the directory whose paths you configured in
 | `history.json`      | Replay ring buffer. | Optional (loss only affects replay-on-join) |
 | `outbound.json`     | Pending outbound retries. | Optional (loss costs at most a few queued messages) |
 | `announces.json`    | Cached peer paths. | No (regenerates from inbound announces) |
+| `groupinfo.json`    | Group description (`/info`) and pinned messages (`/pins`). | Yes — operator-authored text, not derivable from anything else |
 | `fwdsvc.log`        | If `log_path` is set, the rolling daemon log. | No |
 
 ### Logs
@@ -874,7 +896,8 @@ restart — the cache will rebuild from live announces (cost: one
 3. Start the service.
 
 The on-disk state format is stable; new versions read older
-`state.json`, `history.json`, `outbound.json`, `announces.json`
+`state.json`, `history.json`, `outbound.json`, `announces.json`,
+`groupinfo.json`
 files. If a future release ever breaks compatibility it'll be called
 out in the release notes.
 

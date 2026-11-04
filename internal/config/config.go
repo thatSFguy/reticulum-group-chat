@@ -316,6 +316,24 @@ type InterfaceConfig struct {
 type ReplayConfig struct {
 	Count  int      `toml:"count"`
 	MaxAge Duration `toml:"max_age"`
+
+	// PinsOnJoin controls whether the pinned-message list (/pins) is sent
+	// to a user on join, AFTER their history replay. Default true.
+	//
+	// After, not before, and that ordering is the point: the replay is a
+	// wall of older traffic the joiner is scrolling past, so a pins block
+	// ahead of it is the first thing pushed off the screen. Sent last it is
+	// what they are looking at when the burst stops — which is the whole
+	// reason issue #20 asked for pins to be played back on join rather than
+	// left for the joiner to go and ask for.
+	//
+	// Defaulting on is safe because an empty pin list renders nothing and
+	// sends nothing: a group that never pins pays exactly what it paid
+	// before. Operators on a very slow segment who would rather a joiner
+	// spend their budget on real traffic can set it false. The list is one
+	// message regardless of how many pins it holds, and the same
+	// per-destination cooldown that bounds replay bounds it too.
+	PinsOnJoin bool `toml:"pins_on_join"`
 }
 
 // Duration extends Go's time.Duration with a "d" (day) and "w" (week) suffix
@@ -440,8 +458,9 @@ func defaults() *Config {
 			IDCacheMax:         10000,
 		},
 		Replay: ReplayConfig{
-			Count:  100,
-			MaxAge: Duration(7 * 24 * time.Hour),
+			Count:      100,
+			MaxAge:     Duration(7 * 24 * time.Hour),
+			PinsOnJoin: true,
 		},
 		Propagation: PropagationConfig{
 			Enabled:        false,

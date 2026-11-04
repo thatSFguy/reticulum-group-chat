@@ -21,6 +21,7 @@ import (
 	"github.com/thatSFguy/reticulum-go/rns"
 	"github.com/thatSFguy/reticulum-group-chat/internal/commands"
 	"github.com/thatSFguy/reticulum-group-chat/internal/config"
+	"github.com/thatSFguy/reticulum-group-chat/internal/groupinfo"
 	"github.com/thatSFguy/reticulum-group-chat/internal/history"
 	"github.com/thatSFguy/reticulum-group-chat/internal/idmap"
 	"github.com/thatSFguy/reticulum-group-chat/internal/roster"
@@ -52,6 +53,7 @@ type Service struct {
 	delivery   *lxmf.Delivery
 	roster     *roster.Roster
 	history    *history.Log
+	info       *groupinfo.Store
 	dispatcher *commands.Dispatcher
 	outbound   *OutboundQueue
 
@@ -102,6 +104,14 @@ func New(cfg *config.Config) (*Service, error) {
 	hist, err := history.New(cfg.Service.HistoryPath, cfg.Replay.Count)
 	if err != nil {
 		return nil, fmt.Errorf("load history: %w", err)
+	}
+	// Group description + pins. Sited next to the roster rather than given
+	// its own config key, the way the announce cache is: it is derived
+	// state for one service instance, and an operator who moves state_path
+	// expects the whole of that instance to move with it.
+	info, err := groupinfo.New(groupInfoPath(cfg.Service.StatePath))
+	if err != nil {
+		return nil, fmt.Errorf("load group info: %w", err)
 	}
 
 	logWriter, err := openLogWriter(cfg.Service.LogPath)
@@ -280,6 +290,7 @@ func New(cfg *config.Config) (*Service, error) {
 		delivery:       delivery,
 		roster:         r,
 		history:        hist,
+		info:           info,
 		outbound:       outbound,
 		idmap:          idCache,
 		dedup:          dedup,
@@ -291,6 +302,7 @@ func New(cfg *config.Config) (*Service, error) {
 	svc.dispatcher = &commands.Dispatcher{
 		Cfg:                 cfg,
 		Roster:              r,
+		Info:                info,
 		Announce:            svc.announceNow,
 		PathLookup:          svc.pathLookup,
 		OnJoin:              svc.onJoin,
@@ -362,6 +374,16 @@ func (s *Service) Run(ctx context.Context) error {
 	}
 	s.logger.Printf("roster size         : %d", len(s.roster.Hashes()))
 	s.logger.Printf("history size        : %d", s.history.Len())
+	s.logger.Printf("pinned messages     : %d", s.info.PinCount())
+	// /setinfo sized the description against the display name in force at
+	// the time; an operator can lengthen display_name or flip `locked` at
+	// any restart, after which the stored description no longer fits. The
+	// reply still delivers — it just goes over a Link, so every stranger's
+	// /info costs a link setup — so this warns rather than refusing to
+	// start, and says exactly how much to cut.
+	if over := s.dispatcher.InfoOverflow(s.info.Info()); over > 0 && s.info.Info() != "" {
+		s.logger.Printf("config warning: the group description makes /info %d bytes too long for one packet with this display_name; non-members' /info will go over a Link until it is shortened (/setinfo)", over)
+	}
 	if s.cfg.Propagation.Enabled {
 		node := "auto-discover"
 		if s.cfg.Propagation.Node != "" {
@@ -464,16 +486,18 @@ func (s *Service) buildAnnounce() (*rns.Packet, error) {
 	return rns.BuildAnnounce(s.identity, lxmf.FullName(), appData, nil)
 }
 
-// onJoin is the /join post-action hook — fires replay-on-join for the
-// newly-joined user so they catch up on recent history.
+// onJoin is the /join post-action hook — fires the join catch-up (history
+// replay, then pins) for the newly-joined user.
+//
+// The old `if Replay.Count > 0` gate lived here; it now lives inside
+// sendJoinCatchup, which has to weigh the pin list as well. A group that
+// runs with replay disabled still wants its pins delivered.
 func (s *Service) onJoin(senderHex string) {
 	bytes, err := hex.DecodeString(senderHex)
 	if err != nil || len(bytes) != 16 {
 		return
 	}
-	if s.cfg.Replay.Count > 0 {
-		go s.replayHistoryTo(bytes, s.now())
-	}
+	go s.sendJoinCatchup(bytes, s.now())
 }
 
 // enrollConfigRoles adds every config admin/mod not already in the roster
@@ -518,9 +542,7 @@ func (s *Service) onAdminAdd(addedHex string) {
 	welcome := fmt.Sprintf("You've been added to %s. Send /? for help, /leave to exit.",
 		s.cfg.Service.DisplayName)
 	s.outbound.Enqueue(bytes, []byte(welcome))
-	if s.cfg.Replay.Count > 0 {
-		go s.replayHistoryTo(bytes, s.now())
-	}
+	go s.sendJoinCatchup(bytes, s.now())
 }
 
 // lookupAnnouncedName returns the announced display name for a peer
