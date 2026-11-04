@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"reflect"
 	"regexp"
 	"strconv"
 	"strings"
@@ -29,6 +30,24 @@ type Config struct {
 	Propagation PropagationConfig `toml:"propagation"`
 	Admins      []string          `toml:"admins"`
 	Mods        []string          `toml:"mods"`
+
+	// Warnings holds non-fatal problems found while loading — currently
+	// keys the file sets that no field consumes. Load cannot log (it runs
+	// before the logger is configured and is shared with tests), so the
+	// caller prints these at startup.
+	//
+	// This exists because an unrecognised key used to be dropped without
+	// a word. An operator put inbound_stamp_cost and
+	// enforce_inbound_stamps at the top of the file beside admins/mods —
+	// the header comment says those two must go there — and TOML scoped
+	// them to the root table, where nothing reads them. The relay started
+	// cleanly with stamps fully off while the operator believed
+	// enforcement was on; even normalize's "enforce requires cost > 0"
+	// check never fired, because neither value arrived.
+	//
+	// A warning rather than an error so that an upgrade cannot refuse to
+	// start a deployment that has been carrying a harmless stray key.
+	Warnings []string `toml:"-"`
 }
 
 // PropagationConfig controls store-and-forward delivery via LXMF
@@ -335,13 +354,69 @@ func Load(path string) (*Config, error) {
 		return nil, err
 	}
 	c := defaults()
-	if _, err := toml.DecodeFile(expanded, c); err != nil {
+	md, err := toml.DecodeFile(expanded, c)
+	if err != nil {
 		return nil, fmt.Errorf("read config %s: %w", expanded, err)
 	}
 	if err := c.normalize(); err != nil {
 		return nil, err
 	}
+	c.Warnings = unknownKeyWarnings(md.Undecoded())
 	return c, nil
+}
+
+// sectionsByKey maps each key that belongs inside a [section] to the
+// section names that accept it, read off the struct tags so it cannot
+// drift from the fields themselves. Only single-table sections are
+// included: [[interfaces]] is an array of tables, and a bare top-level
+// "addr" is ambiguous enough that naming it is better than guessing.
+func sectionsByKey() map[string][]string {
+	out := map[string][]string{}
+	ct := reflect.TypeOf(Config{})
+	for i := 0; i < ct.NumField(); i++ {
+		f := ct.Field(i)
+		if f.Type.Kind() != reflect.Struct {
+			continue
+		}
+		section := tagName(f)
+		for j := 0; j < f.Type.NumField(); j++ {
+			if k := tagName(f.Type.Field(j)); k != "" {
+				out[k] = append(out[k], section)
+			}
+		}
+	}
+	return out
+}
+
+func tagName(f reflect.StructField) string {
+	name, _, _ := strings.Cut(f.Tag.Get("toml"), ",")
+	if name == "-" {
+		return ""
+	}
+	return name
+}
+
+// unknownKeyWarnings renders one line per key the decoder did not
+// consume. The common way to get here is a section key written at the
+// top level — easy to do because admins/mods must be top-level and the
+// file invites you to add things near them — so that case names the
+// section the key belongs in.
+func unknownKeyWarnings(keys []toml.Key) []string {
+	if len(keys) == 0 {
+		return nil
+	}
+	homes := sectionsByKey()
+	var out []string
+	for _, k := range keys {
+		msg := fmt.Sprintf("config key %q is not recognised and has no effect", k.String())
+		if len(k) == 1 {
+			if secs := homes[k[0]]; len(secs) > 0 {
+				msg += fmt.Sprintf(" (it belongs under [%s] — keys after a [section] header, or before the first one, are scoped by TOML to that position)", strings.Join(secs, "] or ["))
+			}
+		}
+		out = append(out, msg)
+	}
+	return out
 }
 
 func defaults() *Config {
