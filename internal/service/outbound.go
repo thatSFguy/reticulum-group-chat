@@ -1,6 +1,7 @@
 package service
 
 import (
+	"bytes"
 	"context"
 	"crypto/rand"
 	"encoding/hex"
@@ -115,6 +116,27 @@ type outboundMessage struct {
 	// direct delivery exhausts its retry budget in "fallback" mode.
 	// Persisted so a restart doesn't demote a message back to direct.
 	Propagated bool `json:"propagated,omitempty"`
+
+	// AfterEarlier holds this message until every message queued before it
+	// to the same recipient has left the queue — delivered, failed for
+	// good, or expired. Set by EnqueueAfterEarlier; nothing else uses it.
+	//
+	// The queue does not otherwise preserve per-recipient order, and that
+	// is deliberate: outboundWorkers sends run in parallel and pickDue
+	// only keeps two workers off the SAME message, so consecutive messages
+	// to one recipient can be on the wire at once, and any one that fails
+	// retries after a backoff while the rest go ahead. That is the right
+	// default — head-of-line avoidance is why the pool exists — but it
+	// meant the pinned-message block a joiner gets after their history
+	// replay could arrive in the middle of it, or first, which is the one
+	// place it is guaranteed to scroll off unread. This flag gives that one
+	// message an ordering guarantee without serialising anything else.
+	//
+	// It cannot wedge the queue: every message ahead of it leaves within
+	// maxDeliveryAttempts or maxQueueAge, whichever comes first, and a
+	// held message's own maxQueueAge clock keeps running regardless.
+	// Persisted, so a restart mid-replay keeps the hold.
+	AfterEarlier bool `json:"after_earlier,omitempty"`
 }
 
 // outboundSender is the subset of *lxmf.Delivery + *rns.Transport the
@@ -149,7 +171,7 @@ type outboundSender interface {
 // OutboundQueue runs outbound LXMF deliveries through Delivery.Send with
 // retry semantics matching LXMF 0.9.7's LXMRouter.process_outbound.
 //
-// Sends run on a small worker pool (outboundWorkers, default 4) so a
+// Sends run on a small worker pool (outboundWorkers, default 8) so a
 // slow link send to one recipient doesn't block command replies or
 // forwards to others — head-of-line avoidance is the main reason for
 // concurrency here. Each worker independently picks the next due
@@ -325,13 +347,26 @@ func (q *OutboundQueue) EnqueueWithFields(recipient, body []byte, fields map[any
 // reply-tos can later be rewritten per recipient. Bubble is in-memory
 // only — not persisted.
 func (q *OutboundQueue) EnqueueBubble(recipient, body []byte, fields map[any]any, bubble *idmap.Bubble) string {
+	return q.enqueue(recipient, body, fields, bubble, false)
+}
+
+// EnqueueAfterEarlier is Enqueue for a message that must not be sent until
+// everything already queued to the same recipient is gone — see
+// outboundMessage.AfterEarlier for why the queue does not give that order
+// by default.
+func (q *OutboundQueue) EnqueueAfterEarlier(recipient, body []byte) string {
+	return q.enqueue(recipient, body, nil, nil, true)
+}
+
+func (q *OutboundQueue) enqueue(recipient, body []byte, fields map[any]any, bubble *idmap.Bubble, afterEarlier bool) string {
 	msg := &outboundMessage{
-		ID:         newMessageID(),
-		Recipient:  append([]byte(nil), recipient...),
-		Body:       append([]byte(nil), body...),
-		Fields:     fields,
-		Bubble:     bubble,
-		EnqueuedAt: q.now(),
+		ID:           newMessageID(),
+		Recipient:    append([]byte(nil), recipient...),
+		Body:         append([]byte(nil), body...),
+		Fields:       fields,
+		Bubble:       bubble,
+		EnqueuedAt:   q.now(),
+		AfterEarlier: afterEarlier,
 	}
 	q.mu.Lock()
 	// Refuse past the cap rather than growing without bound. Dropping
@@ -463,11 +498,14 @@ func (q *OutboundQueue) pickDue() *outboundMessage {
 	var bestSeen time.Time
 	var bestKnown bool
 
-	for _, m := range q.pending {
+	for i, m := range q.pending {
 		if q.inFlight[m.ID] {
 			continue
 		}
 		if !m.NextAttempt.IsZero() && m.NextAttempt.After(now) {
+			continue
+		}
+		if m.AfterEarlier && hasEarlierFor(q.pending[:i], m.Recipient) {
 			continue
 		}
 		seen, known := q.sender.LastAnnounceFor(m.Recipient)
@@ -488,6 +526,20 @@ func (q *OutboundQueue) pickDue() *outboundMessage {
 		q.inFlight[best.ID] = true
 	}
 	return best
+}
+
+// hasEarlierFor reports whether any message in ahead is addressed to
+// recipient. q.pending is append-ordered and retries keep their slot, so a
+// lower index is always an earlier enqueue. In-flight messages count: one
+// that is mid-send has not been delivered yet. Linear, but only ever run
+// for the rare AfterEarlier message, never on the common path.
+func hasEarlierFor(ahead []*outboundMessage, recipient []byte) bool {
+	for _, m := range ahead {
+		if bytes.Equal(m.Recipient, recipient) {
+			return true
+		}
+	}
+	return false
 }
 
 // attempt fires one Send for msg and updates state from the outcome.

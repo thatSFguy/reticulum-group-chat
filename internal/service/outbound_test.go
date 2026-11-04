@@ -900,3 +900,77 @@ func TestStampWorkersBusyDefersWithoutSpendingAnAttempt(t *testing.T) {
 		t.Errorf("pendingCount after slot freed = %d, want 0", got)
 	}
 }
+
+// TestAfterEarlierHoldsBehindSameRecipientOnly: a held message waits for
+// everything queued before it to the SAME recipient — including one that is
+// mid-retry or in flight — and is not held back by traffic to anyone else.
+func TestAfterEarlierHoldsBehindSameRecipientOnly(t *testing.T) {
+	sender := &fakeSender{}
+	q := newTestQueue(t, sender, nil)
+	alice := bytes.Repeat([]byte{0x01}, 16)
+	bob := bytes.Repeat([]byte{0x02}, 16)
+
+	q.Enqueue(alice, []byte("a1"))
+	q.Enqueue(bob, []byte("b1"))
+	q.EnqueueAfterEarlier(alice, []byte("a-last"))
+
+	// a1 is backing off after a failure: not due, but still ahead.
+	q.mu.Lock()
+	q.pending[0].NextAttempt = time.Now().Add(time.Hour)
+	q.mu.Unlock()
+
+	for i := 0; i < 3; i++ {
+		q.processOnce(context.Background())
+	}
+	sender.mu.Lock()
+	sent := make([]string, 0, len(sender.sendCalls))
+	for _, b := range sender.sendCalls {
+		sent = append(sent, string(b))
+	}
+	sender.mu.Unlock()
+	if len(sent) != 1 || sent[0] != "b1" {
+		t.Fatalf("sent %q, want only b1 (a-last held behind a1, bob unaffected)", sent)
+	}
+
+	// An in-flight earlier message holds it too.
+	q.mu.Lock()
+	q.pending[0].NextAttempt = time.Time{}
+	q.inFlight[q.pending[0].ID] = true
+	q.mu.Unlock()
+	if m := q.pickDue(); m != nil {
+		t.Fatalf("pickDue offered %q while an earlier message to the same recipient was in flight", m.Body)
+	}
+
+	// Once a1 is gone, a-last is released.
+	q.mu.Lock()
+	delete(q.inFlight, q.pending[0].ID)
+	q.mu.Unlock()
+	q.processOnce(context.Background())
+	q.processOnce(context.Background())
+	if got := sender.sendCount(); got != 3 {
+		t.Fatalf("sendCount = %d, want 3 after a1 drained", got)
+	}
+	sender.mu.Lock()
+	defer sender.mu.Unlock()
+	if last := string(sender.sendCalls[2]); last != "a-last" {
+		t.Errorf("last send = %q, want a-last", last)
+	}
+}
+
+func TestAfterEarlierFlagPersistsAcrossReload(t *testing.T) {
+	dir := t.TempDir()
+	store := newOutboundStore(filepath.Join(dir, "outbound.json"))
+	q := newTestQueue(t, &fakeSender{}, store)
+	q.EnqueueAfterEarlier(bytes.Repeat([]byte{0x03}, 16), []byte("held"))
+	q.Flush()
+
+	q2 := newTestQueue(t, &fakeSender{}, store)
+	if err := q2.Load(); err != nil {
+		t.Fatal(err)
+	}
+	q2.mu.Lock()
+	defer q2.mu.Unlock()
+	if len(q2.pending) != 1 || !q2.pending[0].AfterEarlier {
+		t.Fatalf("AfterEarlier lost across reload: %+v", q2.pending)
+	}
+}
