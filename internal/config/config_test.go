@@ -441,3 +441,77 @@ func TestNormalizeRejectsEnforceWithoutCost(t *testing.T) {
 		t.Fatalf("enforce with cost 8 should be accepted: %v", err)
 	}
 }
+
+// TestLoadWarnsOnMisplacedKeys reproduces an operator config that put the
+// stamp settings at the top level beside admins/mods. Those keys used to
+// vanish silently; now Load must keep them out of ServiceConfig (TOML
+// scoping is not ours to second-guess) but say so, and point at [service].
+func TestLoadWarnsOnMisplacedKeys(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "c.toml")
+	body := "admins = []\n" +
+		"inbound_stamp_cost = 8\n" +
+		"enforce_inbound_stamps = true\n" +
+		"[service]\ndisplay_name = \"x\"\nno_such_key = 1\n"
+	if err := os.WriteFile(path, []byte(body), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	c, err := Load(path)
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if c.Service.InboundStampCost != 0 || c.Service.EnforceInboundStamps {
+		t.Fatalf("top-level stamp keys leaked into [service]: cost=%d enforce=%v",
+			c.Service.InboundStampCost, c.Service.EnforceInboundStamps)
+	}
+	if len(c.Warnings) != 3 {
+		t.Fatalf("want 3 warnings, got %d: %q", len(c.Warnings), c.Warnings)
+	}
+	for _, key := range []string{"inbound_stamp_cost", "enforce_inbound_stamps"} {
+		if !containsWarning(c.Warnings, `"`+key+`"`, "[service]") {
+			t.Errorf("no warning naming %s and [service] in %q", key, c.Warnings)
+		}
+	}
+	if !containsWarning(c.Warnings, `"service.no_such_key"`) {
+		t.Errorf("no warning for service.no_such_key in %q", c.Warnings)
+	}
+	if containsWarning(c.Warnings, `"service.no_such_key"`, "belongs under") {
+		t.Errorf("unknown in-section key should not get a section hint: %q", c.Warnings)
+	}
+}
+
+func TestLoadNoWarningsForCleanConfig(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "c.toml")
+	body := "admins = []\n[service]\ndisplay_name = \"x\"\ninbound_stamp_cost = 8\n" +
+		"[[interfaces]]\ntype = \"tcp_client\"\naddr = \"h:1\"\n"
+	if err := os.WriteFile(path, []byte(body), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	c, err := Load(path)
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if len(c.Warnings) != 0 {
+		t.Errorf("unexpected warnings: %q", c.Warnings)
+	}
+	if c.Service.InboundStampCost != 8 {
+		t.Errorf("InboundStampCost = %d, want 8", c.Service.InboundStampCost)
+	}
+}
+
+func containsWarning(ws []string, subs ...string) bool {
+	for _, w := range ws {
+		ok := true
+		for _, s := range subs {
+			if !strings.Contains(w, s) {
+				ok = false
+				break
+			}
+		}
+		if ok {
+			return true
+		}
+	}
+	return false
+}

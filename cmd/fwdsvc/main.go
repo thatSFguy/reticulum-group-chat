@@ -37,6 +37,9 @@ func main() {
 	}
 
 	log.Printf("fwdsvc %s starting (%s/%s)", Version, runtime.GOOS, runtime.GOARCH)
+	for _, w := range cfg.Warnings {
+		log.Printf("config warning: %s", w)
+	}
 
 	svc, err := service.New(cfg)
 	if err != nil {
