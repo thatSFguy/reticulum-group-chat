@@ -5,9 +5,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"io"
 	"io/fs"
-	"log"
 	"os"
 	"path/filepath"
 	"sync"
@@ -16,6 +14,7 @@ import (
 	"time"
 
 	"github.com/thatSFguy/reticulum-go/lxmf"
+	"github.com/thatSFguy/reticulum-group-chat/internal/logging"
 )
 
 // fakeSender records every Send/RequestPath call and lets a test inject
@@ -126,7 +125,7 @@ func (f *fakeSender) sendCount() int {
 
 func newTestQueue(t *testing.T, sender outboundSender, store *outboundStore) *OutboundQueue {
 	t.Helper()
-	q := newOutboundQueue(sender, store, log.New(io.Discard, "", 0))
+	q := newOutboundQueue(sender, store, logging.Discard())
 	q.now = time.Now
 	return q
 }

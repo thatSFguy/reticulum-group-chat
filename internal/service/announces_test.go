@@ -6,15 +6,14 @@ import (
 	"crypto/sha256"
 	"encoding/json"
 	"errors"
-	"io"
 	"io/fs"
-	"log"
 	"os"
 	"path/filepath"
 	"testing"
 	"time"
 
 	"github.com/thatSFguy/reticulum-go/rns"
+	"github.com/thatSFguy/reticulum-group-chat/internal/logging"
 )
 
 // makeKnownIdentity returns a syntactically-valid KnownIdentity for
@@ -204,7 +203,7 @@ func TestPersistTapWritesAsyncAndCoalesces(t *testing.T) {
 	transport := rns.NewTransport(nil)
 	transport.Restore(makeKnownIdentity(0x01, time.Now()))
 
-	tap := newAnnouncePersistTap(transport, store, log.New(io.Discard, "", 0))
+	tap := newAnnouncePersistTap(transport, store, logging.Discard())
 	tap.debounce = 20 * time.Millisecond
 
 	// Stop the run loop and WAIT for it to exit before the test
@@ -253,7 +252,7 @@ func TestPersistTapFinalSaveOnShutdown(t *testing.T) {
 	transport := rns.NewTransport(nil)
 	transport.Restore(makeKnownIdentity(0x02, time.Now()))
 
-	tap := newAnnouncePersistTap(transport, store, log.New(io.Discard, "", 0))
+	tap := newAnnouncePersistTap(transport, store, logging.Discard())
 	tap.debounce = time.Hour // never fires on its own
 
 	ctx, cancel := context.WithCancel(context.Background())

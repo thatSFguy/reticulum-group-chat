@@ -35,7 +35,7 @@ func (s *Service) onLXMFReceived(msg *lxmf.Message) {
 	if id := msg.DedupKey(); len(id) > 0 {
 		keyHex := hex.EncodeToString(id)
 		if s.dedup.seenBefore(keyHex, now) {
-			s.logger.Printf("duplicate inbound dropped: from=%s key=%s", senderHex[:8], keyHex[:8])
+			s.logger.Debugf("duplicate inbound dropped: from=%s key=%s", senderHex[:8], keyHex[:8])
 			return
 		}
 	}
@@ -43,7 +43,7 @@ func (s *Service) onLXMFReceived(msg *lxmf.Message) {
 	// Banlist check FIRST: a banned sender must not be able to drive any
 	// further work, least of all the field-key diagnostic below.
 	if s.roster.IsBanned(senderBytes) {
-		s.logger.Printf("dropping banned sender %s", senderHex[:8])
+		s.logger.Infof("dropping banned sender %s", senderHex[:8])
 		return
 	}
 
@@ -60,7 +60,7 @@ func (s *Service) onLXMFReceived(msg *lxmf.Message) {
 	// message that fails never reaches here, so what appears below is
 	// exactly the traffic that would start being dropped.
 	if msg.StampChecked {
-		s.logger.Printf("inbound stamp: from=%s valid=%v value=%d required=%d",
+		s.logger.Infof("inbound stamp: from=%s valid=%v value=%d required=%d",
 			senderHex[:8], msg.StampValid, msg.StampValue, s.cfg.Service.InboundStampCost)
 	}
 
@@ -84,7 +84,7 @@ func (s *Service) onLXMFReceived(msg *lxmf.Message) {
 			}
 			fieldKeys = append(fieldKeys, fmt.Sprintf("%v(%T)", k, k))
 		}
-		s.logger.Printf("inbound LXMF: from=%s content_len=%d field_count=%d field_keys=%v",
+		s.logger.Infof("inbound LXMF: from=%s content_len=%d field_count=%d field_keys=%v",
 			senderHex[:8], len(msg.Content), len(msg.Fields), fieldKeys)
 	}
 
@@ -92,7 +92,7 @@ func (s *Service) onLXMFReceived(msg *lxmf.Message) {
 	// (e.g. to add a user to the admins/mods list) without digging into
 	// state.json. Subsequent messages from the same sender don't re-log.
 	if !s.roster.Has(senderBytes) {
-		s.logger.Printf("new sender contact: full dest_hash = %s", senderHex)
+		s.logger.Infof("new sender contact: full dest_hash = %s", senderHex)
 	}
 
 	// Any inbound traffic from a member — a command, an over-limit message,
@@ -107,7 +107,7 @@ func (s *Service) onLXMFReceived(msg *lxmf.Message) {
 	// An actual forwarded chat message bumps last_message_at via
 	// MarkMessage further down.
 	if _, err := s.roster.Touch(senderBytes, now); err != nil {
-		s.logger.Printf("roster touch: %v", err)
+		s.logger.Warnf("roster touch: %v", err)
 	}
 
 	content := strings.TrimRight(string(msg.Content), "\r\n")
@@ -117,12 +117,12 @@ func (s *Service) onLXMFReceived(msg *lxmf.Message) {
 	// members. The dispatcher returns role/membership-aware replies.
 	if commands.IsCommand(content) {
 		parsed := commands.Parse(content)
-		s.logger.Printf("cmd from=%s name=/%s argc=%d",
+		s.logger.Infof("cmd from=%s name=/%s argc=%d",
 			senderHex[:8], parsed.Name, len(parsed.Args))
 		reply := s.dispatcher.Dispatch(senderHex, parsed)
 		if reply != "" {
 			id := s.outbound.Enqueue(senderBytes, []byte(reply))
-			s.logger.Printf("cmd reply queued: to=%s name=/%s reply_len=%d id=%s",
+			s.logger.Debugf("cmd reply queued: to=%s name=/%s reply_len=%d id=%s",
 				senderHex[:8], parsed.Name, len(reply), id)
 		}
 		return
@@ -154,7 +154,7 @@ func (s *Service) onLXMFReceived(msg *lxmf.Message) {
 	// (the only signal besides /join that resets the silent-prune clock).
 	// The Touch above only recorded presence; commands never reach here.
 	if _, err := s.roster.MarkMessage(senderBytes, now); err != nil {
-		s.logger.Printf("roster mark message: %v", err)
+		s.logger.Warnf("roster mark message: %v", err)
 	}
 
 	senderUser, _ := s.roster.Get(senderHex)
@@ -186,7 +186,7 @@ func (s *Service) onLXMFReceived(msg *lxmf.Message) {
 		body = "[" + senderNick + "] " + content
 	}
 	for _, note := range drops {
-		s.logger.Printf("attachment dropped: from=%s %s", senderHex[:8], note)
+		s.logger.Infof("attachment dropped: from=%s %s", senderHex[:8], note)
 		if body == "" {
 			body = note
 		} else {
@@ -207,7 +207,7 @@ func (s *Service) onLXMFReceived(msg *lxmf.Message) {
 	// stripped by the operator policy, there's nothing left to deliver
 	// — bail out so we don't fan out empty bubbles to every member.
 	if body == "" && len(fwdFields) == 0 {
-		s.logger.Printf("inbound LXMF: bailing — empty body and no fields survived filter (from=%s msg_fields_in=%d, allowlist=%v)",
+		s.logger.Infof("inbound LXMF: bailing — empty body and no fields survived filter (from=%s msg_fields_in=%d, allowlist=%v)",
 			senderHex[:8], len(msg.Fields), s.cfg.Service.ForwardedFields)
 		return
 	}
@@ -240,7 +240,7 @@ func (s *Service) onLXMFReceived(msg *lxmf.Message) {
 		if opts.bubble != nil && s.idmap != nil {
 			senderMsgIDHex := hex.EncodeToString(msg.MessageID())
 			s.idmap.RegisterView(opts.bubble, senderHex, senderMsgIDHex)
-			s.logger.Printf("idmap: registered sender view from=%s msgid=%s",
+			s.logger.Debugf("idmap: registered sender view from=%s msgid=%s",
 				senderHex[:8], senderMsgIDHex[:8])
 		}
 	}
@@ -262,7 +262,7 @@ func (s *Service) onLXMFReceived(msg *lxmf.Message) {
 	// a reactable bubble. The per-recipient rewrite closure clones these
 	// fields through unchanged.
 	if stampReactorIdentity(fwdFields, senderBytes) {
-		s.logger.Printf("reaction relay: stamped originator source_hash=%s", senderHex)
+		s.logger.Debugf("reaction relay: stamped originator source_hash=%s", senderHex)
 	}
 
 	// Delivery.Send routes opportunistic vs link automatically based on
@@ -305,7 +305,7 @@ func (s *Service) replyUnsupportedFields(senderBytes []byte, labels []string, on
 	}
 	msg := fmt.Sprintf("This group doesn't accept %s attachments, so it wasn't forwarded. %s", list, tail)
 	s.outbound.Enqueue(senderBytes, []byte(msg))
-	s.logger.Printf("attachment refused: to=%x kinds=%v only=%v", senderBytes[:4], labels, only)
+	s.logger.Infof("attachment refused: to=%x kinds=%v only=%v", senderBytes[:4], labels, only)
 }
 
 // replyPaused tells a paused member that their non-command message

@@ -3,13 +3,12 @@ package service
 import (
 	"bytes"
 	"encoding/hex"
-	"io"
-	"log"
 	"path/filepath"
 	"testing"
 	"time"
 
 	"github.com/thatSFguy/reticulum-go/rns"
+	"github.com/thatSFguy/reticulum-group-chat/internal/logging"
 	"github.com/thatSFguy/reticulum-group-chat/internal/roster"
 )
 
@@ -25,7 +24,7 @@ func newTestTap(t *testing.T) (*announceTap, *roster.Roster) {
 	}
 	svc := &Service{
 		roster: r,
-		logger: log.New(io.Discard, "", 0),
+		logger: logging.Discard(),
 		now:    func() time.Time { return time.Date(2026, 5, 11, 12, 0, 0, 0, time.UTC) },
 	}
 	return &announceTap{svc: svc}, r

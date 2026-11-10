@@ -3,12 +3,11 @@ package service
 import (
 	"bytes"
 	"encoding/hex"
-	"io"
-	"log"
 	"testing"
 	"time"
 
 	"github.com/thatSFguy/reticulum-group-chat/internal/idmap"
+	"github.com/thatSFguy/reticulum-group-chat/internal/logging"
 )
 
 // fakeBubble implements just the ViewFor lookup the substitute helpers
@@ -167,7 +166,7 @@ func TestStampedReactionSurvivesPerRecipientRewrite(t *testing.T) {
 	bubble := idmap.NewBubble(time.Minute, time.Now())
 	cache.RegisterView(bubble, aliceHex, hex.EncodeToString(aliceView))
 	cache.RegisterView(bubble, "reactor", hex.EncodeToString(senderView))
-	s := &Service{idmap: cache, logger: log.New(io.Discard, "", 0)}
+	s := &Service{idmap: cache, logger: logging.Discard()}
 
 	in := map[any]any{fieldReaction: map[any]any{targetIdx: senderView, 0x01: []byte("👍")}}
 	stampReactorIdentity(in, reactorHash)
@@ -202,7 +201,7 @@ func TestRewriteToleratesStrCarriers(t *testing.T) {
 	bubble := idmap.NewBubble(time.Minute, time.Now())
 	cache.RegisterView(bubble, aliceHex, hex.EncodeToString(aliceView))
 	cache.RegisterView(bubble, "reactor", hex.EncodeToString(target))
-	s := &Service{idmap: cache, logger: log.New(io.Discard, "", 0)}
+	s := &Service{idmap: cache, logger: logging.Discard()}
 
 	// SPEC §5.9.8: a reaction's REACTION_TO may arrive as msgpack str
 	// (raw bytes carried as a string); the relay MUST still bind it.
@@ -309,7 +308,7 @@ func TestBuildRewriteReturnsNilWhenNoTargetFields(t *testing.T) {
 	// reason.
 	s := &Service{
 		idmap:  idmap.New(time.Minute, 0),
-		logger: log.New(io.Discard, "", 0),
+		logger: logging.Discard(),
 	}
 	if got := s.buildRewrite(nil); got != nil {
 		t.Error("buildRewrite(nil) should be nil")
@@ -318,7 +317,7 @@ func TestBuildRewriteReturnsNilWhenNoTargetFields(t *testing.T) {
 		t.Error("buildRewrite(image-only) should be nil")
 	}
 	// idmap disabled → always nil even with a reaction present.
-	disabled := &Service{logger: log.New(io.Discard, "", 0)}
+	disabled := &Service{logger: logging.Discard()}
 	if got := disabled.buildRewrite(map[any]any{fieldReaction: map[any]any{targetIdx: []byte{1}}}); got != nil {
 		t.Error("buildRewrite with nil idmap should be nil")
 	}
@@ -344,7 +343,7 @@ func TestBuildRewriteBindsReactionToRecipientView(t *testing.T) {
 	// sender's view as the inbound reaction_to so it must be looked up.
 	cache.RegisterView(bubble, "reactor", hex.EncodeToString(senderView))
 
-	s := &Service{idmap: cache, logger: log.New(io.Discard, "", 0)}
+	s := &Service{idmap: cache, logger: logging.Discard()}
 
 	in := map[any]any{
 		fieldReaction: map[any]any{

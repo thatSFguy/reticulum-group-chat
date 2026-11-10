@@ -7,6 +7,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/thatSFguy/reticulum-go/rns"
 )
 
 // validServiceConfig is the minimum ServiceConfig that passes normalize();
@@ -514,4 +516,48 @@ func containsWarning(ws []string, subs ...string) bool {
 		}
 	}
 	return false
+}
+
+func TestLogLevel(t *testing.T) {
+	cases := []struct {
+		in      string
+		want    rns.LogLevel
+		wantErr bool
+	}{
+		{"", rns.LogInfo, false},
+		{"warn", rns.LogWarn, false},
+		{"warning", rns.LogWarn, false},
+		{"ERROR", rns.LogError, false},
+		{"debug", rns.LogDebug, false},
+		// A typo must refuse to start, not quietly log at info.
+		{"warnings", 0, true},
+	}
+	for _, c := range cases {
+		dir := t.TempDir()
+		path := filepath.Join(dir, "c.toml")
+		body := "admins = []\n[service]\ndisplay_name = \"x\"\n"
+		if c.in != "" {
+			body += "log_level = \"" + c.in + "\"\n"
+		}
+		if err := os.WriteFile(path, []byte(body), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		cfg, err := Load(path)
+		if c.wantErr {
+			if err == nil {
+				t.Errorf("log_level %q: accepted, want error", c.in)
+			}
+			continue
+		}
+		if err != nil {
+			t.Errorf("log_level %q: %v", c.in, err)
+			continue
+		}
+		if cfg.Service.LogLevelValue != c.want {
+			t.Errorf("log_level %q: got %v, want %v", c.in, cfg.Service.LogLevelValue, c.want)
+		}
+		if len(cfg.Warnings) != 0 {
+			t.Errorf("log_level %q under [service] warned: %q", c.in, cfg.Warnings)
+		}
+	}
 }

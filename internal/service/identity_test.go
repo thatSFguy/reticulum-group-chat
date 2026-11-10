@@ -3,19 +3,18 @@ package service
 import (
 	"bytes"
 	"encoding/base64"
-	"io"
-	"log"
 	"os"
 	"path/filepath"
 	"testing"
 
 	"github.com/thatSFguy/reticulum-go/rns"
+	"github.com/thatSFguy/reticulum-group-chat/internal/logging"
 )
 
-// quietLogger is a *log.Logger that drops every line. Used so test
+// quietLogger is a *logging.Logger that drops every line. Used so test
 // runs aren't polluted with the BACKUP: lines we emit on first
 // generation.
-func quietLogger() *log.Logger { return log.New(io.Discard, "", 0) }
+func quietLogger() *logging.Logger { return logging.Discard() }
 
 func TestLoadOrCreateIdentityPrefersConfigB64OverFile(t *testing.T) {
 	dir := t.TempDir()

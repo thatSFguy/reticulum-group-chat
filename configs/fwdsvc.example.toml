@@ -38,6 +38,17 @@ identity_path = "~/.fwdsvc/identity"
 state_path    = "~/.fwdsvc/state.json"
 history_path  = "~/.fwdsvc/history.json"
 
+# Lowest severity logged: "debug", "info" (the default), "warn" or "error".
+# A busy hub that wants a quiet log sets "warn". Info is the default
+# because the lines you size policy from live there — "inbound stamp:"
+# before enforcing stamps, "new sender contact:" to find a hash for admins.
+#
+# Under systemd you may not need this at all: when stdout is the journal,
+# every line carries a journald priority, so you can keep info here and
+# either filter when reading (`journalctl -u fwdsvc -p warning`) or set
+# `LogLevelMax=warning` in the unit to stop lower lines being stored.
+# log_level = "info"
+
 # Optional: paste the base64 form of your 64-byte identity here to make
 # this config file the single source of truth for your service identity.
 # When set, identity_path is ignored on startup. Useful so a reinstall
