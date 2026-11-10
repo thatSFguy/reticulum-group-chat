@@ -6,13 +6,13 @@ import (
 	"errors"
 	"fmt"
 	"io/fs"
-	"log"
 	"os"
 	"path/filepath"
 	"sync"
 	"time"
 
 	"github.com/thatSFguy/reticulum-go/rns"
+	"github.com/thatSFguy/reticulum-group-chat/internal/logging"
 )
 
 // announceStoreMaxAge bounds how stale a persisted announce can be at
@@ -144,7 +144,7 @@ const announcePersistDebounce = 2 * time.Second
 type announcePersistTap struct {
 	transport *rns.Transport
 	store     *announceStore
-	logger    *log.Logger
+	logger    *logging.Logger
 
 	// kick is buffered(1): OnAnnounce sets it without blocking; the run
 	// loop drains it. Multiple announces between saves collapse into
@@ -155,7 +155,7 @@ type announcePersistTap struct {
 	debounce time.Duration
 }
 
-func newAnnouncePersistTap(transport *rns.Transport, store *announceStore, logger *log.Logger) *announcePersistTap {
+func newAnnouncePersistTap(transport *rns.Transport, store *announceStore, logger *logging.Logger) *announcePersistTap {
 	return &announcePersistTap{
 		transport: transport,
 		store:     store,
@@ -204,6 +204,6 @@ func (t *announcePersistTap) run(ctx context.Context) {
 
 func (t *announcePersistTap) saveNow() {
 	if err := t.store.save(t.transport.KnownSnapshot()); err != nil {
-		t.logger.Printf("announce cache save: %v", err)
+		t.logger.Errorf("announce cache save: %v", err)
 	}
 }

@@ -11,7 +11,6 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"log"
 	"os"
 	"path/filepath"
 	"strings"
@@ -24,6 +23,7 @@ import (
 	"github.com/thatSFguy/reticulum-group-chat/internal/groupinfo"
 	"github.com/thatSFguy/reticulum-group-chat/internal/history"
 	"github.com/thatSFguy/reticulum-group-chat/internal/idmap"
+	"github.com/thatSFguy/reticulum-group-chat/internal/logging"
 	"github.com/thatSFguy/reticulum-group-chat/internal/roster"
 )
 
@@ -83,7 +83,7 @@ type Service struct {
 	// /leave + /join cycle cannot re-trigger the fan-out repeatedly.
 	replayLimit *replayLimiter
 
-	logger *log.Logger
+	logger *logging.Logger
 	now    func() time.Time
 }
 
@@ -114,11 +114,11 @@ func New(cfg *config.Config) (*Service, error) {
 		return nil, fmt.Errorf("load group info: %w", err)
 	}
 
-	logWriter, err := openLogWriter(cfg.Service.LogPath)
+	logFile, err := openLogFile(cfg.Service.LogPath)
 	if err != nil {
 		return nil, fmt.Errorf("open log: %w", err)
 	}
-	logger := log.New(logWriter, "fwdsvc ", log.LstdFlags|log.Lmicroseconds)
+	logger := logging.New(os.Stdout, logFile, cfg.Service.LogLevelValue)
 
 	// Single-instance guard. Two fwdsvc processes on the same state both
 	// answer to the same destination hash and both fan out every message,
@@ -143,7 +143,7 @@ func New(cfg *config.Config) (*Service, error) {
 				"refusing to start to avoid duplicate message delivery; stop the other instance first "+
 				"(check with: pgrep -x fwdsvc)", cfg.Service.StatePath, lockErr)
 		}
-		logger.Printf("single-instance lock unavailable (%v); continuing without it", lockErr)
+		logger.Warnf("single-instance lock unavailable (%v); continuing without it", lockErr)
 	}
 
 	// Auto-enroll config admins/mods as roster members. Being listed in
@@ -161,7 +161,7 @@ func New(cfg *config.Config) (*Service, error) {
 	// re-enrolled on the next restart — remove them from the config for a
 	// permanent opt-out.
 	if n := enrollConfigRoles(r, cfg, time.Now()); n > 0 {
-		logger.Printf("auto-enrolled %d config admin/mod(s) as members", n)
+		logger.Infof("auto-enrolled %d config admin/mod(s) as members", n)
 	}
 
 	id, err := loadOrCreateIdentity(cfg.Service.IdentityB64, cfg.Service.IdentityPath, logger)
@@ -169,7 +169,7 @@ func New(cfg *config.Config) (*Service, error) {
 		return nil, err
 	}
 
-	transport := rns.NewTransport(stdLoggerAdapter{logger})
+	transport := rns.NewTransport(logger)
 	// Sign LINKIDENTIFY (SPEC §6.6) on every link we initiate, so
 	// responders can cache our destination and route follow-up tap-back
 	// reactions / replies back through us instead of inferring a target
@@ -317,7 +317,7 @@ func New(cfg *config.Config) (*Service, error) {
 	}
 
 	delivery.OnMessage = svc.onLXMFReceived
-	delivery.OnError = func(err error) { logger.Printf("inbound: %v", err) }
+	delivery.OnError = func(err error) { logger.Infof("inbound: %v", err) }
 
 	transport.RegisterAnnounceHandler(&announceTap{svc: svc})
 
@@ -328,13 +328,13 @@ func New(cfg *config.Config) (*Service, error) {
 	// inbound verified announce thereafter.
 	announceStore := newAnnounceStore(announceStorePath(cfg.Service.StatePath))
 	if entries, dropped, err := announceStore.load(svc.now()); err != nil {
-		logger.Printf("announce cache load: %v (continuing with empty cache)", err)
+		logger.Warnf("announce cache load: %v (continuing with empty cache)", err)
 	} else {
 		for _, e := range entries {
 			transport.Restore(e)
 		}
 		if len(entries) > 0 || dropped > 0 {
-			logger.Printf("announce cache restored: %d entries (dropped %d stale > %s)",
+			logger.Infof("announce cache restored: %d entries (dropped %d stale > %s)",
 				len(entries), dropped, announceStoreMaxAge)
 		}
 	}
@@ -357,24 +357,24 @@ func (s *Service) Run(ctx context.Context) error {
 
 	for _, iface := range s.cfg.Interfaces {
 		if err := s.dialInterface(iface); err != nil {
-			s.logger.Printf("interface %s %s: %v", iface.Type, iface.Addr, err)
+			s.logger.Errorf("interface %s %s: %v", iface.Type, iface.Addr, err)
 			// Best-effort: continue with the interfaces that did connect.
 		}
 	}
 
-	s.logger.Printf("service identity hash: %s", s.identity.HexHash())
-	s.logger.Printf("delivery destination : %s", hex.EncodeToString(s.delivery.Hash()))
-	s.logger.Printf("display name        : %s", s.cfg.Service.DisplayName)
-	s.logger.Printf("locked (invite-only): %v", s.cfg.Service.Locked)
+	s.logger.Infof("service identity hash: %s", s.identity.HexHash())
+	s.logger.Infof("delivery destination : %s", hex.EncodeToString(s.delivery.Hash()))
+	s.logger.Infof("display name        : %s", s.cfg.Service.DisplayName)
+	s.logger.Infof("locked (invite-only): %v", s.cfg.Service.Locked)
 	if s.cfg.Service.InboundStampCost > 0 {
-		s.logger.Printf("inbound stamps      : cost=%d enforce=%v",
+		s.logger.Infof("inbound stamps      : cost=%d enforce=%v",
 			s.cfg.Service.InboundStampCost, s.cfg.Service.EnforceInboundStamps)
 	} else {
-		s.logger.Printf("inbound stamps      : none required (announcing no stamp_cost)")
+		s.logger.Infof("inbound stamps      : none required (announcing no stamp_cost)")
 	}
-	s.logger.Printf("roster size         : %d", len(s.roster.Hashes()))
-	s.logger.Printf("history size        : %d", s.history.Len())
-	s.logger.Printf("pinned messages     : %d", s.info.PinCount())
+	s.logger.Infof("roster size         : %d", len(s.roster.Hashes()))
+	s.logger.Infof("history size        : %d", s.history.Len())
+	s.logger.Infof("pinned messages     : %d", s.info.PinCount())
 	// /setinfo sized the description against the display name in force at
 	// the time; an operator can lengthen display_name or flip `locked` at
 	// any restart, after which the stored description no longer fits. The
@@ -382,19 +382,19 @@ func (s *Service) Run(ctx context.Context) error {
 	// /info costs a link setup — so this warns rather than refusing to
 	// start, and says exactly how much to cut.
 	if over := s.dispatcher.InfoOverflow(s.info.Info()); over > 0 && s.info.Info() != "" {
-		s.logger.Printf("config warning: the group description makes /info %d bytes too long for one packet with this display_name; non-members' /info will go over a Link until it is shortened (/setinfo)", over)
+		s.logger.Warnf("config warning: the group description makes /info %d bytes too long for one packet with this display_name; non-members' /info will go over a Link until it is shortened (/setinfo)", over)
 	}
 	if s.cfg.Propagation.Enabled {
 		node := "auto-discover"
 		if s.cfg.Propagation.Node != "" {
 			node = s.cfg.Propagation.Node
 		}
-		s.logger.Printf("propagation         : mode=%s node=%s", s.cfg.Propagation.Mode, node)
+		s.logger.Infof("propagation         : mode=%s node=%s", s.cfg.Propagation.Mode, node)
 		if s.cfg.Propagation.Mode == config.PropagationModeFallback {
 			// Make the split budget auditable from the log: the shorter
 			// direct budget applies only while a node is available; with
 			// none known, the full budget protects the message.
-			s.logger.Printf("propagation         : direct_attempts=%d while a node is available (else %d)",
+			s.logger.Infof("propagation         : direct_attempts=%d while a node is available (else %d)",
 				s.cfg.Propagation.DirectAttempts, maxDeliveryAttempts)
 		}
 	}
@@ -426,12 +426,12 @@ func (s *Service) Run(ctx context.Context) error {
 	if s.cfg.Propagation.Enabled {
 		if pinned := s.cfg.Propagation.NodeBytes(); pinned != nil && s.transport.Recall(pinned) == nil {
 			if err := s.transport.RequestPath(pinned); err != nil {
-				s.logger.Printf("propagation: path request for pinned node: %v", err)
+				s.logger.Warnf("propagation: path request for pinned node: %v", err)
 			}
 		}
 	}
 
-	s.logger.Printf("outbound queue depth   : %d", s.outbound.pendingCount())
+	s.logger.Infof("outbound queue depth   : %d", s.outbound.pendingCount())
 
 	pruneTicker := time.NewTicker(s.cfg.Service.PruneInterval.Std())
 	defer pruneTicker.Stop()
@@ -439,7 +439,7 @@ func (s *Service) Run(ctx context.Context) error {
 	for {
 		select {
 		case <-ctx.Done():
-			s.logger.Printf("shutting down")
+			s.logger.Infof("shutting down")
 			return nil
 		case t := <-pruneTicker.C:
 			s.runPrune(t)
@@ -455,7 +455,7 @@ func (s *Service) dialInterface(iface config.InterfaceConfig) error {
 			return err
 		}
 		s.transport.AddInterface(client)
-		s.logger.Printf("interface tcp_client connected: %s", iface.Addr)
+		s.logger.Infof("interface tcp_client connected: %s", iface.Addr)
 		return nil
 	default:
 		return fmt.Errorf("unsupported interface type %q", iface.Type)
@@ -603,18 +603,18 @@ func (s *Service) announceNow() error {
 	if err != nil {
 		return fmt.Errorf("build: %w", err)
 	}
-	s.logger.Printf("on-demand /announce")
+	s.logger.Infof("on-demand /announce")
 	return s.transport.Broadcast(pkt)
 }
 
 func (s *Service) runPrune(now time.Time) {
 	pruned, err := s.roster.Prune(now, s.cfg.Service.PruneAfter.Std(), s.cfg.Service.PruneSilentAfter.Std())
 	if err != nil {
-		s.logger.Printf("prune error: %v", err)
+		s.logger.Warnf("prune error: %v", err)
 		return
 	}
 	if len(pruned) > 0 {
-		s.logger.Printf("pruned %d inactive user(s)", len(pruned))
+		s.logger.Infof("pruned %d inactive user(s)", len(pruned))
 	}
 }
 
@@ -631,7 +631,7 @@ func (s *Service) runPrune(now time.Time) {
 //     operator can copy the value into service.identity_b64 to make
 //     the config the single backup target. The b64 path is logged
 //     prominently so the recommendation is visible on first run.
-func loadOrCreateIdentity(b64 string, identityPath string, logger *log.Logger) (*rns.Identity, error) {
+func loadOrCreateIdentity(b64 string, identityPath string, logger *logging.Logger) (*rns.Identity, error) {
 	if b64 = strings.TrimSpace(b64); b64 != "" {
 		raw, err := base64.StdEncoding.DecodeString(b64)
 		if err != nil {
@@ -641,7 +641,7 @@ func loadOrCreateIdentity(b64 string, identityPath string, logger *log.Logger) (
 		if err != nil {
 			return nil, fmt.Errorf("service.identity_b64: %w", err)
 		}
-		logger.Printf("identity loaded from config (identity_b64); ignoring %s", identityPath)
+		logger.Infof("identity loaded from config (identity_b64); ignoring %s", identityPath)
 		return id, nil
 	}
 	if _, err := os.Stat(identityPath); err == nil {
@@ -660,13 +660,13 @@ func loadOrCreateIdentity(b64 string, identityPath string, logger *log.Logger) (
 		// Backup file failed to write but the identity is safe on disk
 		// at identityPath. Log loudly and continue — better to keep the
 		// daemon running than to fail startup over a backup-file write.
-		logger.Printf("WARNING: could not write identity backup to %s: %v", backupPath, err)
-		logger.Printf("WARNING: copy the contents of %s manually to back up your identity", identityPath)
+		logger.Warnf("could not write identity backup to %s: %v", backupPath, err)
+		logger.Warnf("copy the contents of %s manually to back up your identity", identityPath)
 	} else {
-		logger.Printf("created new identity at %s", identityPath)
-		logger.Printf("BACKUP: identity also written to %s as base64", backupPath)
-		logger.Printf("BACKUP: copy that value into your config under [service] identity_b64 = \"...\"")
-		logger.Printf("BACKUP: so the identity survives losing the data dir at %s", filepath.Dir(identityPath))
+		logger.Infof("created new identity at %s", identityPath)
+		logger.Warnf("BACKUP: identity also written to %s as base64", backupPath)
+		logger.Warnf("BACKUP: copy that value into your config under [service] identity_b64 = \"...\"")
+		logger.Warnf("BACKUP: so the identity survives losing the data dir at %s", filepath.Dir(identityPath))
 	}
 	return id, nil
 }
@@ -728,7 +728,7 @@ func (t *announceTap) OnAnnounce(a *rns.Announce) {
 		at = emitted
 	}
 	if err := t.svc.roster.UpdateLastAnnounce(a.DestHash, at); err != nil {
-		t.svc.logger.Printf("announce update: %v", err)
+		t.svc.logger.Warnf("announce update: %v", err)
 	}
 	t.maybeAdoptAnnouncedNickname(a)
 }
@@ -755,22 +755,22 @@ func (t *announceTap) maybeAdoptAnnouncedNickname(a *rns.Announce) {
 		return
 	}
 	if err := t.svc.roster.SetNickname(hashHex, sanitized); err != nil {
-		t.svc.logger.Printf("nick from announce: set %s for %s: %v", sanitized, hashHex[:8], err)
+		t.svc.logger.Warnf("nick from announce: set %s for %s: %v", sanitized, hashHex[:8], err)
 		return
 	}
-	t.svc.logger.Printf("nick from announce: adopted %q for %s", sanitized, hashHex[:8])
+	t.svc.logger.Infof("nick from announce: adopted %q for %s", sanitized, hashHex[:8])
 }
 
-// openLogWriter returns an io.Writer for the daemon logger. Stdout is
-// always included so operators running fwdsvc in the foreground keep
-// seeing output. If logPath is non-empty, the file is opened in append
-// mode (mode 0600 — log lines may include user dest_hashes) and tee'd
-// alongside stdout via io.MultiWriter; the file handle leaks
+// openLogFile opens the optional log_path file, or returns nil when none is
+// configured. Stdout is always written by the logger itself so operators
+// running fwdsvc in the foreground, or under systemd, keep seeing output;
+// this file is an additional copy. It is opened in append mode (mode
+// 0600 — log lines may include user dest_hashes) and the handle leaks
 // intentionally (its lifetime is the process). On any open error the
 // caller decides whether to fail startup.
-func openLogWriter(logPath string) (io.Writer, error) {
+func openLogFile(logPath string) (io.Writer, error) {
 	if logPath == "" {
-		return os.Stdout, nil
+		return nil, nil
 	}
 	if err := os.MkdirAll(filepath.Dir(logPath), 0o700); err != nil {
 		return nil, fmt.Errorf("create log dir: %w", err)
@@ -779,13 +779,8 @@ func openLogWriter(logPath string) (io.Writer, error) {
 	if err != nil {
 		return nil, err
 	}
-	return io.MultiWriter(os.Stdout, f), nil
+	return f, nil
 }
-
-// stdLoggerAdapter bridges a *log.Logger into rns.Logger.
-type stdLoggerAdapter struct{ l *log.Logger }
-
-func (s stdLoggerAdapter) Printf(format string, args ...any) { s.l.Printf(format, args...) }
 
 // Compile-time guard: announceTap implements rns.AnnounceHandler.
 var _ rns.AnnounceHandler = (*announceTap)(nil)
@@ -811,12 +806,12 @@ func (s *Service) runRosterFlusher(ctx context.Context) {
 		select {
 		case <-ctx.Done():
 			if err := s.roster.Flush(); err != nil {
-				s.logger.Printf("roster flush on shutdown: %v", err)
+				s.logger.Errorf("roster flush on shutdown: %v", err)
 			}
 			return
 		case <-ticker.C:
 			if err := s.roster.Flush(); err != nil {
-				s.logger.Printf("roster flush: %v", err)
+				s.logger.Errorf("roster flush: %v", err)
 			}
 			s.pinRosterDestinations()
 		}

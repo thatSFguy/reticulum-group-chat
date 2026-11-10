@@ -4,13 +4,14 @@ import (
 	"context"
 	"flag"
 	"fmt"
-	"log"
 	"os"
 	"os/signal"
 	"runtime"
 	"syscall"
 
+	"github.com/thatSFguy/reticulum-go/rns"
 	"github.com/thatSFguy/reticulum-group-chat/internal/config"
+	"github.com/thatSFguy/reticulum-group-chat/internal/logging"
 	"github.com/thatSFguy/reticulum-group-chat/internal/service"
 	"github.com/thatSFguy/reticulum-group-chat/internal/version"
 )
@@ -30,20 +31,27 @@ func main() {
 		return
 	}
 
+	// These lines go to stderr, which systemd sends to the journal just
+	// like stdout, so they need priorities too. Without one, journald
+	// files them as info and LogLevelMax=warning would hide exactly the
+	// lines that say why the service refused to start. The config error
+	// is logged before log_level is known, so it is written
+	// unconditionally.
 	cfg, err := config.Load(*configPath)
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "config: %v\n", err)
+		logging.New(os.Stderr, nil, rns.LogDebug).Errorf("config: %v", err)
 		os.Exit(2)
 	}
+	logger := logging.New(os.Stderr, nil, cfg.Service.LogLevelValue)
 
-	log.Printf("fwdsvc %s starting (%s/%s)", Version, runtime.GOOS, runtime.GOARCH)
+	logger.Infof("fwdsvc %s starting (%s/%s)", Version, runtime.GOOS, runtime.GOARCH)
 	for _, w := range cfg.Warnings {
-		log.Printf("config warning: %s", w)
+		logger.Warnf("config warning: %s", w)
 	}
 
 	svc, err := service.New(cfg)
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "init: %v\n", err)
+		logger.Errorf("init: %v", err)
 		os.Exit(1)
 	}
 
@@ -51,6 +59,7 @@ func main() {
 	defer cancel()
 
 	if err := svc.Run(ctx); err != nil {
-		log.Fatalf("run: %v", err)
+		logger.Errorf("run: %v", err)
+		os.Exit(1)
 	}
 }

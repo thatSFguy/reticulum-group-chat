@@ -247,11 +247,11 @@ func (s *Service) buildRewrite(fields map[any]any) func(recipientHex string, fie
 // having to add ad-hoc logging next time.
 func (s *Service) logTargetLookup(label, targetHex string, hit bool) {
 	if hit {
-		s.logger.Printf("rewrite: %s target=%s hit (cache size=%d)",
+		s.logger.Debugf("rewrite: %s target=%s hit (cache size=%d)",
 			label, shortHex(targetHex), s.idmap.Len())
 		return
 	}
-	s.logger.Printf("rewrite: %s target=%s miss (cache size=%d) FULL=%s",
+	s.logger.Debugf("rewrite: %s target=%s miss (cache size=%d) FULL=%s",
 		label, shortHex(targetHex), s.idmap.Len(), targetHex)
 }
 

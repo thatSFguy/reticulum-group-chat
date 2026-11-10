@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/BurntSushi/toml"
+	"github.com/thatSFguy/reticulum-go/rns"
 )
 
 const identityHashLen = 16
@@ -156,6 +157,22 @@ type ServiceConfig struct {
 	HistoryPath      string   `toml:"history_path"`
 	LogPath          string   `toml:"log_path"`
 	PruneAfter       Duration `toml:"prune_after"`
+
+	// LogLevel is the lowest severity written: "debug", "info", "warn" or
+	// "error". Empty means "info", which is everything fwdsvc logged before
+	// levels existed apart from per-transfer protocol chatter.
+	//
+	// The default stays at info, not warn, because the lines operators
+	// size policy from are info: "inbound stamp:" before enforcing stamps,
+	// "new sender contact:" to find a hash for admins. A hub that wants a
+	// quiet journal sets "warn" here — or, under systemd, keeps info and
+	// sets LogLevelMax=warning in the unit, since each line carries a
+	// journald priority either way (see internal/logging).
+	LogLevel string `toml:"log_level"`
+
+	// LogLevelValue is LogLevel parsed by normalize; it is what the
+	// service reads.
+	LogLevelValue rns.LogLevel `toml:"-"`
 
 	// PruneSilentAfter removes members who have not sent a chat message in
 	// this window, IGNORING announces AND commands — i.e. lurkers who joined
@@ -495,6 +512,18 @@ func (c *Config) normalize() error {
 	}
 	if c.Service.PruneSilentAfter.Std() < 0 {
 		return fmt.Errorf("service.prune_silent_after must be >= 0 (0 disables)")
+	}
+	// Refuse a typo rather than fall back to a default: "warnings" quietly
+	// becoming info would be the opposite of what the operator asked for,
+	// and they would only notice when the journal stayed loud.
+	if strings.TrimSpace(c.Service.LogLevel) == "" {
+		c.Service.LogLevelValue = rns.LogInfo
+	} else {
+		lvl, err := rns.ParseLogLevel(c.Service.LogLevel)
+		if err != nil {
+			return fmt.Errorf("service.log_level: %w", err)
+		}
+		c.Service.LogLevelValue = lvl
 	}
 	if c.Service.AnnounceInterval.Std() <= 0 {
 		return fmt.Errorf("service.announce_interval must be positive")

@@ -4,12 +4,12 @@ import (
 	"bytes"
 	"encoding/hex"
 	"fmt"
-	"log"
 	"sync"
 	"time"
 
 	"github.com/thatSFguy/reticulum-go/lxmf"
 	"github.com/thatSFguy/reticulum-go/rns"
+	"github.com/thatSFguy/reticulum-group-chat/internal/logging"
 )
 
 var lxmfPropagationNameHash = rns.NameHash(lxmf.PropagationFullName())
@@ -31,7 +31,7 @@ var lxmfPropagationNameHash = rns.NameHash(lxmf.PropagationFullName())
 // announcing once per second deterministically seize the role from
 // honest nodes and silently blackhole every store-and-forward message.
 type propagationTracker struct {
-	logger *log.Logger
+	logger *logging.Logger
 	pinned []byte // nil when auto-discovering
 	now    func() time.Time
 
@@ -69,7 +69,7 @@ const (
 	minTransferLimitKB = 16
 )
 
-func newPropagationTracker(logger *log.Logger, pinned []byte) *propagationTracker {
+func newPropagationTracker(logger *logging.Logger, pinned []byte) *propagationTracker {
 	return &propagationTracker{
 		logger: logger,
 		pinned: append([]byte(nil), pinned...),
@@ -90,7 +90,13 @@ func (t *propagationTracker) AspectMatch(nameHash []byte) bool {
 func (t *propagationTracker) OnAnnounce(a *rns.Announce) {
 	info, err := lxmf.ParsePropagationNodeAppData(a.AppData)
 	if err != nil {
-		t.logger.Printf("propagation: ignoring node %x: %v", a.DestHash[:4], err)
+		// Debug, not info: unlike the cases below this one has no
+		// first-heard check, so it fires on EVERY announce from a node
+		// whose app_data we cannot parse. That is a stranger's bytes on a
+		// public mesh — not actionable, and at info a node re-announcing
+		// every second would be one log line per second for as long as it
+		// keeps doing so.
+		t.logger.Debugf("propagation: ignoring node %x: %v", a.DestHash[:4], err)
 		return
 	}
 	key := hex.EncodeToString(a.DestHash)
@@ -119,15 +125,15 @@ func (t *propagationTracker) OnAnnounce(a *rns.Announce) {
 
 	switch {
 	case prev == nil && !usable:
-		t.logger.Printf("propagation: ignoring node %s — %s (stamp_cost=%d transfer_limit=%dKB)",
+		t.logger.Infof("propagation: ignoring node %s — %s (stamp_cost=%d transfer_limit=%dKB)",
 			key[:8], reason, info.StampCost, info.PerTransferLimitKB)
 	case prev == nil:
-		t.logger.Printf("propagation: discovered node %s (accepting=%v stamp_cost=%d transfer_limit=%dKB)",
+		t.logger.Infof("propagation: discovered node %s (accepting=%v stamp_cost=%d transfer_limit=%dKB)",
 			key[:8], info.Enabled, info.StampCost, info.PerTransferLimitKB)
 	case prev.enabled != info.Enabled:
-		t.logger.Printf("propagation: node %s now accepting=%v", key[:8], info.Enabled)
+		t.logger.Infof("propagation: node %s now accepting=%v", key[:8], info.Enabled)
 	case prev.usable != usable && !usable:
-		t.logger.Printf("propagation: node %s no longer usable — %s", key[:8], reason)
+		t.logger.Infof("propagation: node %s no longer usable — %s", key[:8], reason)
 	}
 }
 

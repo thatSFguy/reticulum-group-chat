@@ -88,7 +88,7 @@ func (s *Service) sendJoinCatchup(joinerHash []byte, now time.Time) {
 		return
 	}
 	if !s.replayLimit.allow(hex.EncodeToString(joinerHash), now) {
-		s.logger.Printf("join catch-up suppressed for %x (within %s cooldown)",
+		s.logger.Debugf("join catch-up suppressed for %x (within %s cooldown)",
 			joinerHash[:4], replayCooldown)
 		return
 	}

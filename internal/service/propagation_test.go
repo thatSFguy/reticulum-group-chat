@@ -2,11 +2,10 @@ package service
 
 import (
 	"bytes"
-	"io"
-	"log"
 	"testing"
 	"time"
 
+	"github.com/thatSFguy/reticulum-group-chat/internal/logging"
 	"github.com/vmihailenco/msgpack/v5"
 
 	"github.com/thatSFguy/reticulum-go/lxmf"
@@ -42,7 +41,7 @@ func pnAppData(t *testing.T, enabled bool, transferLimitKB, stampCost int) []byt
 }
 
 func newTestTracker(pinned []byte) *propagationTracker {
-	return newPropagationTracker(log.New(io.Discard, "", 0), pinned)
+	return newPropagationTracker(logging.Discard(), pinned)
 }
 
 func TestTrackerAspectMatch(t *testing.T) {

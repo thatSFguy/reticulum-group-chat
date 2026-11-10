@@ -9,7 +9,6 @@ import (
 	"errors"
 	"fmt"
 	"io/fs"
-	"log"
 	"os"
 	"path/filepath"
 	"sync"
@@ -18,6 +17,7 @@ import (
 	"github.com/thatSFguy/reticulum-go/lxmf"
 	"github.com/thatSFguy/reticulum-go/rns"
 	"github.com/thatSFguy/reticulum-group-chat/internal/idmap"
+	"github.com/thatSFguy/reticulum-group-chat/internal/logging"
 )
 
 // Constants mirror LXMF 0.9.7's LXMRouter.process_outbound retry policy.
@@ -183,7 +183,7 @@ type OutboundQueue struct {
 	sender outboundSender
 	store  *outboundStore
 	idmap  *idmap.Cache // optional — when set, successful sends register the per-recipient message_id view here for reaction/reply rewriting
-	logger *log.Logger
+	logger *logging.Logger
 
 	mu       sync.Mutex
 	pending  []*outboundMessage
@@ -224,7 +224,7 @@ type OutboundQueue struct {
 	now func() time.Time
 }
 
-func newOutboundQueue(sender outboundSender, store *outboundStore, logger *log.Logger) *OutboundQueue {
+func newOutboundQueue(sender outboundSender, store *outboundStore, logger *logging.Logger) *OutboundQueue {
 	return &OutboundQueue{
 		sender:          sender,
 		store:           store,
@@ -308,10 +308,10 @@ func (q *OutboundQueue) Load() error {
 	q.pending = kept
 	q.mu.Unlock()
 	if dropped > 0 {
-		q.logger.Printf("outbound: dropped %d malformed queue entries on load", dropped)
+		q.logger.Warnf("outbound: dropped %d malformed queue entries on load", dropped)
 	}
 	if demoted > 0 {
-		q.logger.Printf("outbound: propagation disabled — %d queued message(s) reverted to direct delivery", demoted)
+		q.logger.Infof("outbound: propagation disabled — %d queued message(s) reverted to direct delivery", demoted)
 	}
 	return nil
 }
@@ -379,7 +379,7 @@ func (q *OutboundQueue) enqueue(recipient, body []byte, fields map[any]any, bubb
 		q.dropped++
 		dropped := q.dropped
 		q.mu.Unlock()
-		q.logger.Printf("outbound: queue full (%d) — dropping message to %x (%d dropped total)",
+		q.logger.Warnf("outbound: queue full (%d) — dropping message to %x (%d dropped total)",
 			maxPendingMessages, recipient[:4], dropped)
 		return ""
 	}
@@ -487,7 +487,7 @@ func (q *OutboundQueue) pickDue() *outboundMessage {
 	}
 	for _, m := range expired {
 		q.removeLocked(m)
-		q.logger.Printf("outbound: expiring message id=%s to %x after %s queued (propagated=%v)",
+		q.logger.Warnf("outbound: expiring message id=%s to %x after %s queued (propagated=%v)",
 			m.ID, safePrefix(m.Recipient), now.Sub(m.EnqueuedAt).Round(time.Minute), m.Propagated)
 	}
 	if len(expired) > 0 {
@@ -569,7 +569,7 @@ func (q *OutboundQueue) attempt(msg *outboundMessage) {
 		recipientHex := hex.EncodeToString(msg.Recipient)
 		msgIDHex := hex.EncodeToString(msgID)
 		q.idmap.RegisterView(msg.Bubble, recipientHex, msgIDHex)
-		q.logger.Printf("idmap: registered view to=%s msgid=%s (cache size=%d)",
+		q.logger.Debugf("idmap: registered view to=%s msgid=%s (cache size=%d)",
 			recipientHex[:8], msgIDHex[:8], q.idmap.Len())
 	}
 
@@ -590,7 +590,7 @@ func (q *OutboundQueue) attempt(msg *outboundMessage) {
 		msg.Attempts--
 		msg.NextAttempt = q.now().Add(q.retryWait)
 		q.persistLocked()
-		q.logger.Printf("outbound: message to %x deferred: %v", safePrefix(msg.Recipient), err)
+		q.logger.Debugf("outbound: message to %x deferred: %v", safePrefix(msg.Recipient), err)
 		return
 	}
 	// A stamp cost we refuse is a DECISION, not a failure: the recipient
@@ -624,7 +624,7 @@ func (q *OutboundQueue) attempt(msg *outboundMessage) {
 		msg.Attempts = 0
 		msg.NextAttempt = q.now().Add(q.retryWait)
 		q.persistLocked()
-		q.logger.Printf("outbound: direct delivery to %x failed after %d attempts (%v) — re-routing via propagation node",
+		q.logger.Infof("outbound: direct delivery to %x failed after %d attempts (%v) — re-routing via propagation node",
 			safePrefix(msg.Recipient), attempts, err)
 		return
 	}
@@ -639,14 +639,14 @@ func (q *OutboundQueue) attempt(msg *outboundMessage) {
 	// and Delivery.Send already short-circuits if Recall is empty.
 	if isRecipientUnknown(err) && attempts > q.pathlessTries {
 		if rerr := q.sender.RequestPath(msg.Recipient); rerr != nil {
-			q.logger.Printf("outbound: path? for %x: %v", safePrefix(msg.Recipient), rerr)
+			q.logger.Warnf("outbound: path? for %x: %v", safePrefix(msg.Recipient), rerr)
 		}
 		msg.NextAttempt = q.now().Add(q.pathRequestWait)
 	} else {
 		msg.NextAttempt = q.now().Add(q.backoffWait(attempts))
 	}
 	q.persistLocked()
-	q.logger.Printf("outbound: attempt %d/%d to %x failed: %v",
+	q.logger.Infof("outbound: attempt %d/%d to %x failed: %v",
 		attempts, q.maxAttempts, safePrefix(msg.Recipient), err)
 }
 
@@ -684,7 +684,7 @@ func (q *OutboundQueue) removeLocked(msg *outboundMessage) {
 func (q *OutboundQueue) failLocked(msg *outboundMessage, err error) {
 	q.removeLocked(msg)
 	q.persistLocked()
-	q.logger.Printf("outbound: failing message id=%s to %x after %d attempts: %v",
+	q.logger.Warnf("outbound: failing message id=%s to %x after %d attempts: %v",
 		msg.ID, safePrefix(msg.Recipient), q.maxAttempts, err)
 }
 
@@ -696,7 +696,7 @@ func (q *OutboundQueue) failLocked(msg *outboundMessage, err error) {
 func (q *OutboundQueue) failStampCostLocked(msg *outboundMessage, err error) {
 	q.removeLocked(msg)
 	q.persistLocked()
-	q.logger.Printf("outbound: dropping message id=%s to %x — %v (not retried: the cost is re-read from the same announce and the propagation route grinds the same stamp)",
+	q.logger.Warnf("outbound: dropping message id=%s to %x — %v (not retried: the cost is re-read from the same announce and the propagation route grinds the same stamp)",
 		msg.ID, safePrefix(msg.Recipient), err)
 }
 
@@ -764,7 +764,7 @@ func (q *OutboundQueue) Flush() {
 	q.mu.Unlock()
 
 	if err := q.store.save(snapshot); err != nil {
-		q.logger.Printf("outbound: persist failed: %v", err)
+		q.logger.Errorf("outbound: persist failed: %v", err)
 		q.mu.Lock()
 		q.dirty = true // retry on the next tick
 		q.mu.Unlock()
@@ -808,7 +808,7 @@ type deliverySender struct {
 	delivery  *lxmf.Delivery
 	transport *rns.Transport
 	nodes     *propagationTracker
-	logger    *log.Logger
+	logger    *logging.Logger
 
 	// propSlots caps how many workers may be inside a propagation
 	// upload at once. Every propagated message targets the SAME selected
@@ -829,9 +829,9 @@ type deliverySender struct {
 	stampSlots chan struct{}
 }
 
-func (d *deliverySender) logf(format string, args ...any) {
+func (d *deliverySender) logf(level rns.LogLevel, format string, args ...any) {
 	if d.logger != nil {
-		d.logger.Printf(format, args...)
+		d.logger.Logf(level, format, args...)
 	}
 }
 
@@ -918,9 +918,9 @@ func (d *deliverySender) SendLXMFPropagated(recipient, body []byte, fields map[a
 	// first question when mail is accepted here but never arrives —
 	// and it was previously unanswerable from the log.
 	if err == nil {
-		d.logf("propagation: uploaded message for %x to node %x", recipient[:4], node[:4])
+		d.logf(rns.LogInfo, "propagation: uploaded message for %x to node %x", recipient[:4], node[:4])
 	} else {
-		d.logf("propagation: upload for %x to node %x failed: %v", recipient[:4], node[:4], err)
+		d.logf(rns.LogWarn, "propagation: upload for %x to node %x failed: %v", recipient[:4], node[:4], err)
 	}
 	// A pinned node we've never heard from can't be linked to — ask the
 	// network for its announce so a later retry can succeed. (For
