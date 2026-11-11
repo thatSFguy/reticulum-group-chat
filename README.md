@@ -808,7 +808,7 @@ to the microsecond. Examples worth recognising:
 | Pattern | Meaning |
 |---|---|
 | `interface tcp_client connected: …`         | TCP interface up. |
-| `announce verified (new\|returning): …`     | We learned a path to a peer. |
+| `announce verified (new\|returning): …`     | We learned a path to a peer. Logged once per peer (again only after 6h of silence) and rate-limited, so a busy hub shows a trickle plus `(announce-new: N further messages suppressed …)`. |
 | `cmd from=<hash> name=/<cmd>`               | A command arrived. |
 | `cmd reply queued: …`                       | The reply went onto the outbound queue. |
 | `outbound: attempt N/5 to <hash> failed: …` | A delivery attempt failed; retrying. |
